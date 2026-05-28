@@ -1,4 +1,6 @@
+import copy
 import sys
+from io import BytesIO
 from pathlib import Path
 
 import torch
@@ -23,6 +25,17 @@ class TinyClassifier(nn.Module):
         return self.classifier_head(self.norm(F.gelu(self.fc1(x))))
 
 
+class TwoMatrixNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.left = nn.Linear(8, 8, bias=False)
+        self.right = nn.Linear(8, 8, bias=False)
+        self.classifier_head = nn.Linear(8, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier_head(F.gelu(self.right(F.gelu(self.left(x)))))
+
+
 def test_param_group_builder_keeps_head_and_norm_in_fallback() -> None:
     model = TinyClassifier()
     groups = build_soda_pmuoneq_normuon_param_groups(model.named_parameters())
@@ -34,6 +47,24 @@ def test_param_group_builder_keeps_head_and_norm_in_fallback() -> None:
     assert "fc1.weight" in matrix_names
     assert "norm.weight" in fallback_names
     assert "classifier_head.weight" in fallback_names
+
+
+def test_param_group_builder_does_not_overmatch_head_substrings() -> None:
+    params = [
+        ("blocks.0.attn.head_projection.weight", nn.Parameter(torch.zeros(8, 8))),
+        ("lm_head.weight", nn.Parameter(torch.zeros(8, 8))),
+        ("head.weight", nn.Parameter(torch.zeros(8, 8))),
+        ("token_embed.weight", nn.Parameter(torch.zeros(8, 8))),
+        ("blocks.0.layernorm.weight", nn.Parameter(torch.zeros(8, 8))),
+    ]
+    groups = build_soda_pmuoneq_normuon_param_groups(params)
+    matrix_names = set(groups[0]["param_names"])
+    fallback_names = set(groups[1]["param_names"])
+    assert "blocks.0.attn.head_projection.weight" in matrix_names
+    assert "lm_head.weight" in fallback_names
+    assert "head.weight" in fallback_names
+    assert "token_embed.weight" in fallback_names
+    assert "blocks.0.layernorm.weight" in fallback_names
 
 
 def test_optimizer_step_is_finite_and_creates_matrix_state() -> None:
@@ -94,3 +125,108 @@ def test_short_training_sanity_loss_decreases() -> None:
     assert all(torch.isfinite(torch.tensor(losses)))
     assert min(losses[-4:]) < losses[0]
 
+
+def _run_step(model: nn.Module, opt: torch.optim.Optimizer, step: int) -> float:
+    torch.manual_seed(10_000 + step)
+    x = torch.randn(16, 8)
+    y = torch.randint(0, 4, (16,))
+    opt.zero_grad(set_to_none=True)
+    loss = F.cross_entropy(model(x), y)
+    loss.backward()
+    opt.step()
+    return float(loss.detach())
+
+
+def test_state_dict_resume_matches_uninterrupted_training() -> None:
+    torch.manual_seed(7)
+    uninterrupted = TinyClassifier()
+    resume_source = copy.deepcopy(uninterrupted)
+    opt_uninterrupted = SodaPmuonEqNorMuon(
+        build_soda_pmuoneq_normuon_param_groups(uninterrupted.named_parameters(), matrix_lr=1e-3, adam_lr=1e-4),
+        warmup_steps=2,
+    )
+    opt_resume_source = SodaPmuonEqNorMuon(
+        build_soda_pmuoneq_normuon_param_groups(resume_source.named_parameters(), matrix_lr=1e-3, adam_lr=1e-4),
+        warmup_steps=2,
+    )
+
+    for step in range(3):
+        assert _run_step(uninterrupted, opt_uninterrupted, step) == _run_step(resume_source, opt_resume_source, step)
+
+    model_blob = BytesIO()
+    opt_blob = BytesIO()
+    torch.save(resume_source.state_dict(), model_blob)
+    torch.save(opt_resume_source.state_dict(), opt_blob)
+    model_blob.seek(0)
+    opt_blob.seek(0)
+
+    resumed = TinyClassifier()
+    resumed.load_state_dict(torch.load(model_blob, weights_only=True))
+    opt_resumed = SodaPmuonEqNorMuon(
+        build_soda_pmuoneq_normuon_param_groups(resumed.named_parameters(), matrix_lr=1e-3, adam_lr=1e-4),
+        warmup_steps=2,
+    )
+    opt_resumed.load_state_dict(torch.load(opt_blob, weights_only=False))
+
+    for step in range(3, 6):
+        _run_step(uninterrupted, opt_uninterrupted, step)
+        _run_step(resumed, opt_resumed, step)
+
+    for a, b in zip(uninterrupted.parameters(), resumed.parameters(), strict=True):
+        assert torch.allclose(a, b, atol=1e-6, rtol=1e-6)
+
+
+def test_same_shape_bucket_matches_split_matrix_groups() -> None:
+    torch.manual_seed(9)
+    bucketed = TwoMatrixNet()
+    split = copy.deepcopy(bucketed)
+
+    opt_bucketed = SodaPmuonEqNorMuon(
+        build_soda_pmuoneq_normuon_param_groups(bucketed.named_parameters(), matrix_lr=1e-3, adam_lr=1e-4),
+        warmup_steps=2,
+    )
+    split_groups = [
+        {
+            "params": [split.left.weight],
+            "param_names": ["left.weight"],
+            "use_matrix_update": True,
+            "lr": 1e-3,
+            "base_lr": 1e-3,
+        },
+        {
+            "params": [split.right.weight],
+            "param_names": ["right.weight"],
+            "use_matrix_update": True,
+            "lr": 1e-3,
+            "base_lr": 1e-3,
+        },
+        {
+            "params": list(split.classifier_head.parameters()),
+            "param_names": ["classifier_head.weight", "classifier_head.bias"],
+            "use_matrix_update": False,
+            "lr": 1e-4,
+            "base_lr": 1e-4,
+        },
+    ]
+    opt_split = SodaPmuonEqNorMuon(split_groups, warmup_steps=2)
+
+    for step in range(5):
+        _run_step(bucketed, opt_bucketed, step)
+        _run_step(split, opt_split, step)
+
+    for a, b in zip(bucketed.parameters(), split.parameters(), strict=True):
+        assert torch.allclose(a, b, atol=1e-6, rtol=1e-6)
+
+
+def test_external_lr_is_not_overwritten_by_internal_warmup() -> None:
+    torch.manual_seed(12)
+    model = TinyClassifier()
+    opt = SodaPmuonEqNorMuon(
+        build_soda_pmuoneq_normuon_param_groups(model.named_parameters(), matrix_lr=1e-3, adam_lr=1e-4),
+        warmup_steps=100,
+        use_external_lr=True,
+    )
+    for group in opt.param_groups:
+        group["lr"] = 3e-4
+    _run_step(model, opt, 0)
+    assert {group["lr"] for group in opt.param_groups} == {3e-4}

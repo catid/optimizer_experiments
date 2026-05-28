@@ -50,6 +50,11 @@ preserving the Frobenius norm of D_t:
     N_t = N_t * ||D_t||_F / (||N_t||_F + eps)
     N_t = N_t * sqrt(max(1, rows / cols))
 
+The final aspect-ratio multiplier is intentional. It was present in the tuned
+local recipe and acts like a fixed layerwise LR scale for tall matrices. Other
+NorMuon implementations may preserve only the Frobenius norm; compare those
+numbers separately rather than treating them as the same update rule.
+
 SODA applies a scheduled pull toward the initialization anchor W_0 before the
 learned update:
 
@@ -141,6 +146,22 @@ DDP behavior
 This optimizer does not do any distributed communication. Use ordinary PyTorch
 DDP, which all-reduces gradients before ``optimizer.step()``. The optimizer
 state is local and deterministic across ranks when DDP gradients are in sync.
+
+Integration notes
+=================
+
+Use ``build_soda_pmuoneq_normuon_param_groups(model.named_parameters())`` for
+normal model training. Passing raw ``model.parameters()`` is supported, but all
+floating tensors with ``ndim >= 2`` are routed through the matrix path, including
+embeddings and output heads. The named-parameter helper keeps common
+embeddings, heads, norms, and biases in the fallback path.
+
+By default ``step()`` owns a short linear warmup:
+
+    lr_t = base_lr * min(1, t / warmup_steps)
+
+Set ``use_external_lr=True`` on the optimizer or a parameter group if an
+external scheduler should write ``group["lr"]`` before each step.
 """
 
 from __future__ import annotations
@@ -209,6 +230,57 @@ def _normuon_row_normalize(update: torch.Tensor, second_momentum: torch.Tensor, 
     out = out * (vnorm / (out.norm(dim=(-2, -1), keepdim=True) + eps_t))
     rows, cols = out.shape[-2], out.shape[-1]
     return out * math.sqrt(max(1.0, rows / cols))
+
+
+def _is_default_fallback_name(name: str) -> bool:
+    """Return whether a named parameter should avoid the matrix update path."""
+
+    lower = name.lower().replace("/", ".")
+    parts = [part for part in lower.split(".") if part]
+    if not parts:
+        return False
+    leaf = parts[-1]
+    if leaf == "bias" or lower.endswith(".bias"):
+        return True
+
+    norm_parts = {
+        "norm",
+        "ln",
+        "bn",
+        "rmsnorm",
+        "layernorm",
+        "batchnorm",
+        "groupnorm",
+        "final_norm",
+    }
+    if any(part in norm_parts or part.endswith("norm") for part in parts):
+        return True
+
+    embed_parts = {
+        "embed",
+        "token_embed",
+        "token_embedding",
+        "embedding",
+        "embeddings",
+        "wte",
+        "wpe",
+        "tok_embeddings",
+        "word_embeddings",
+        "word_embedding",
+        "pos_embed",
+        "position_embeddings",
+        "cls_token",
+        "reg_token",
+    }
+    if any(part in embed_parts for part in parts):
+        return True
+
+    known_head_tokens = ("lm_head", "classifier_head", "unembed")
+    if any(token in lower for token in known_head_tokens):
+        return True
+    if lower == "head.weight" or lower.endswith(".head.weight"):
+        return True
+    return False
 
 
 class GramNewtonSchulz:
@@ -324,6 +396,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         normuon_eps: float = 1e-10,
         ns_epsilon: float = 1e-7,
         ns_compute_dtype: torch.dtype | None = None,
+        use_external_lr: bool = False,
     ) -> None:
         if warmup_steps <= 0:
             raise ValueError("warmup_steps must be positive")
@@ -347,6 +420,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             pmuoneq_eps=pmuoneq_eps,
             normuon_beta2=normuon_beta2,
             normuon_eps=normuon_eps,
+            use_external_lr=use_external_lr,
         )
         super().__init__(prepared, defaults={})
 
@@ -378,6 +452,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         pmuoneq_eps: float,
         normuon_beta2: float,
         normuon_eps: float,
+        use_external_lr: bool,
     ) -> list[dict[str, Any]]:
         items = list(params)
         if not items:
@@ -389,6 +464,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                 is_matrix = bool(group["use_matrix_update"])
                 group.setdefault("lr", matrix_lr if is_matrix else adam_lr)
                 group.setdefault("base_lr", group["lr"])
+                group.setdefault("use_external_lr", use_external_lr)
                 if is_matrix:
                     group.setdefault("weight_decay", matrix_weight_decay)
                     group.setdefault("momentum", momentum)
@@ -430,6 +506,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                     "pmuoneq_eps": pmuoneq_eps,
                     "normuon_beta2": normuon_beta2,
                     "normuon_eps": normuon_eps,
+                    "use_external_lr": use_external_lr,
                 }
             )
         if fallback_params:
@@ -442,6 +519,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                     "weight_decay": adam_weight_decay,
                     "betas": adam_betas,
                     "eps": eps,
+                    "use_external_lr": use_external_lr,
                 }
             )
         return groups
@@ -615,8 +693,11 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             k = int(group.get("k", 0))
             t = k + 1
             warmup_steps = int(group.get("warmup_steps", self.warmup_steps))
-            lr = float(group["base_lr"]) * min(1.0, t / warmup_steps)
-            group["lr"] = lr
+            if bool(group.get("use_external_lr", False)):
+                lr = float(group["lr"])
+            else:
+                lr = float(group["base_lr"]) * min(1.0, t / warmup_steps)
+                group["lr"] = lr
             if group.get("use_matrix_update", False):
                 self._step_matrix_group(group, lr=lr, t=t)
             else:
@@ -643,13 +724,12 @@ def build_soda_pmuoneq_normuon_param_groups(
     normuon_eps: float = 1e-10,
     matrix_filter: Callable[[str, torch.nn.Parameter], bool] | None = None,
 ) -> list[dict[str, Any]]:
-    """Split named parameters into matrix and Adam fallback groups."""
+    """Split named parameters into matrix and RMS/AdamW-style fallback groups."""
 
     matrix_params: list[torch.nn.Parameter] = []
     matrix_names: list[str] = []
     fallback_params: list[torch.nn.Parameter] = []
     fallback_names: list[str] = []
-    fallback_tokens = ("bias", "norm", "ln", "bn", "embed", "embedding", "wte", "wpe", "lm_head", "unembed", "head")
 
     for name, p in named_parameters:
         if not p.requires_grad:
@@ -657,8 +737,7 @@ def build_soda_pmuoneq_normuon_param_groups(
         if matrix_filter is not None:
             use_matrix = bool(matrix_filter(name, p))
         else:
-            lower = name.lower()
-            use_matrix = p.ndim >= 2 and not any(token in lower for token in fallback_tokens)
+            use_matrix = p.ndim >= 2 and not _is_default_fallback_name(name)
         if use_matrix:
             matrix_params.append(p)
             matrix_names.append(name)

@@ -7,8 +7,11 @@ This folder contains my standalone optimizer contribution to the shared
 
 - `soda_pmuoneq_normuon.py` - a focused, copyable PyTorch optimizer file.
 - `tests/test_soda_pmuoneq_normuon.py` - self-contained CPU tests for grouping,
-  finite updates, state creation, no-op train/eval compatibility, and a simple
-  train-loss sanity check.
+  finite updates, state creation, no-op train/eval compatibility, state-dict
+  resume parity, bucket parity, and a simple train-loss sanity check.
+- `tests/ddp_smoke_soda_pmuoneq_normuon.py` - torchrun smoke test that checks
+  model parameters and optimizer tensor state stay rank-identical after DDP
+  gradient all-reduce.
 - `results/cifar10_seed34000_summary.csv` - CIFAR-10 ViT-5 comparison against a
   tuned AdamW baseline.
 - `results/cifar10_seed34000_curves.csv` - bin-level train/validation loss and
@@ -34,7 +37,21 @@ The standalone file intentionally removes the previous ablation switches:
 
 The matrix path is always the best local recipe. Biases, norms, embeddings,
 heads, and other fallback parameters use the same RMS/AdamW-style
-second-moment fallback that matched the prior winning implementation.
+second-moment fallback that matched the prior winning implementation. This
+fallback is intentionally not ordinary AdamW: it uses the current gradient
+divided by a bias-corrected second-moment denominator, with no first-moment
+EMA.
+
+Use `build_soda_pmuoneq_normuon_param_groups(model.named_parameters())` for
+normal training. Passing raw `model.parameters()` is supported, but it routes
+all `ndim >= 2` tensors through the matrix path, including embeddings and output
+heads. The named-parameter helper keeps common embeddings, heads, norms, and
+biases in the fallback path.
+
+The NorMuon step includes the tuned aspect-ratio multiplier
+`sqrt(max(1, rows / cols))` after Frobenius-norm restoration. That is a real
+layerwise step-size choice and is part of this recipe, so compare it separately
+from NorMuon implementations that preserve only the Frobenius norm.
 
 ## Tuned Defaults
 
@@ -53,6 +70,15 @@ SodaPmuonEqNorMuon(
     warmup_steps=10,
 )
 ```
+
+By default the optimizer owns a short internal linear warmup:
+
+```text
+lr_t = base_lr * min(1, t / warmup_steps)
+```
+
+Set `use_external_lr=True` on the optimizer or an individual parameter group if
+an external scheduler should write `group["lr"]` before each `step()`.
 
 ## CIFAR-10 Check
 
@@ -76,3 +102,9 @@ From this folder:
 python -m pytest -q tests/test_soda_pmuoneq_normuon.py
 ```
 
+Optional DDP smoke test from the repository root:
+
+```bash
+torchrun --standalone --nproc_per_node=2 \
+  workers/codex_soda_pmuoneq_normuon/tests/ddp_smoke_soda_pmuoneq_normuon.py
+```
