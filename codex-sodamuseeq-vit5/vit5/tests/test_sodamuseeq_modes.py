@@ -1,4 +1,5 @@
 import itertools
+import copy
 import sys
 from pathlib import Path
 
@@ -24,9 +25,27 @@ class TinyViTLike(nn.Module):
         return self.head(x)
 
 
+class SameShapeBucketModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj_a = nn.Linear(8, 8, bias=False)
+        self.proj_b = nn.Linear(8, 8, bias=False)
+        self.norm = nn.LayerNorm(8)
+        self.head = nn.Linear(8, 5)
+
+    def forward(self, x):
+        x = torch.tanh(self.proj_a(x) + self.proj_b(x))
+        return self.head(self.norm(x))
+
+
 def _batch():
     torch.manual_seed(123)
     return torch.randn(24, 12), torch.randint(0, 5, (24,))
+
+
+def _same_shape_batch():
+    torch.manual_seed(124)
+    return torch.randn(24, 8), torch.randint(0, 5, (24,))
 
 
 def _step(model, opt, x, y):
@@ -49,6 +68,15 @@ def _make_opt(model, **kwargs):
         projection_dtype=torch.float32,
         **kwargs,
     )
+
+
+def _clone_model_state(model):
+    return {key: value.detach().clone() for key, value in model.state_dict().items()}
+
+
+def _assert_models_close(model_a, model_b, *, atol=1e-6, rtol=1e-6):
+    for pa, pb in zip(model_a.parameters(), model_b.parameters(), strict=True):
+        assert torch.allclose(pa, pb, atol=atol, rtol=rtol)
 
 
 def test_all_ablation_modes_run_without_nan():
@@ -89,6 +117,34 @@ def test_batch_projection_matches_individual_projection():
         assert torch.allclose(pa, pb, atol=1e-6, rtol=1e-6)
 
 
+def test_same_shape_bucket_projection_matches_individual_projection():
+    x, y = _same_shape_batch()
+    torch.manual_seed(80)
+    model_a = SameShapeBucketModel()
+    model_b = SameShapeBucketModel()
+    model_b.load_state_dict(model_a.state_dict())
+    opt_a = SodaMuseEq(
+        make_sodamuseeq_param_groups(model_a, lr=1e-2, weight_decay=0.01),
+        warmup_steps=2,
+        soda_warmup_steps=1,
+        stats_interval=1,
+        projection_dtype=torch.float32,
+        batch_project=True,
+    )
+    opt_b = SodaMuseEq(
+        make_sodamuseeq_param_groups(model_b, lr=1e-2, weight_decay=0.01),
+        warmup_steps=2,
+        soda_warmup_steps=1,
+        stats_interval=1,
+        projection_dtype=torch.float32,
+        batch_project=False,
+    )
+    for _ in range(4):
+        _step(model_a, opt_a, x, y)
+        _step(model_b, opt_b, x, y)
+    _assert_models_close(model_a, model_b)
+
+
 def test_train_eval_roundtrip_restores_train_weights():
     x, y = _batch()
     torch.manual_seed(9)
@@ -104,6 +160,75 @@ def test_train_eval_roundtrip_restores_train_weights():
     assert any(not torch.allclose(a, b) for a, b in zip(train_weights, eval_weights, strict=True))
     for a, b in zip(train_weights, restored, strict=True):
         assert torch.allclose(a, b, atol=1e-6, rtol=1e-6)
+
+
+def test_repeated_train_eval_roundtrips_are_idempotent():
+    x, y = _batch()
+    torch.manual_seed(91)
+    model = TinyViTLike()
+    opt = _make_opt(model)
+    for _ in range(4):
+        _step(model, opt, x, y)
+    train_weights = [p.detach().clone() for p in model.parameters()]
+    for _ in range(3):
+        assert opt.eval() is opt
+        assert opt.train() is opt
+        restored = [p.detach().clone() for p in model.parameters()]
+        for expected, actual in zip(train_weights, restored, strict=True):
+            assert torch.allclose(expected, actual, atol=1e-6, rtol=1e-6)
+
+
+def test_state_dict_resume_matches_uninterrupted_train_checkpoint():
+    x, y = _batch()
+    torch.manual_seed(92)
+    model_ref = TinyViTLike()
+    model_ckpt = TinyViTLike()
+    model_ckpt.load_state_dict(model_ref.state_dict())
+    opt_ref = _make_opt(model_ref)
+    opt_ckpt = _make_opt(model_ckpt)
+    for _ in range(4):
+        _step(model_ref, opt_ref, x, y)
+        _step(model_ckpt, opt_ckpt, x, y)
+
+    model_state = _clone_model_state(model_ckpt)
+    opt_state = copy.deepcopy(opt_ckpt.state_dict())
+    _step(model_ref, opt_ref, x, y)
+
+    model_new = TinyViTLike()
+    model_new.load_state_dict(model_state)
+    opt_new = _make_opt(model_new)
+    opt_new.load_state_dict(opt_state)
+    assert opt_new.global_step == opt_ckpt.global_step
+    _step(model_new, opt_new, x, y)
+    _assert_models_close(model_ref, model_new)
+
+
+def test_state_dict_resume_matches_uninterrupted_eval_checkpoint():
+    x, y = _batch()
+    torch.manual_seed(93)
+    model_ref = TinyViTLike()
+    model_ckpt = TinyViTLike()
+    model_ckpt.load_state_dict(model_ref.state_dict())
+    opt_ref = _make_opt(model_ref)
+    opt_ckpt = _make_opt(model_ckpt)
+    for _ in range(4):
+        _step(model_ref, opt_ref, x, y)
+        _step(model_ckpt, opt_ckpt, x, y)
+
+    opt_ref.eval()
+    opt_ckpt.eval()
+    model_state = _clone_model_state(model_ckpt)
+    opt_state = copy.deepcopy(opt_ckpt.state_dict())
+    assert opt_state["sodamuseeq_extra"]["train_mode"] is False
+    _step(model_ref, opt_ref, x, y)
+
+    model_new = TinyViTLike()
+    model_new.load_state_dict(model_state)
+    opt_new = _make_opt(model_new)
+    opt_new.load_state_dict(opt_state)
+    assert not opt_new.train_mode
+    _step(model_new, opt_new, x, y)
+    _assert_models_close(model_ref, model_new)
 
 
 def test_stats_interval_avoids_expensive_sync_stats_between_intervals():

@@ -62,9 +62,12 @@ def _is_matrix_like(param: nn.Parameter) -> bool:
 
 def _is_default_aux_name(name: str) -> bool:
     lowered = name.lower()
+    parts = lowered.split(".")
     if lowered.endswith(".bias"):
         return True
     if any(token in lowered for token in ("norm", "ln_", "layernorm", "rmsnorm")):
+        return True
+    if len(parts) >= 2 and parts[-1] == "weight" and parts[-2] in {"embed", "embedding", "embeddings"}:
         return True
     if any(token in lowered for token in ("pos_embed", "cls_token", "reg_token", "wte", "tok_emb", "lm_head", "unembed")):
         return True
@@ -440,7 +443,8 @@ class SodaMuseEq(torch.optim.Optimizer):
                     groups.append(group)
                     continue
                 matrix = [p for p in group_params if _is_matrix_like(p)]
-                aux = [p for p in group_params if p not in set(matrix)]
+                matrix_ids = {id(p) for p in matrix}
+                aux = [p for p in group_params if id(p) not in matrix_ids]
                 base = {k: v for k, v in group.items() if k != "params"}
                 if matrix:
                     groups.append({**base, "params": matrix, "use_muon": True})
@@ -482,6 +486,24 @@ class SodaMuseEq(torch.optim.Optimizer):
                 else:
                     p.grad.detach_()
                     p.grad.zero_()
+
+    def state_dict(self):
+        state = super().state_dict()
+        state["sodamuseeq_extra"] = {
+            "soda_step_idx": int(self.soda_step_idx),
+            "train_mode": bool(self.train_mode),
+            "last_stats": dict(self.last_stats),
+        }
+        return state
+
+    def load_state_dict(self, state_dict):
+        state_dict = dict(state_dict)
+        extra = state_dict.pop("sodamuseeq_extra", {})
+        super().load_state_dict(state_dict)
+        inferred_step = max((int(group.get("k", 0)) for group in self.param_groups), default=0)
+        self.soda_step_idx = int(extra.get("soda_step_idx", inferred_step))
+        self.train_mode = bool(extra.get("train_mode", True))
+        self.last_stats = dict(extra.get("last_stats", {}))
 
     @torch.no_grad()
     def train(self):

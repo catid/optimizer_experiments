@@ -50,16 +50,41 @@ def main():
         loss.backward()
         opt.step()
     with torch.no_grad():
-        max_diff = torch.zeros((), device=device)
+        train_param_diff = _max_rank0_diff([p.detach() for p in ddp.module.parameters()], device)
+        state_tensors = []
         for p in ddp.module.parameters():
-            ref = p.detach().clone()
-            dist.broadcast(ref, src=0)
-            max_diff = torch.maximum(max_diff, (p.detach() - ref).abs().max())
-        dist.all_reduce(max_diff, op=dist.ReduceOp.MAX)
+            for value in opt.state[p].values():
+                if isinstance(value, torch.Tensor) and value.is_floating_point():
+                    state_tensors.append(value.detach())
+        state_diff = _max_rank0_diff(state_tensors, device)
+
+        opt.eval()
+        eval_param_diff = _max_rank0_diff([p.detach() for p in ddp.module.parameters()], device)
+        opt.train()
+        restored_param_diff = _max_rank0_diff([p.detach() for p in ddp.module.parameters()], device)
     if dist.get_rank() == 0:
-        print(f"ddp_sodamuseeq_smoke max_param_diff={float(max_diff.item()):.6g}")
-    assert float(max_diff.item()) < 1e-5
+        print(
+            "ddp_sodamuseeq_smoke "
+            f"train_param_diff={float(train_param_diff.item()):.6g} "
+            f"state_diff={float(state_diff.item()):.6g} "
+            f"eval_param_diff={float(eval_param_diff.item()):.6g} "
+            f"restored_param_diff={float(restored_param_diff.item()):.6g}"
+        )
+    assert float(train_param_diff.item()) < 1e-5
+    assert float(state_diff.item()) < 1e-5
+    assert float(eval_param_diff.item()) < 1e-5
+    assert float(restored_param_diff.item()) < 1e-5
     dist.destroy_process_group()
+
+
+def _max_rank0_diff(tensors, device):
+    max_diff = torch.zeros((), device=device)
+    for tensor in tensors:
+        ref = tensor.detach().clone()
+        dist.broadcast(ref, src=0)
+        max_diff = torch.maximum(max_diff, (tensor.detach() - ref).abs().max())
+    dist.all_reduce(max_diff, op=dist.ReduceOp.MAX)
+    return max_diff
 
 
 if __name__ == "__main__":

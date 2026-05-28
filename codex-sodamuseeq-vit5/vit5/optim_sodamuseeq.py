@@ -376,6 +376,24 @@ class SodaMuseEq(torch.optim.Optimizer):
                     p.grad.detach_()
                     p.grad.zero_()
 
+    def state_dict(self):
+        state = super().state_dict()
+        state["sodamuseeq_extra"] = {
+            "global_step": int(self.global_step),
+            "train_mode": bool(self.train_mode),
+            "last_stats": dict(self.last_stats),
+        }
+        return state
+
+    def load_state_dict(self, state_dict):
+        state_dict = dict(state_dict)
+        extra = state_dict.pop("sodamuseeq_extra", {})
+        super().load_state_dict(state_dict)
+        inferred_step = max((int(group.get("k", 0)) for group in self.param_groups), default=0)
+        self.global_step = int(extra.get("global_step", inferred_step))
+        self.train_mode = bool(extra.get("train_mode", True))
+        self.last_stats = dict(extra.get("last_stats", {}))
+
     def set_base_lr(self, lr: float):
         for group in self.param_groups:
             group["base_lr"] = float(lr)

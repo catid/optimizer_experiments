@@ -26,23 +26,45 @@ The optimizer supports optional switches for:
 Validated in the source workspace before packaging:
 
 ```bash
-uv run python -m py_compile \
+python -m py_compile \
   sodamuseeq.py \
-  external/vit5-sodamuseeq/optim_sodamuseeq.py \
-  external/vit5-sodamuseeq/main.py \
-  external/vit5-sodamuseeq/engine.py \
-  external/vit5-sodamuseeq/experiments/sodamuseeq_ablation.py \
-  external/vit5-sodamuseeq/experiments/focused_optimizer_confidence.py
+  vit5/optim_sodamuseeq.py \
+  vit5/main.py \
+  vit5/engine.py \
+  vit5/experiments/sodamuseeq_ablation.py \
+  vit5/experiments/focused_optimizer_confidence.py
 
-uv run pytest \
-  external/vit5-sodamuseeq/tests/test_sodamuseeq_modes.py \
+python -m pytest \
+  vit5/tests/test_sodamuseeq_modes.py \
   tests/test_sodamuseeq_standalone.py
 
-uv run torchrun --standalone --nproc-per-node=2 \
-  external/vit5-sodamuseeq/tests/ddp_sodamuseeq_smoke.py
+torchrun --standalone --nproc-per-node=2 \
+  vit5/tests/ddp_sodamuseeq_smoke.py
 ```
 
-The DDP smoke passed with `max_param_diff=0`.
+The DDP smoke checks train weights, eval weights, restored train weights, and
+optimizer tensor state across ranks.
+
+The tests include:
+
+- all ablation modes run without NaNs,
+- batch projection parity against individual projection,
+- same-shape matrix bucket parity,
+- repeated schedule-free `train()` / `eval()` roundtrips,
+- train-mode and eval-mode checkpoint resume parity,
+- standalone optimizer grouping and resume coverage.
+
+## Checkpoint Recipe
+
+For schedule-free/AMUSE modes, call `optimizer.eval()` before validation if you
+want the averaged/eval weights, then call `optimizer.train()` before resuming
+training. Checkpoints are safe in either mode as long as both the model state and
+optimizer state are saved together. The optimizer stores its train/eval mode and
+SODA step counter in `state_dict()` under `sodamuseeq_extra`.
+
+SODA is configured to replace ordinary weight decay by default. When
+`soda_replaces_weight_decay=True`, matrix and fallback weight decay are disabled
+inside the optimizer and the anchor correction supplies the regularization path.
 
 ## Focused Confidence Runner
 
@@ -69,15 +91,19 @@ The runner schedules one trial per visible GPU. It intentionally compares only:
 - NorMuon+BaseGram: no SODA, no AMUSE, no PMuonEq.
 - SODA+PMuonEq+Gram.
 
-## Current Single-Seed Result Before Focused Follow-Up
+## Focused Results
 
-The prior corrected CIFAR-10 ViT-5 10k comparison found:
+The 3-seed 10k and seed-0 20k focused confidence pass found:
 
-| Variant | Val loss | Val acc | Test acc |
-| --- | ---: | ---: | ---: |
-| SODA+PMuonEq+Gram | 0.4129 | 87.24% | 86.77% |
-| SODA+PMuonEq+Gram+NorMuon | 0.4320 | 86.60% | 86.28% |
-| AdamW | 0.5815 | 82.52% | 82.12% |
+| Variant | Budget | Val loss | Val acc | Test acc | Steps/sec |
+| --- | --- | ---: | ---: | ---: | ---: |
+| SODA+PMuonEq+Gram | 10k, 3 seeds | 0.4210 +/- 0.0097 | 87.19% +/- 0.24 | 86.90% +/- 0.35 | 42.84 +/- 0.20 |
+| NorMuon+BaseGram | 10k, 3 seeds | 0.5069 +/- 0.0100 | 86.21% +/- 0.49 | 86.05% +/- 0.36 | 47.93 +/- 0.67 |
+| AdamW | 10k, 3 seeds | 0.6030 +/- 0.0167 | 81.47% +/- 0.75 | 81.27% +/- 0.74 | 58.46 +/- 0.42 |
+| SODA+PMuonEq+Gram | 20k, seed 0 | 0.4151 | 87.58% | 87.77% | 42.94 |
+| NorMuon+BaseGram | 20k, seed 0 | 0.5001 | 86.10% | 86.42% | 49.22 |
+| AdamW | 20k, seed 0 | 0.5967 | 82.46% | 82.25% | 59.19 |
 
-The focused runner was added because NorMuon+BaseGram is a distinct ablation
-from NorMuon layered on top of SODA+PMuonEq.
+The result supports SODA+PMuonEq+Gram as the best quality recipe in this compact
+ViT-5/CIFAR-10 harness. NorMuon+BaseGram is faster than SODA+PMuonEq+Gram and
+better than AdamW, but it did not close the quality gap.
