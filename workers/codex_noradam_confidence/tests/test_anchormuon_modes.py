@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import copy
+import sys
+from pathlib import Path
 
 import torch
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from optim_anchormuon import AnchorMuon, gram_newton_schulz, normuon_normalize_update, pmuon_eq_precondition
+from optim_factory import _anchor_param_groups
 
 
 class TinyNet(torch.nn.Module):
@@ -44,6 +51,7 @@ def _step(mode: dict) -> tuple[TinyNet, AnchorMuon]:
         normuon=mode.get("normuon", False),
         normuon_beta=mode.get("normuon_beta", 0.95),
         amuse=mode.get("amuse", True),
+        sync_diagnostics=mode.get("sync_diagnostics", False),
     )
     loss = _loss(model)
     loss.backward()
@@ -117,6 +125,107 @@ def test_modes_run_without_nan_and_keep_gradients_unchanged() -> None:
         if mode.get("normuon"):
             assert opt.last_stats["normuon_params"] > 0
         assert isinstance(model, TinyNet)
+
+
+def test_sync_diagnostics_are_opt_in() -> None:
+    _model, opt = _step({"soda": "all", "amuse": False, "normuon": True})
+    assert opt.last_stats["sync_diagnostics"] == 0.0
+    assert "mean_update_rms" not in opt.last_stats
+    assert "mean_precond_matrix_rms" not in opt.last_stats
+
+    _model, sync_opt = _step({"soda": "all", "amuse": False, "normuon": True, "sync_diagnostics": True})
+    assert sync_opt.last_stats["sync_diagnostics"] == 1.0
+    assert sync_opt.last_stats["mean_update_rms"] > 0.0
+    assert sync_opt.last_stats["mean_precond_matrix_rms"] > 0.0
+
+
+def test_reported_normuon_base_recipe_flags_are_explicit() -> None:
+    torch.manual_seed(13)
+    model = TinyNet()
+    opt = AnchorMuon(
+        _anchor_param_groups(model, weight_decay=0.05),
+        lr=8e-3,
+        warmup_steps=80,
+        soda="all",
+        amuse=False,
+        pmuon_eq=True,
+        pmuon_beta=0.90,
+        row_gamma=0.30,
+        col_gamma=0.0,
+        momentum=0.95,
+        normuon=True,
+        normuon_beta=0.95,
+        mimuon=False,
+    )
+    assert all(group["soda"] == "all" for group in opt.param_groups)
+    assert all(group["amuse"] is False for group in opt.param_groups)
+    assert all(group["pmuon_eq"] is True for group in opt.param_groups)
+    assert all(group["normuon"] is True for group in opt.param_groups)
+    assert all(group["mimuon"] is False for group in opt.param_groups)
+    assert {group["sync_diagnostics"] for group in opt.param_groups} == {False}
+
+    loss = _loss(model)
+    loss.backward()
+    opt.step()
+    assert opt.last_stats["matrix_params"] > 0
+    assert opt.last_stats["normuon_params"] == opt.last_stats["matrix_params"]
+
+
+def test_factory_currently_routes_2d_head_through_muon_path() -> None:
+    torch.manual_seed(17)
+    model = TinyNet()
+    groups = _anchor_param_groups(model, weight_decay=0.05)
+    opt = AnchorMuon(groups, lr=1e-3, warmup_steps=2, soda="all", amuse=False, normuon=True)
+    loss = _loss(model)
+    loss.backward()
+    opt.step()
+    # This documents the exact grouping used by the committed confidence runs:
+    # _anchor_param_groups is name-free, so a 2D classifier/head matrix is still
+    # eligible for Muon/NorMuon unless the model's no_weight_decay() excludes it.
+    assert opt._use_muon_for_param(opt.param_groups[0], model.linear2.weight)
+
+
+def test_reported_recipe_state_dict_resume_matches_uninterrupted_step() -> None:
+    def make_opt(model: TinyNet) -> AnchorMuon:
+        return AnchorMuon(
+            _anchor_param_groups(model, weight_decay=0.05),
+            lr=8e-3,
+            warmup_steps=80,
+            soda="all",
+            amuse=False,
+            pmuon_eq=True,
+            pmuon_beta=0.90,
+            row_gamma=0.30,
+            col_gamma=0.0,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.95,
+            mimuon=False,
+        )
+
+    def seeded_step(model: TinyNet, opt: AnchorMuon, seed: int) -> None:
+        torch.manual_seed(seed)
+        loss = _loss(model)
+        loss.backward()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+
+    torch.manual_seed(19)
+    uninterrupted = TinyNet()
+    opt_uninterrupted = make_opt(uninterrupted)
+    seeded_step(uninterrupted, opt_uninterrupted, seed=20)
+
+    resumed = copy.deepcopy(uninterrupted)
+    opt_resumed = make_opt(resumed)
+    opt_resumed.load_state_dict(copy.deepcopy(opt_uninterrupted.state_dict()))
+
+    seeded_step(uninterrupted, opt_uninterrupted, seed=21)
+    seeded_step(resumed, opt_resumed, seed=21)
+
+    for p_expected, p_actual in zip(uninterrupted.parameters(), resumed.parameters()):
+        assert torch.allclose(p_expected, p_actual, atol=1e-6, rtol=1e-6)
+    for group_expected, group_actual in zip(opt_uninterrupted.param_groups, opt_resumed.param_groups):
+        assert group_expected["anchor_step"] == group_actual["anchor_step"]
 
 
 def test_eval_train_swap_roundtrip() -> None:

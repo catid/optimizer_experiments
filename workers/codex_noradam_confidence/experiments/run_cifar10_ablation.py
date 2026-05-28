@@ -94,6 +94,16 @@ def parse_args() -> argparse.Namespace:
                         help="Comma-separated seeds. Supervisor duplicates selected trials for each seed.")
     parser.add_argument("--warmup-steps", type=int, default=80)
     parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument(
+        "--no-sync-step-timing",
+        dest="sync_step_timing",
+        action="store_false",
+        help=(
+            "Skip CUDA synchronization around each training step. Per-step timing "
+            "then measures CPU launch time, but end-to-end interval throughput is less perturbed."
+        ),
+    )
+    parser.set_defaults(sync_step_timing=True)
     parser.add_argument("--no-plots", action="store_true")
     return parser.parse_args()
 
@@ -459,7 +469,7 @@ def run_worker(args: argparse.Namespace) -> None:
                         group["lr"] = lr
                 images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
                 targets = targets.to(device, non_blocking=True)
-                if torch.cuda.is_available():
+                if args.sync_step_timing and torch.cuda.is_available():
                     torch.cuda.synchronize()
                 step_start = time.perf_counter()
                 optimizer.zero_grad(set_to_none=True)
@@ -468,7 +478,7 @@ def run_worker(args: argparse.Namespace) -> None:
                     loss = criterion(logits, targets)
                 loss.backward()
                 optimizer.step()
-                if torch.cuda.is_available():
+                if args.sync_step_timing and torch.cuda.is_available():
                     torch.cuda.synchronize()
                 step_ms = (time.perf_counter() - step_start) * 1000.0
                 batch = int(targets.numel())
@@ -491,6 +501,7 @@ def run_worker(args: argparse.Namespace) -> None:
                         "train_loss": float(loss.item()),
                         "lr": float(optimizer.param_groups[0]["lr"]),
                         "step_ms": step_ms,
+                        "step_timing": "cuda_synchronized" if args.sync_step_timing else "cpu_launch_unsynchronized",
                     }
                     if hasattr(optimizer, "last_stats"):
                         row.update({f"opt_{k}": v for k, v in optimizer.last_stats.items()})
@@ -518,6 +529,7 @@ def run_worker(args: argparse.Namespace) -> None:
                         "overall_examples_per_sec": total_examples_seen / max(total_train_seconds, 1e-9),
                         "elapsed_wall_sec": time.perf_counter() - started,
                         "max_memory_mb": torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0),
+                        "step_timing": "cuda_synchronized" if args.sync_step_timing else "cpu_launch_unsynchronized",
                     }
                     if hasattr(optimizer, "last_stats"):
                         row.update({f"opt_{k}": v for k, v in optimizer.last_stats.items()})
@@ -550,6 +562,7 @@ def run_worker(args: argparse.Namespace) -> None:
                 "best_val_loss": best_val_loss,
                 "examples_per_sec": train_total / max(train_seconds, 1e-9),
                 "max_memory_mb": torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0),
+                "step_timing": "cuda_synchronized" if args.sync_step_timing else "cpu_launch_unsynchronized",
             }
             if hasattr(optimizer, "last_stats"):
                 row.update({f"opt_{k}": v for k, v in optimizer.last_stats.items()})
@@ -582,6 +595,7 @@ def run_worker(args: argparse.Namespace) -> None:
         "avg_step_ms": 1000.0 * total_train_seconds / max(global_step, 1),
         "overall_examples_per_sec": total_examples_seen / max(total_train_seconds, 1e-9),
         "elapsed_sec": time.perf_counter() - started,
+        "step_timing": "cuda_synchronized" if args.sync_step_timing else "cpu_launch_unsynchronized",
         "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name(0),
     })
@@ -622,6 +636,8 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> None:
                 "--warmup-steps", str(args.warmup_steps),
                 "--log-every", str(args.log_every),
             ]
+            if not args.sync_step_timing:
+                cmd.append("--no-sync-step-timing")
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(next_gpu)
             print(f"[launch] gpu={next_gpu} trial={cfg.name}", flush=True)

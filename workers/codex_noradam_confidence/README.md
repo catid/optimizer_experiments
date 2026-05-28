@@ -38,6 +38,39 @@ See `results/cifar10_confidence_noradam_20260528/summary.md`.
 NorMuon+base is better on validation loss and accuracy in this harness, while
 AdamW is faster per step.
 
+## Exact Reported Recipe
+
+The reported NorMuon+base rows use this explicit AnchorMuon configuration:
+
+```text
+lr = 8e-3
+warmup_steps = 80
+amuse = False
+soda = "all"
+soda_disables_weight_decay = True
+pmuon_eq = True
+pmuon_beta = 0.90
+row_gamma = 0.30
+col_gamma = 0.0
+momentum = 0.95
+normuon = True
+normuon_beta = 0.95
+mimuon = False
+ns_steps = 5
+```
+
+`_anchor_param_groups()` is intentionally the grouping used by the committed
+confidence runs. It is name-free except for the model's `no_weight_decay()`
+hook, so a 2D classifier/head matrix can be routed through the Muon/NorMuon
+path unless the model excludes it. Treat that as part of the reported recipe
+rather than an implied general recommendation.
+
+`AnchorMuon.sync_diagnostics` now defaults to `False`. The committed historical
+metrics include `mean_update_rms` and `mean_precond_matrix_rms`, but those values
+required GPU-to-CPU synchronization inside `step()`. Enable
+`sync_diagnostics=True` only for debugging runs where that timing perturbation is
+acceptable.
+
 ## Reproduction Commands
 
 From this folder, with the repo environment active:
@@ -45,6 +78,7 @@ From this folder, with the repo environment active:
 ```bash
 python -m py_compile experiments/run_cifar10_ablation.py optim_anchormuon.py
 python -m pytest -q tests/test_anchormuon_modes.py
+python -m torch.distributed.run --standalone --nproc-per-node=<num_gpus> tests/ddp_smoke_anchormuon.py
 ```
 
 The HPO run used:

@@ -241,6 +241,8 @@ class AnchorMuon(torch.optim.Optimizer):
     * ``soda``: ``"matrix"`` by default, meaning only matrix/Muon parameters get
       SODA's initialization-anchor pull. Use ``True``/``"all"`` for all params or
       ``False``/``"none"`` to disable SODA.
+    * ``sync_diagnostics``: off by default. When enabled, ``last_stats`` includes
+      RMS diagnostics that require GPU-to-CPU synchronization inside ``step()``.
     """
 
     def __init__(
@@ -273,6 +275,7 @@ class AnchorMuon(torch.optim.Optimizer):
         weight_decay: float = 0.0,
         soda: bool | str = "matrix",
         soda_disables_weight_decay: bool = True,
+        sync_diagnostics: bool = False,
         min_matrix_dim: int = 2,
     ) -> None:
         b1 = float(betas[0] if beta1 is None else beta1)
@@ -319,6 +322,7 @@ class AnchorMuon(torch.optim.Optimizer):
             weight_decay=float(weight_decay),
             soda=soda,
             soda_disables_weight_decay=bool(soda_disables_weight_decay),
+            sync_diagnostics=bool(sync_diagnostics),
             min_matrix_dim=int(min_matrix_dim),
             anchor_step=0,
             anchor_weight_sum=0.0,
@@ -471,6 +475,7 @@ class AnchorMuon(torch.optim.Optimizer):
         normuon_params = 0
         update_rms_sum = 0.0
         precond_rms_sum = 0.0
+        sync_diagnostics_count = 0
         lr_last = 0.0
         beta_last = 0.0
 
@@ -482,6 +487,7 @@ class AnchorMuon(torch.optim.Optimizer):
             momentum_beta = float(group["momentum"])
             group_weight_decay = float(group["weight_decay"])
             amuse = bool(group.get("amuse", True))
+            sync_diagnostics = bool(group.get("sync_diagnostics", False))
 
             for param in group["params"]:
                 if param.grad is None:
@@ -547,7 +553,8 @@ class AnchorMuon(torch.optim.Optimizer):
                         update_matrix = mix * muon_matrix + (1.0 - mix) * raw_matrix
                     else:
                         update_matrix = muon_matrix
-                    precond_rms_sum += float(preconditioned.float().square().mean().sqrt().detach().cpu())
+                    if sync_diagnostics:
+                        precond_rms_sum += float(preconditioned.float().square().mean().sqrt().detach().cpu())
                     update = _restore_matrix_view(update_matrix, original_shape)
                 else:
                     exp_avg_sq = self._ensure_fallback_state(param, state)
@@ -576,7 +583,9 @@ class AnchorMuon(torch.optim.Optimizer):
                         lam = 1.0 / float(t + 1)
                         z.add_(init - old_base, alpha=lam)
                     param.copy_(z.to(device=param.device, dtype=param.dtype))
-                update_rms_sum += float(update.float().square().mean().sqrt().detach().cpu())
+                if sync_diagnostics:
+                    sync_diagnostics_count += 1
+                    update_rms_sum += float(update.float().square().mean().sqrt().detach().cpu())
 
         self.last_stats = {
             "step": float(max((int(g.get("anchor_step", 0)) for g in self.param_groups), default=0)),
@@ -586,9 +595,15 @@ class AnchorMuon(torch.optim.Optimizer):
             "matrix_params": float(matrix_params),
             "mimuon_params": float(mimuon_params),
             "normuon_params": float(normuon_params),
-            "mean_update_rms": update_rms_sum / max(total_params, 1),
-            "mean_precond_matrix_rms": precond_rms_sum / max(matrix_params, 1),
+            "sync_diagnostics": float(sync_diagnostics_count > 0),
         }
+        if sync_diagnostics_count > 0:
+            self.last_stats.update(
+                {
+                    "mean_update_rms": update_rms_sum / max(sync_diagnostics_count, 1),
+                    "mean_precond_matrix_rms": precond_rms_sum / max(matrix_params, 1),
+                }
+            )
         return loss
 
 

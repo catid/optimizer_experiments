@@ -27,6 +27,24 @@ class TinyDDP(torch.nn.Module):
         return self.net(x)
 
 
+def assert_replicated(name: str, tensor: torch.Tensor, *, atol: float = 1e-6) -> None:
+    flat = tensor.detach().float().reshape(-1)
+    gathered = [torch.empty_like(flat) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, flat)
+    stacked = torch.stack(gathered, dim=0)
+    spread = (stacked.max(dim=0).values - stacked.min(dim=0).values).max()
+    if spread.item() > atol:
+        raise AssertionError(f"{name} differs across DDP ranks: max spread {spread.item():.3e}")
+
+
+def assert_optimizer_replicated(model: TinyDDP, opt: AnchorMuon) -> None:
+    for name, param in model.named_parameters():
+        assert_replicated(f"param:{name}", param)
+        for state_name, value in opt.state[param].items():
+            if torch.is_tensor(value):
+                assert_replicated(f"state:{name}:{state_name}", value)
+
+
 def main() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -34,7 +52,7 @@ def main() -> None:
     torch.manual_seed(100 + dist.get_rank())
     model = TinyDDP().cuda()
     ddp = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
-    opt = AnchorMuon(ddp.parameters(), lr=1e-3, warmup_steps=2, soda="matrix", pmuon_eq=True, mimuon=True)
+    opt = AnchorMuon(ddp.parameters(), lr=1e-3, warmup_steps=2, soda="all", pmuon_eq=True, mimuon=True, normuon=True)
     for _ in range(3):
         opt.train()
         x = torch.randn(32, 16, device="cuda")
@@ -44,13 +62,16 @@ def main() -> None:
         opt.step()
         opt.zero_grad(set_to_none=True)
         assert torch.isfinite(loss)
+        assert_optimizer_replicated(model, opt)
     opt.eval()
+    assert_optimizer_replicated(model, opt)
     with torch.no_grad():
         _ = ddp(torch.randn(8, 16, device="cuda"))
     opt.train()
+    assert_optimizer_replicated(model, opt)
     dist.barrier()
     if dist.get_rank() == 0:
-        print("ddp smoke passed")
+        print("ddp smoke passed with parameter/state parity")
     dist.destroy_process_group()
 
 
