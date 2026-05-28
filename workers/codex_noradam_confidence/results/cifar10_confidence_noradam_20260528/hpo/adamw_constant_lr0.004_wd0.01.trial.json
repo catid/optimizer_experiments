@@ -1,0 +1,19 @@
+{
+  "name": "adamw_constant_lr0.004_wd0.01",
+  "optimizer": "adamw",
+  "lr": 0.004,
+  "seed": null,
+  "lr_schedule": "constant",
+  "weight_decay": 0.01,
+  "soda": "matrix",
+  "pmuon_eq": true,
+  "row_gamma": 0.2,
+  "col_gamma": 0.0,
+  "pmuon_beta": 0.95,
+  "momentum": 0.95,
+  "amuse": true,
+  "mimuon": false,
+  "mimuon_mix": 0.85,
+  "normuon": false,
+  "normuon_beta": 0.95
+}

@@ -1,0 +1,892 @@
+#!/usr/bin/env python3
+"""Run CIFAR-10 optimizer ablations for ViT-5 + AnchorMuon.
+
+The supervisor process launches one worker per visible GPU. Each worker trains a
+single small ViT-5 model, writes JSONL curves, and exits. The default quick preset
+tunes AdamW and several AnchorMuon ablations with the same model, data subset,
+batch size, and epoch budget.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Iterable
+
+import torch
+from timm.models import create_model
+from torch import nn
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import models_vit5  # noqa: F401  Registers vit5_micro/vit5_tiny with timm.
+from optim_anchormuon import AnchorMuon
+from optim_factory import _anchor_param_groups
+
+
+@dataclass
+class TrialConfig:
+    name: str
+    optimizer: str
+    lr: float
+    seed: int | None = None
+    lr_schedule: str = "cosine"
+    weight_decay: float = 0.05
+    soda: str = "matrix"
+    pmuon_eq: bool = True
+    row_gamma: float = 0.20
+    col_gamma: float = 0.0
+    pmuon_beta: float = 0.95
+    momentum: float = 0.95
+    amuse: bool = True
+    mimuon: bool = False
+    mimuon_mix: float = 0.85
+    normuon: bool = False
+    normuon_beta: float = 0.95
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--trial-json", type=Path)
+    parser.add_argument("--two-stage", action="store_true",
+                        help="Run HPO first, select best configs by family, then run fixed-step 8-bin finals")
+    parser.add_argument("--final-from-hpo", type=Path,
+                        help="Run only the fixed-step finals from an existing hpo/best_by_family.json")
+    parser.add_argument(
+        "--preset",
+        default="quick",
+        choices=["smoke", "quick", "full", "sweep", "focused20", "confidence"],
+    )
+    parser.add_argument("--only", default="", help="Regex filter for trial names")
+    parser.add_argument("--max-trials", type=int, default=0)
+    parser.add_argument("--data-path", type=Path, default=Path("/home/catid/screen/repos/TinyRecursiveModels/data/cifar10"))
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "experiments" / "results" / "cifar10_anchormuon")
+    parser.add_argument("--model", default="vit5_micro")
+    parser.add_argument("--epochs", type=int, default=6)
+    parser.add_argument("--max-steps", type=int, default=0,
+                        help="Stop after this many optimizer steps instead of using all epoch steps")
+    parser.add_argument("--eval-bins", type=int, default=8,
+                        help="Number of fixed-step validation bins for final loss-curve comparison")
+    parser.add_argument("--hpo-epochs", type=int, default=4)
+    parser.add_argument("--hpo-max-steps", type=int, default=0)
+    parser.add_argument("--final-epochs", type=int, default=12)
+    parser.add_argument("--final-max-steps", type=int, default=0)
+    parser.add_argument("--train-subset", type=int, default=10000)
+    parser.add_argument("--val-subset", type=int, default=2000)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--num-workers", type=int, default=max(2, (os.cpu_count() or 8) // 4))
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--seeds", default="",
+                        help="Comma-separated seeds. Supervisor duplicates selected trials for each seed.")
+    parser.add_argument("--warmup-steps", type=int, default=80)
+    parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument("--no-plots", action="store_true")
+    return parser.parse_args()
+
+
+def trial_grid(preset: str) -> list[TrialConfig]:
+    smoke = [
+        TrialConfig("adamw_lr1e-3", "adamw", 1e-3),
+        TrialConfig("anchormuon_full_lr4e-3_rg0p20", "anchormuon", 4e-3),
+        TrialConfig("anchormuon_no_soda_lr4e-3", "anchormuon", 4e-3, soda="none"),
+        TrialConfig("anchormuon_no_pmuoneq_lr4e-3", "anchormuon", 4e-3, pmuon_eq=False),
+    ]
+    if preset == "smoke":
+        return smoke
+    quick = [
+        TrialConfig("adamw_lr5e-4", "adamw", 5e-4),
+        TrialConfig("adamw_lr1e-3", "adamw", 1e-3),
+        TrialConfig("adamw_lr2e-3", "adamw", 2e-3),
+        TrialConfig("anchormuon_full_lr2e-3_rg0p20", "anchormuon", 2e-3),
+        TrialConfig("anchormuon_full_lr4e-3_rg0p20", "anchormuon", 4e-3),
+        TrialConfig("anchormuon_full_lr6e-3_rg0p20", "anchormuon", 6e-3),
+        TrialConfig("anchormuon_no_soda_lr4e-3", "anchormuon", 4e-3, soda="none"),
+        TrialConfig("anchormuon_no_pmuoneq_lr4e-3", "anchormuon", 4e-3, pmuon_eq=False),
+        TrialConfig("anchormuon_mimuon_lr4e-3_mix0p85", "anchormuon", 4e-3, mimuon=True, mimuon_mix=0.85),
+    ]
+    if preset == "quick":
+        return quick
+    full = quick + [
+        TrialConfig("anchormuon_full_lr4e-3_rg0p10", "anchormuon", 4e-3, row_gamma=0.10),
+        TrialConfig("anchormuon_full_lr4e-3_rg0p30", "anchormuon", 4e-3, row_gamma=0.30),
+        TrialConfig("anchormuon_full_lr4e-3_rg0p20_cg0p10", "anchormuon", 4e-3, row_gamma=0.20, col_gamma=0.10),
+        TrialConfig("anchormuon_mimuon_lr6e-3_mix0p75", "anchormuon", 6e-3, mimuon=True, mimuon_mix=0.75),
+        TrialConfig("anchormuon_no_soda_no_pmuoneq_lr4e-3", "anchormuon", 4e-3, soda="none", pmuon_eq=False),
+    ]
+    if preset == "full":
+        return full
+    focused20 = [
+        TrialConfig("adamw_lr0.003_wd0.005", "adamw", 3e-3, weight_decay=0.005),
+        TrialConfig(
+            "base_mlr0.009_rg0.2_cg0.1_mom0.95_pb0.9",
+            "anchormuon",
+            9e-3,
+            soda="all",
+            row_gamma=0.20,
+            col_gamma=0.10,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            amuse=False,
+        ),
+        TrialConfig(
+            "normuon_mlr0.007_rg0.3_cg0.1_mom0.95_pb0.9_nb0.9",
+            "anchormuon",
+            7e-3,
+            soda="all",
+            row_gamma=0.30,
+            col_gamma=0.10,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.90,
+            amuse=False,
+        ),
+        TrialConfig(
+            "mimuon_mlr0.007_rg0.3_cg0.1_mom0.95_pb0.9_mix0.85",
+            "anchormuon",
+            7e-3,
+            soda="all",
+            row_gamma=0.30,
+            col_gamma=0.10,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            mimuon=True,
+            mimuon_mix=0.85,
+            amuse=False,
+        ),
+        TrialConfig(
+            "mimuon_normuon_mlr0.009_rg0.3_cg0.1_mom0.95_pb0.9_mix0.85_nb0.95",
+            "anchormuon",
+            9e-3,
+            soda="all",
+            row_gamma=0.30,
+            col_gamma=0.10,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            mimuon=True,
+            mimuon_mix=0.85,
+            normuon=True,
+            normuon_beta=0.95,
+            amuse=False,
+        ),
+    ]
+    if preset == "focused20":
+        return focused20
+    confidence: list[TrialConfig] = []
+    for schedule in ["cosine", "constant"]:
+        for lr in [2e-3, 3e-3, 4e-3]:
+            for wd in [0.001, 0.005, 0.01, 0.03, 0.05]:
+                confidence.append(TrialConfig(
+                    f"adamw_{schedule}_lr{lr:g}_wd{wd:g}",
+                    "adamw",
+                    lr,
+                    lr_schedule=schedule,
+                    weight_decay=wd,
+                ))
+    for lr in [6e-3, 7e-3, 8e-3]:
+        for row_gamma in [0.20, 0.30]:
+            for col_gamma in [0.0, 0.10]:
+                for normuon_beta in [0.90, 0.95]:
+                    confidence.append(TrialConfig(
+                        (
+                            f"normuon_mlr{lr:g}_rg{row_gamma:g}_cg{col_gamma:g}"
+                            f"_mom0.95_pb0.9_nb{normuon_beta:g}"
+                        ),
+                        "anchormuon",
+                        lr,
+                        soda="all",
+                        row_gamma=row_gamma,
+                        col_gamma=col_gamma,
+                        pmuon_beta=0.90,
+                        momentum=0.95,
+                        normuon=True,
+                        normuon_beta=normuon_beta,
+                        amuse=False,
+                    ))
+    if preset == "confidence":
+        return confidence
+    return full + [
+        TrialConfig("adamw_lr3e-3", "adamw", 3e-3),
+        TrialConfig("adamw_lr2e-3_wd0p03", "adamw", 2e-3, weight_decay=0.03),
+        TrialConfig("adamw_lr2e-3_wd0p10", "adamw", 2e-3, weight_decay=0.10),
+        TrialConfig("anchormuon_full_lr3e-3_rg0p20", "anchormuon", 3e-3),
+        TrialConfig("anchormuon_full_lr8e-3_rg0p20", "anchormuon", 8e-3),
+        TrialConfig("anchormuon_full_lr6e-3_rg0p10", "anchormuon", 6e-3, row_gamma=0.10),
+        TrialConfig("anchormuon_full_lr6e-3_rg0p30", "anchormuon", 6e-3, row_gamma=0.30),
+        TrialConfig("anchormuon_full_lr6e-3_rg0p20_cg0p10", "anchormuon", 6e-3, row_gamma=0.20, col_gamma=0.10),
+        TrialConfig("anchormuon_full_lr6e-3_beta0p90", "anchormuon", 6e-3, pmuon_beta=0.90),
+        TrialConfig("anchormuon_full_lr6e-3_beta0p98", "anchormuon", 6e-3, pmuon_beta=0.98),
+        TrialConfig("anchormuon_soda_all_lr4e-3", "anchormuon", 4e-3, soda="all"),
+        TrialConfig("anchormuon_soda_all_lr6e-3", "anchormuon", 6e-3, soda="all"),
+        TrialConfig("anchormuon_soda_all_normuon_lr3e-3", "anchormuon", 3e-3, soda="all", normuon=True),
+        TrialConfig("anchormuon_soda_all_normuon_lr4e-3", "anchormuon", 4e-3, soda="all", normuon=True),
+        TrialConfig("anchormuon_soda_all_normuon_lr5e-3", "anchormuon", 5e-3, soda="all", normuon=True),
+        TrialConfig("anchormuon_soda_all_normuon_lr4e-3_beta0p90", "anchormuon", 4e-3, soda="all", normuon=True, normuon_beta=0.90),
+        TrialConfig("anchormuon_soda_all_mimuon_lr3e-3_mix0p85", "anchormuon", 3e-3, soda="all", mimuon=True, mimuon_mix=0.85),
+        TrialConfig("anchormuon_soda_all_mimuon_lr4e-3_mix0p75", "anchormuon", 4e-3, soda="all", mimuon=True, mimuon_mix=0.75),
+        TrialConfig("anchormuon_soda_all_mimuon_lr4e-3_mix0p85", "anchormuon", 4e-3, soda="all", mimuon=True, mimuon_mix=0.85),
+        TrialConfig("anchormuon_soda_all_mimuon_lr4e-3_mix0p95", "anchormuon", 4e-3, soda="all", mimuon=True, mimuon_mix=0.95),
+        TrialConfig("anchormuon_soda_all_mimuon_normuon_lr4e-3_mix0p85", "anchormuon", 4e-3, soda="all", mimuon=True, mimuon_mix=0.85, normuon=True),
+        TrialConfig("anchormuon_no_soda_lr2e-3", "anchormuon", 2e-3, soda="none"),
+        TrialConfig("anchormuon_no_soda_lr3e-3", "anchormuon", 3e-3, soda="none"),
+        TrialConfig("anchormuon_no_soda_lr6e-3", "anchormuon", 6e-3, soda="none"),
+        TrialConfig("anchormuon_no_soda_lr4e-3_rg0p10", "anchormuon", 4e-3, soda="none", row_gamma=0.10),
+        TrialConfig("anchormuon_no_soda_lr4e-3_rg0p30", "anchormuon", 4e-3, soda="none", row_gamma=0.30),
+        TrialConfig("anchormuon_no_soda_lr4e-3_cg0p10", "anchormuon", 4e-3, soda="none", col_gamma=0.10),
+        TrialConfig("anchormuon_no_soda_lr4e-3_beta0p90", "anchormuon", 4e-3, soda="none", pmuon_beta=0.90),
+        TrialConfig("anchormuon_no_soda_lr4e-3_beta0p98", "anchormuon", 4e-3, soda="none", pmuon_beta=0.98),
+        TrialConfig("anchormuon_no_pmuoneq_lr2e-3", "anchormuon", 2e-3, pmuon_eq=False),
+        TrialConfig("anchormuon_no_pmuoneq_lr6e-3", "anchormuon", 6e-3, pmuon_eq=False),
+        TrialConfig("anchormuon_no_soda_no_pmuoneq_lr2e-3", "anchormuon", 2e-3, soda="none", pmuon_eq=False),
+        TrialConfig("anchormuon_no_soda_no_pmuoneq_lr6e-3", "anchormuon", 6e-3, soda="none", pmuon_eq=False),
+        TrialConfig("anchormuon_mimuon_lr4e-3_mix0p75", "anchormuon", 4e-3, mimuon=True, mimuon_mix=0.75),
+        TrialConfig("anchormuon_mimuon_lr4e-3_mix0p95", "anchormuon", 4e-3, mimuon=True, mimuon_mix=0.95),
+        TrialConfig("anchormuon_mimuon_lr6e-3_mix0p85", "anchormuon", 6e-3, mimuon=True, mimuon_mix=0.85),
+    ]
+
+
+def trial_family(cfg: TrialConfig) -> str:
+    if cfg.optimizer == "adamw":
+        return "adamw"
+    if cfg.mimuon and cfg.normuon:
+        return "anchormuon_mimuon_normuon"
+    if cfg.mimuon:
+        return "anchormuon_mimuon"
+    if cfg.normuon:
+        return "anchormuon_normuon"
+    if cfg.soda == "all":
+        return "anchormuon_soda_all"
+    if cfg.soda == "none" and not cfg.pmuon_eq:
+        return "anchormuon_no_soda_no_pmuoneq"
+    if cfg.soda == "none":
+        return "anchormuon_no_soda"
+    if not cfg.pmuon_eq:
+        return "anchormuon_no_pmuoneq"
+    return "anchormuon_full"
+
+
+def cifar10_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
+    mean = (0.4914, 0.4822, 0.4465)
+    std = (0.2470, 0.2435, 0.2616)
+    train_tf = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+    val_tf = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+    train_ds = datasets.CIFAR10(args.data_path, train=True, transform=train_tf, download=True)
+    val_ds = datasets.CIFAR10(args.data_path, train=False, transform=val_tf, download=True)
+    if 0 < args.train_subset < len(train_ds):
+        gen = torch.Generator().manual_seed(args.seed)
+        train_ds = Subset(train_ds, torch.randperm(len(train_ds), generator=gen)[:args.train_subset].tolist())
+    if 0 < args.val_subset < len(val_ds):
+        val_ds = Subset(val_ds, list(range(args.val_subset)))
+    loader_kwargs = dict(
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+    )
+    train_loader = DataLoader(train_ds, shuffle=True, drop_last=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, drop_last=False, **loader_kwargs)
+    return train_loader, val_loader
+
+
+def set_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def adamw_lr(
+    step: int,
+    total_steps: int,
+    base_lr: float,
+    warmup_steps: int,
+    schedule: str = "cosine",
+) -> float:
+    if step < max(1, warmup_steps):
+        return base_lr * float(step + 1) / float(max(1, warmup_steps))
+    if schedule == "constant":
+        return base_lr
+    if schedule != "cosine":
+        raise ValueError(f"unknown AdamW lr schedule {schedule!r}")
+    progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+    return base_lr * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress))))
+
+
+def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace) -> torch.optim.Optimizer:
+    if cfg.optimizer == "adamw":
+        return torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.999))
+    if cfg.optimizer == "anchormuon":
+        return AnchorMuon(
+            _anchor_param_groups(model, cfg.weight_decay),
+            lr=cfg.lr,
+            warmup_steps=args.warmup_steps,
+            use_external_lr=False,
+            weight_decay=cfg.weight_decay,
+            soda=cfg.soda,
+            pmuon_eq=cfg.pmuon_eq,
+            row_gamma=cfg.row_gamma,
+            col_gamma=cfg.col_gamma,
+            pmuon_beta=cfg.pmuon_beta,
+            momentum=cfg.momentum,
+            amuse=cfg.amuse,
+            mimuon=cfg.mimuon,
+            mimuon_mix=cfg.mimuon_mix,
+            normuon=cfg.normuon,
+            normuon_beta=cfg.normuon_beta,
+        )
+    raise ValueError(f"unknown optimizer {cfg.optimizer}")
+
+
+def selected_eval_steps(total_steps: int, bins: int) -> set[int]:
+    bins = max(1, int(bins))
+    steps = {max(1, round(total_steps * i / bins)) for i in range(1, bins + 1)}
+    steps.add(total_steps)
+    return steps
+
+
+def parse_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    raise ValueError(f"cannot parse boolean value {value!r}")
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, optimizer: torch.optim.Optimizer, loader: DataLoader, device: torch.device) -> tuple[float, float]:
+    was_training = model.training
+    if hasattr(optimizer, "eval"):
+        optimizer.eval()
+    model.eval()
+    loss_sum = 0.0
+    correct = 0
+    total = 0
+    criterion = nn.CrossEntropyLoss()
+    for images, targets in loader:
+        images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
+        targets = targets.to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            logits = model(images)
+            loss = criterion(logits, targets)
+        batch = int(targets.numel())
+        loss_sum += float(loss.item()) * batch
+        correct += int((logits.argmax(dim=1) == targets).sum().item())
+        total += batch
+    if hasattr(optimizer, "train"):
+        optimizer.train()
+    if was_training:
+        model.train()
+    return loss_sum / max(total, 1), 100.0 * correct / max(total, 1)
+
+
+def run_worker(args: argparse.Namespace) -> None:
+    assert args.trial_json is not None
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this benchmark")
+    cfg = TrialConfig(**json.loads(args.trial_json.read_text()))
+    trial_dir = args.output_dir / cfg.name
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = trial_dir / "metrics.jsonl"
+    trial_seed = int(cfg.seed if cfg.seed is not None else args.seed)
+    args.seed = trial_seed
+    set_seed(trial_seed)
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda:0")
+
+    train_loader, val_loader = cifar10_loaders(args)
+    model = create_model(args.model, pretrained=False, num_classes=10, img_size=32, drop_path_rate=0.05)
+    model.to(device=device, memory_format=torch.channels_last)
+    optimizer = make_optimizer(model, cfg, args)
+    criterion = nn.CrossEntropyLoss()
+    total_steps = args.epochs * len(train_loader)
+    if args.max_steps > 0:
+        total_steps = min(total_steps, int(args.max_steps))
+    eval_steps = selected_eval_steps(total_steps, args.eval_bins)
+    global_step = 0
+    total_examples_seen = 0
+    total_train_seconds = 0.0
+    best_val_acc = 0.0
+    best_val_loss = float("inf")
+    epoch_rows: list[dict[str, float | int | str]] = []
+    started = time.perf_counter()
+
+    with metrics_path.open("w") as f:
+        interval_start = time.perf_counter()
+        interval_loss_sum = 0.0
+        interval_examples = 0
+        interval_step_ms_sum = 0.0
+        interval_steps = 0
+        for epoch in range(args.epochs):
+            if hasattr(optimizer, "train"):
+                optimizer.train()
+            model.train()
+            train_loss_sum = 0.0
+            train_correct = 0
+            train_total = 0
+            train_start = time.perf_counter()
+            for batch_idx, (images, targets) in enumerate(train_loader):
+                if global_step >= total_steps:
+                    break
+                if cfg.optimizer == "adamw":
+                    lr = adamw_lr(global_step, total_steps, cfg.lr, args.warmup_steps, cfg.lr_schedule)
+                    for group in optimizer.param_groups:
+                        group["lr"] = lr
+                images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
+                targets = targets.to(device, non_blocking=True)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                step_start = time.perf_counter()
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    logits = model(images)
+                    loss = criterion(logits, targets)
+                loss.backward()
+                optimizer.step()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                step_ms = (time.perf_counter() - step_start) * 1000.0
+                batch = int(targets.numel())
+                train_loss_sum += float(loss.item()) * batch
+                train_correct += int((logits.argmax(dim=1) == targets).sum().item())
+                train_total += batch
+                total_examples_seen += batch
+                interval_loss_sum += float(loss.item()) * batch
+                interval_examples += batch
+                interval_step_ms_sum += step_ms
+                interval_steps += 1
+                total_train_seconds += step_ms / 1000.0
+                if global_step % args.log_every == 0:
+                    row = {
+                        "type": "step",
+                        "trial": cfg.name,
+                        "epoch": epoch,
+                        "step": global_step,
+                        "batch": batch_idx,
+                        "train_loss": float(loss.item()),
+                        "lr": float(optimizer.param_groups[0]["lr"]),
+                        "step_ms": step_ms,
+                    }
+                    if hasattr(optimizer, "last_stats"):
+                        row.update({f"opt_{k}": v for k, v in optimizer.last_stats.items()})
+                    f.write(json.dumps(row) + "\n")
+                    f.flush()
+                global_step += 1
+                if global_step in eval_steps:
+                    interval_seconds = time.perf_counter() - interval_start
+                    val_loss, val_acc = evaluate(model, optimizer, val_loader, device)
+                    best_val_acc = max(best_val_acc, val_acc)
+                    best_val_loss = min(best_val_loss, val_loss)
+                    row = {
+                        "type": "bin",
+                        "trial": cfg.name,
+                        "epoch": epoch,
+                        "step": global_step,
+                        "progress": global_step / max(total_steps, 1),
+                        "train_loss": interval_loss_sum / max(interval_examples, 1),
+                        "val_loss": val_loss,
+                        "val_acc": val_acc,
+                        "best_val_acc": best_val_acc,
+                        "best_val_loss": best_val_loss,
+                        "interval_examples_per_sec": interval_examples / max(interval_seconds, 1e-9),
+                        "interval_avg_step_ms": interval_step_ms_sum / max(interval_steps, 1),
+                        "overall_examples_per_sec": total_examples_seen / max(total_train_seconds, 1e-9),
+                        "elapsed_wall_sec": time.perf_counter() - started,
+                        "max_memory_mb": torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0),
+                    }
+                    if hasattr(optimizer, "last_stats"):
+                        row.update({f"opt_{k}": v for k, v in optimizer.last_stats.items()})
+                    f.write(json.dumps(row) + "\n")
+                    f.flush()
+                    print(json.dumps(row), flush=True)
+                    interval_start = time.perf_counter()
+                    interval_loss_sum = 0.0
+                    interval_examples = 0
+                    interval_step_ms_sum = 0.0
+                    interval_steps = 0
+            train_seconds = time.perf_counter() - train_start
+            if train_total == 0:
+                break
+            train_loss = train_loss_sum / max(train_total, 1)
+            train_acc = 100.0 * train_correct / max(train_total, 1)
+            val_loss, val_acc = evaluate(model, optimizer, val_loader, device)
+            best_val_acc = max(best_val_acc, val_acc)
+            best_val_loss = min(best_val_loss, val_loss)
+            row = {
+                "type": "epoch",
+                "trial": cfg.name,
+                "epoch": epoch,
+                "step": global_step,
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "best_val_acc": best_val_acc,
+                "best_val_loss": best_val_loss,
+                "examples_per_sec": train_total / max(train_seconds, 1e-9),
+                "max_memory_mb": torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0),
+            }
+            if hasattr(optimizer, "last_stats"):
+                row.update({f"opt_{k}": v for k, v in optimizer.last_stats.items()})
+            f.write(json.dumps(row) + "\n")
+            f.flush()
+            epoch_rows.append(row)
+            print(json.dumps(row), flush=True)
+            if global_step >= total_steps:
+                break
+
+    final = dict(epoch_rows[-1])
+    final.update({
+        "trial": cfg.name,
+        "optimizer": cfg.optimizer,
+        "lr": cfg.lr,
+        "lr_schedule": cfg.lr_schedule,
+        "seed": trial_seed,
+        "weight_decay": cfg.weight_decay,
+        "soda": cfg.soda,
+        "pmuon_eq": cfg.pmuon_eq,
+        "row_gamma": cfg.row_gamma,
+        "col_gamma": cfg.col_gamma,
+        "pmuon_beta": cfg.pmuon_beta,
+        "momentum": cfg.momentum,
+        "amuse": cfg.amuse,
+        "mimuon": cfg.mimuon,
+        "mimuon_mix": cfg.mimuon_mix,
+        "normuon": cfg.normuon,
+        "normuon_beta": cfg.normuon_beta,
+        "avg_step_ms": 1000.0 * total_train_seconds / max(global_step, 1),
+        "overall_examples_per_sec": total_examples_seen / max(total_train_seconds, 1e-9),
+        "elapsed_sec": time.perf_counter() - started,
+        "torch": torch.__version__,
+        "gpu": torch.cuda.get_device_name(0),
+    })
+    (trial_dir / "summary.json").write_text(json.dumps(final, indent=2) + "\n")
+
+
+def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required; refusing to silently fall back to CPU")
+    gpu_count = torch.cuda.device_count()
+    if gpu_count < 1:
+        raise RuntimeError("No visible CUDA GPUs")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    pending = list(trials)
+    running: list[tuple[subprocess.Popen, str]] = []
+    next_gpu = 0
+    while pending or running:
+        while pending and len(running) < gpu_count:
+            cfg = pending.pop(0)
+            trial_json = args.output_dir / f"{cfg.name}.trial.json"
+            trial_json.write_text(json.dumps(asdict(cfg), indent=2) + "\n")
+            cmd = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--worker",
+                "--trial-json", str(trial_json),
+                "--data-path", str(args.data_path),
+                "--output-dir", str(args.output_dir),
+                "--model", args.model,
+                "--epochs", str(args.epochs),
+                "--max-steps", str(args.max_steps),
+                "--eval-bins", str(args.eval_bins),
+                "--train-subset", str(args.train_subset),
+                "--val-subset", str(args.val_subset),
+                "--batch-size", str(args.batch_size),
+                "--num-workers", str(args.num_workers),
+                "--seed", str(int(cfg.seed if cfg.seed is not None else args.seed)),
+                "--warmup-steps", str(args.warmup_steps),
+                "--log-every", str(args.log_every),
+            ]
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(next_gpu)
+            print(f"[launch] gpu={next_gpu} trial={cfg.name}", flush=True)
+            running.append((subprocess.Popen(cmd, env=env, cwd=ROOT), cfg.name))
+            next_gpu = (next_gpu + 1) % gpu_count
+        time.sleep(2.0)
+        still_running: list[tuple[subprocess.Popen, str]] = []
+        for proc, name in running:
+            rc = proc.poll()
+            if rc is None:
+                still_running.append((proc, name))
+            elif rc != 0:
+                raise RuntimeError(f"trial {name} failed with exit code {rc}")
+            else:
+                print(f"[done] {name}", flush=True)
+        running = still_running
+
+
+def collect_epoch_rows(output_dir: Path) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for path in sorted(output_dir.glob("*/metrics.jsonl")):
+        with path.open() as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                if item.get("type") in {"epoch", "bin"}:
+                    rows.append({k: str(v) for k, v in item.items()})
+    return rows
+
+
+def add_speed_fields_from_metrics(summary_path: Path, row: dict) -> dict:
+    if "avg_step_ms" in row and "overall_examples_per_sec" in row:
+        return row
+    metrics_path = summary_path.parent / "metrics.jsonl"
+    if not metrics_path.exists():
+        return row
+    step_ms_sum = 0.0
+    final_examples_per_sec = 0.0
+    interval_count = 0.0
+    with metrics_path.open() as f:
+        for line in f:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if item.get("type") != "bin":
+                continue
+            train_loss = float(item.get("train_loss", 0.0))
+            if not math.isfinite(train_loss):
+                continue
+            examples_per_sec = float(item.get("overall_examples_per_sec", 0.0))
+            step_ms = float(item.get("interval_avg_step_ms", 0.0))
+            progress = float(item.get("progress", 0.0))
+            if step_ms > 0:
+                interval_count += 1.0
+                step_ms_sum += step_ms
+            if examples_per_sec > 0 and progress >= 1.0:
+                final_examples_per_sec = examples_per_sec
+    if interval_count > 0 and "avg_step_ms" not in row:
+        row["avg_step_ms"] = step_ms_sum / interval_count
+    if final_examples_per_sec > 0 and "overall_examples_per_sec" not in row:
+        row["overall_examples_per_sec"] = final_examples_per_sec
+    return row
+
+
+def summarize(output_dir: Path, make_plots: bool) -> None:
+    summaries = []
+    for path in sorted(output_dir.glob("*/summary.json")):
+        summaries.append(add_speed_fields_from_metrics(path, json.loads(path.read_text())))
+    if not summaries:
+        return
+    fieldnames = sorted({k for row in summaries for k in row.keys()})
+    with (output_dir / "all_runs.csv").open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(summaries)
+    best = max(summaries, key=lambda row: (float(row["best_val_acc"]), -float(row["best_val_loss"])))
+    (output_dir / "best_run.json").write_text(json.dumps(best, indent=2) + "\n")
+    by_family: dict[str, dict] = {}
+    for row in summaries:
+        cfg = TrialConfig(
+            name=row["trial"],
+            optimizer=row["optimizer"],
+            lr=float(row["lr"]),
+            seed=int(row["seed"]) if row.get("seed") is not None else None,
+            lr_schedule=str(row.get("lr_schedule", "cosine")),
+            weight_decay=float(row["weight_decay"]),
+            soda=row["soda"],
+            pmuon_eq=parse_bool(row["pmuon_eq"]),
+            row_gamma=float(row["row_gamma"]),
+            col_gamma=float(row["col_gamma"]),
+            pmuon_beta=float(row.get("pmuon_beta", 0.95)),
+            momentum=float(row.get("momentum", 0.95)),
+            amuse=parse_bool(row.get("amuse", True)),
+            mimuon=parse_bool(row["mimuon"]),
+            mimuon_mix=float(row["mimuon_mix"]),
+            normuon=parse_bool(row.get("normuon", False)),
+            normuon_beta=float(row.get("normuon_beta", 0.95)),
+        )
+        fam = trial_family(cfg)
+        current = by_family.get(fam)
+        if current is None or (
+            float(row["best_val_acc"]), -float(row["best_val_loss"])
+        ) > (
+            float(current["best_val_acc"]), -float(current["best_val_loss"])
+        ):
+            by_family[fam] = row
+    (output_dir / "best_by_family.json").write_text(json.dumps(by_family, indent=2) + "\n")
+    if make_plots:
+        try:
+            import matplotlib.pyplot as plt
+
+            rows = collect_epoch_rows(output_dir)
+            by_trial: dict[str, list[dict[str, float]]] = {}
+            for row in rows:
+                by_trial.setdefault(row["trial"], []).append({
+                    "epoch": float(row["epoch"]),
+                    "step": float(row["step"]),
+                    "train_loss": float(row["train_loss"]),
+                    "val_loss": float(row["val_loss"]),
+                    "val_acc": float(row["val_acc"]),
+                    "examples_per_sec": float(row.get("examples_per_sec", row.get("interval_examples_per_sec", 0.0))),
+                })
+            for metric in ["train_loss", "val_loss", "val_acc", "examples_per_sec"]:
+                plt.figure(figsize=(9, 5))
+                for trial, vals in by_trial.items():
+                    vals = sorted(vals, key=lambda x: x["step"])
+                    plt.plot([v["step"] for v in vals], [v[metric] for v in vals], marker="o", label=trial)
+                plt.xlabel("optimizer step")
+                plt.ylabel(metric)
+                plt.legend(fontsize=7)
+                plt.tight_layout()
+                plt.savefig(output_dir / f"{metric}.png", dpi=160)
+                plt.close()
+            for metric, path_name, title, reverse in [
+                ("avg_step_ms", "step_time_ms_bar.png", "Average training step time (ms)", False),
+                ("overall_examples_per_sec", "examples_per_sec_bar.png", "Overall training examples/s", True),
+            ]:
+                available = [row for row in summaries if row.get(metric) not in (None, "")]
+                if not available:
+                    continue
+                available = sorted(available, key=lambda row: float(row[metric]), reverse=reverse)
+                height = max(4.0, 0.32 * len(available))
+                plt.figure(figsize=(11, height))
+                labels = [str(row["trial"]) for row in available]
+                vals = [float(row[metric]) for row in available]
+                bars = plt.barh(labels, vals)
+                plt.gca().invert_yaxis()
+                plt.xlabel(title)
+                if vals:
+                    plt.xlim(0.0, max(vals) * 1.12)
+                for bar, val in zip(bars, vals):
+                    plt.text(
+                        val,
+                        bar.get_y() + bar.get_height() / 2,
+                        f" {val:.2f}",
+                        va="center",
+                        fontsize=7,
+                    )
+                plt.tight_layout()
+                plt.savefig(output_dir / path_name, dpi=180)
+                plt.close()
+        except Exception as exc:  # pragma: no cover - plotting is best effort.
+            print(f"plotting skipped: {exc}")
+    print("best run:", json.dumps(best, indent=2), flush=True)
+
+
+def filtered_trials(args: argparse.Namespace) -> list[TrialConfig]:
+    trials = trial_grid(args.preset)
+    if args.only:
+        pattern = re.compile(args.only)
+        trials = [trial for trial in trials if pattern.search(trial.name)]
+    if args.max_trials > 0:
+        trials = trials[: args.max_trials]
+    trials = expand_trials_by_seeds(trials, args.seeds)
+    if not trials:
+        raise ValueError("no trials selected")
+    return trials
+
+
+def expand_trials_by_seeds(trials: list[TrialConfig], seeds_csv: str) -> list[TrialConfig]:
+    if not seeds_csv:
+        return trials
+    seeds = [int(part) for part in seeds_csv.split(",") if part.strip()]
+    if not seeds:
+        return trials
+    expanded = []
+    for trial in trials:
+        for seed in seeds:
+            seeded = TrialConfig(**asdict(trial))
+            seeded.seed = seed
+            seeded.name = f"{trial.name}_seed{seed}"
+            expanded.append(seeded)
+    return expanded
+
+
+def summaries_to_trials(rows: Iterable[dict]) -> list[TrialConfig]:
+    trials = []
+    for family, row in rows:
+        trials.append(TrialConfig(
+            name=f"final_{family}_{row['trial']}",
+            optimizer=row["optimizer"],
+            lr=float(row["lr"]),
+            seed=int(row["seed"]) if str(row.get("seed", "")).strip() else None,
+            lr_schedule=str(row.get("lr_schedule", "cosine")),
+            weight_decay=float(row["weight_decay"]),
+            soda=row["soda"],
+            pmuon_eq=parse_bool(row["pmuon_eq"]),
+            row_gamma=float(row["row_gamma"]),
+            col_gamma=float(row["col_gamma"]),
+            pmuon_beta=float(row.get("pmuon_beta", 0.95)),
+            momentum=float(row.get("momentum", 0.95)),
+            amuse=parse_bool(row.get("amuse", True)),
+            mimuon=parse_bool(row["mimuon"]),
+            mimuon_mix=float(row["mimuon_mix"]),
+            normuon=parse_bool(row.get("normuon", False)),
+            normuon_beta=float(row.get("normuon_beta", 0.95)),
+        ))
+    return trials
+
+
+def main() -> None:
+    args = parse_args()
+    if args.worker:
+        run_worker(args)
+        return
+    if args.final_from_hpo is not None:
+        by_family = json.loads(args.final_from_hpo.read_text())
+        final_args = argparse.Namespace(**vars(args))
+        final_args.epochs = args.final_epochs
+        final_args.max_steps = args.final_max_steps
+        final_trials = summaries_to_trials(sorted(by_family.items()))
+        final_trials = expand_trials_by_seeds(final_trials, args.seeds)
+        if args.only:
+            pattern = re.compile(args.only)
+            final_trials = [trial for trial in final_trials if pattern.search(trial.name)]
+        launch_trials(final_args, final_trials)
+        summarize(final_args.output_dir, make_plots=not args.no_plots)
+        return
+    if args.two_stage:
+        base_output = args.output_dir
+        hpo_args = argparse.Namespace(**vars(args))
+        hpo_args.output_dir = base_output / "hpo"
+        hpo_args.epochs = args.hpo_epochs
+        hpo_args.max_steps = args.hpo_max_steps
+        hpo_trials = filtered_trials(hpo_args)
+        launch_trials(hpo_args, hpo_trials)
+        summarize(hpo_args.output_dir, make_plots=not args.no_plots)
+        by_family = json.loads((hpo_args.output_dir / "best_by_family.json").read_text())
+        final_args = argparse.Namespace(**vars(args))
+        final_args.output_dir = base_output / "final_bins"
+        final_args.epochs = args.final_epochs
+        final_args.max_steps = args.final_max_steps
+        final_trials = summaries_to_trials(sorted(by_family.items()))
+        final_trials = expand_trials_by_seeds(final_trials, args.seeds)
+        if args.only:
+            pattern = re.compile(args.only)
+            final_trials = [trial for trial in final_trials if pattern.search(trial.name)]
+        launch_trials(final_args, final_trials)
+        summarize(final_args.output_dir, make_plots=not args.no_plots)
+        return
+    trials = filtered_trials(args)
+    launch_trials(args, trials)
+    summarize(args.output_dir, make_plots=not args.no_plots)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,19 @@
+{
+  "name": "adamw_cosine_lr0.002_wd0.005",
+  "optimizer": "adamw",
+  "lr": 0.002,
+  "seed": null,
+  "lr_schedule": "cosine",
+  "weight_decay": 0.005,
+  "soda": "matrix",
+  "pmuon_eq": true,
+  "row_gamma": 0.2,
+  "col_gamma": 0.0,
+  "pmuon_beta": 0.95,
+  "momentum": 0.95,
+  "amuse": true,
+  "mimuon": false,
+  "mimuon_mix": 0.85,
+  "normuon": false,
+  "normuon_beta": 0.95
+}
