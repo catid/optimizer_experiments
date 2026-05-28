@@ -400,30 +400,32 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         super().load_state_dict(state_dict)
 
     @torch.no_grad()
-    def train(self) -> None:
+    def train(self) -> "EquiMuseNorMuon":
         """Swap parameters from averaged/eval weights X to train weights Y."""
 
         if self.train_mode:
-            return
+            return self
         for group in self.param_groups:
             beta1 = float(group.get("beta1", self.beta1_init))
             items = [(p.detach(), self.state[p]["z"]) for p in group["params"] if "z" in self.state[p]]
             for bucket in _bucket_by_tensor(items, tensor_index=0):
                 _foreach_lerp_([x[0] for x in bucket], [x[1] for x in bucket], 1.0 - beta1, bool(group.get("foreach", self.foreach)))
         self.train_mode = True
+        return self
 
     @torch.no_grad()
-    def eval(self) -> None:
+    def eval(self) -> "EquiMuseNorMuon":
         """Swap parameters from train weights Y to averaged/eval weights X."""
 
         if not self.train_mode:
-            return
+            return self
         for group in self.param_groups:
             beta1 = float(group.get("beta1", self.beta1_init))
             items = [(p.detach(), self.state[p]["z"]) for p in group["params"] if "z" in self.state[p]]
             for bucket in _bucket_by_tensor(items, tensor_index=0):
                 _foreach_lerp_([x[0] for x in bucket], [x[1] for x in bucket], 1.0 - 1.0 / beta1, bool(group.get("foreach", self.foreach)))
         self.train_mode = False
+        return self
 
     @torch.no_grad()
     def step(self, closure=None):  # type: ignore[override]

@@ -130,3 +130,49 @@ def test_state_dict_roundtrip() -> None:
     other.load_state_dict(loaded)
     assert other.train_mode is True
 
+
+def test_train_eval_return_self_and_checkpoint_roundtrips() -> None:
+    params = _make_params()
+    opt = EquiMuseNorMuon(_groups(params, batch_muon=True), beta1=0.6, warmup_steps=2)
+    assert opt.train() is opt
+    for step in range(3):
+        for i, p in enumerate(params):
+            p.grad = torch.ones_like(p) * (0.03 + i * 0.01 + step * 0.007)
+        opt.step()
+
+    assert opt.eval() is opt
+    eval_params = [p.detach().clone() for p in params]
+    assert opt.eval() is opt
+    for p, expected in zip(params, eval_params, strict=True):
+        assert torch.allclose(p, expected, atol=0.0, rtol=0.0)
+
+    assert opt.train() is opt
+    train_params = [p.detach().clone() for p in params]
+    opt.eval()
+    for p, expected in zip(params, eval_params, strict=True):
+        assert torch.allclose(p, expected, atol=1e-6, rtol=1e-6)
+
+    eval_checkpoint = BytesIO()
+    torch.save({"params": eval_params, "optimizer": opt.state_dict()}, eval_checkpoint)
+    eval_checkpoint.seek(0)
+    eval_loaded = torch.load(eval_checkpoint, weights_only=False)
+    eval_clone_params = [torch.nn.Parameter(p.clone()) for p in eval_loaded["params"]]
+    eval_clone = EquiMuseNorMuon(_groups(eval_clone_params, batch_muon=True), beta1=0.6, warmup_steps=2)
+    eval_clone.load_state_dict(eval_loaded["optimizer"])
+    assert eval_clone.train_mode is False
+    eval_clone.train()
+    for p, expected in zip(eval_clone_params, train_params, strict=True):
+        assert torch.allclose(p, expected, atol=1e-6, rtol=1e-6)
+
+    opt.train()
+    train_checkpoint = BytesIO()
+    torch.save({"params": [p.detach().clone() for p in params], "optimizer": opt.state_dict()}, train_checkpoint)
+    train_checkpoint.seek(0)
+    train_loaded = torch.load(train_checkpoint, weights_only=False)
+    train_clone_params = [torch.nn.Parameter(p.clone()) for p in train_loaded["params"]]
+    train_clone = EquiMuseNorMuon(_groups(train_clone_params, batch_muon=True), beta1=0.6, warmup_steps=2)
+    train_clone.load_state_dict(train_loaded["optimizer"])
+    assert train_clone.train_mode is True
+    train_clone.eval()
+    for p, expected in zip(train_clone_params, eval_params, strict=True):
+        assert torch.allclose(p, expected, atol=1e-6, rtol=1e-6)
