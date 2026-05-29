@@ -1,4 +1,4 @@
-"""Standalone SODA-PMuonEq-NorMuon optimizer.
+"""Standalone AnchorMuon optimizer.
 
 This file is intentionally self-contained and suitable for copying into another
 project. It implements only the repo-wide winning optimizer family for the next
@@ -30,7 +30,7 @@ evaluated only once at the end:
     step time:          19.95 ms
 
 The aspect-scaled variant was close and sometimes won on other CIFAR proxies,
-but no-aspect won the cleanest official-test protocol. This golden file keeps
+but no-aspect won the cleanest official-test protocol. This root file keeps
 the no-aspect variant only. If aspect or column gamma is needed for an ablation,
 use the older ``soda_pmuoneq_normuon.py`` research file instead.
 
@@ -67,7 +67,7 @@ For a matrix parameter ``W_t`` with gradient ``G_t``:
 
    NorMuon changes row allocation after the spectral direction is produced,
    while preserving the whole-matrix Frobenius norm. There is no aspect-ratio
-   multiplier in this golden version.
+   multiplier in this standalone version.
 
 5. SODA anchor pull and update:
 
@@ -314,7 +314,7 @@ def _is_matrix_like_parameter(param: torch.Tensor, *, min_matrix_dim: int) -> bo
 
 
 class GramNewtonSchulz:
-    """Batched Gram Newton-Schulz polar approximation used by the golden path."""
+    """Batched Gram Newton-Schulz polar approximation used by AnchorMuon."""
 
     def __init__(
         self,
@@ -401,12 +401,12 @@ class GramNewtonSchulz:
         return q @ x
 
 
-class SodaPmuonEqNorMuon(torch.optim.Optimizer):
-    """PyTorch optimizer implementing the focused SODA-PMuonEq-NorMuon path.
+class AnchorMuon(torch.optim.Optimizer):
+    """PyTorch optimizer implementing the focused AnchorMuon path.
 
     Preferred use:
 
-        optimizer = SodaPmuonEqNorMuon(model)
+        optimizer = AnchorMuon(model)
 
     Passing a ``torch.nn.Module`` or ``model.named_parameters()`` lets the
     optimizer keep embeddings, output heads, normalization weights, biases,
@@ -505,7 +505,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             group.setdefault("base_lr", group["lr"])
 
     @classmethod
-    def from_model(cls, model: torch.nn.Module, **kwargs: Any) -> "SodaPmuonEqNorMuon":
+    def from_model(cls, model: torch.nn.Module, **kwargs: Any) -> "AnchorMuon":
         """Construct the optimizer from ``model.named_parameters()``.
 
         This is the least error-prone public API for normal training code.
@@ -541,7 +541,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             and isinstance(items[0][0], str)
             and isinstance(items[0][1], torch.Tensor)
         ):
-            return build_soda_pmuoneq_normuon_param_groups(
+            return build_param_groups(
                 items,  # type: ignore[arg-type]
                 matrix_lr=matrix_lr,
                 fallback_lr=fallback_lr,
@@ -582,7 +582,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             return groups
 
         warnings.warn(
-            "SodaPmuonEqNorMuon received unnamed parameters. Pass a module or "
+            "AnchorMuon received unnamed parameters. Pass a module or "
             "model.named_parameters() so embeddings, heads, norms, and tied "
             "weights can be routed safely.",
             stacklevel=3,
@@ -637,10 +637,10 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             )
         return groups
 
-    def train(self) -> "SodaPmuonEqNorMuon":
+    def train(self) -> "AnchorMuon":
         return self
 
-    def eval(self) -> "SodaPmuonEqNorMuon":
+    def eval(self) -> "AnchorMuon":
         return self
 
     def group_summary(self) -> list[dict[str, Any]]:
@@ -754,7 +754,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                 continue
             if grad.is_sparse:
                 raise RuntimeError(
-                    "SodaPmuonEqNorMuon does not support sparse gradients. "
+                    "AnchorMuon does not support sparse gradients. "
                     "Use dense gradients for this parameter or a different optimizer for sparse embeddings."
                 )
             if not _is_matrix_like_parameter(grad, min_matrix_dim=int(group.get("min_matrix_dim", 2))):
@@ -803,7 +803,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             return 0
         if grad.is_sparse:
             raise RuntimeError(
-                "SodaPmuonEqNorMuon does not support sparse gradients. "
+                "AnchorMuon does not support sparse gradients. "
                 "Use dense gradients for this parameter or a different optimizer for sparse embeddings."
             )
         state = self.state[p]
@@ -875,7 +875,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         return loss
 
 
-def build_soda_pmuoneq_normuon_param_groups(
+def build_param_groups(
     named_parameters: Iterable[tuple[str, torch.nn.Parameter]],
     *,
     matrix_lr: float = 8e-3,
@@ -982,19 +982,14 @@ def build_soda_pmuoneq_normuon_param_groups(
     return groups
 
 
-GoldenSodaPmuonEqNorMuon = SodaPmuonEqNorMuon
-build_golden_soda_pmuoneq_normuon_param_groups = build_soda_pmuoneq_normuon_param_groups
-GoldenMuon = SodaPmuonEqNorMuon
-build_param_groups = build_soda_pmuoneq_normuon_param_groups
+# Backward-compatible implementation aliases. These are intentionally not in
+# __all__; new code should import AnchorMuon and build_param_groups.
+SodaPmuonEqNorMuon = AnchorMuon
+build_soda_pmuoneq_normuon_param_groups = build_param_groups
 
 
 __all__ = [
     "__version__",
-    "SodaPmuonEqNorMuon",
-    "GoldenSodaPmuonEqNorMuon",
-    "GoldenMuon",
-    "GramNewtonSchulz",
-    "build_soda_pmuoneq_normuon_param_groups",
-    "build_golden_soda_pmuoneq_normuon_param_groups",
+    "AnchorMuon",
     "build_param_groups",
 ]

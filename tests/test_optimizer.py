@@ -15,13 +15,12 @@ REF_ROOT = ROOT / "workers" / "codex_soda_pmuoneq_normuon"
 if str(REF_ROOT) not in sys.path:
     sys.path.insert(0, str(REF_ROOT))
 
+import optimizer as optimizer_module
 from optimizer import (
-    GoldenSodaPmuonEqNorMuon,
-    GoldenMuon,
+    AnchorMuon,
     SodaPmuonEqNorMuon,
     __version__,
     build_param_groups,
-    build_golden_soda_pmuoneq_normuon_param_groups,
     build_soda_pmuoneq_normuon_param_groups,
 )
 from soda_pmuoneq_normuon import (
@@ -72,7 +71,7 @@ def _run_step(model: nn.Module, opt: torch.optim.Optimizer, step: int) -> float:
     return float(loss.detach())
 
 
-def test_golden_param_groups_use_effective_shape_for_matrix_routing() -> None:
+def test_anchor_param_groups_use_effective_shape_for_matrix_routing() -> None:
     params = [
         ("blocks.0.mlp.fc1.weight", nn.Parameter(torch.zeros(8, 8))),
         ("blocks.0.attn.head_projection.weight", nn.Parameter(torch.zeros(8, 8))),
@@ -85,7 +84,7 @@ def test_golden_param_groups_use_effective_shape_for_matrix_routing() -> None:
         ("blocks.0.layernorm.weight", nn.Parameter(torch.zeros(8, 8))),
         ("blocks.0.mlp.fc1.bias", nn.Parameter(torch.zeros(8))),
     ]
-    groups = build_golden_soda_pmuoneq_normuon_param_groups(params)
+    groups = build_param_groups(params)
     assert len(groups) == 2
     matrix_names = set(groups[0]["param_names"])
     fallback_names = set(groups[1]["param_names"])
@@ -103,16 +102,16 @@ def test_golden_param_groups_use_effective_shape_for_matrix_routing() -> None:
 
 def test_public_names_and_tied_parameter_grouping_are_safe() -> None:
     tied = nn.Parameter(torch.zeros(8, 8))
-    groups = build_soda_pmuoneq_normuon_param_groups(
+    groups = build_param_groups(
         [
             ("blocks.0.mlp.fc1.weight", nn.Parameter(torch.zeros(8, 8))),
             ("token_embed.weight", tied),
             ("lm_head.weight", tied),
         ]
     )
-    assert GoldenSodaPmuonEqNorMuon is SodaPmuonEqNorMuon
-    assert GoldenMuon is SodaPmuonEqNorMuon
-    assert build_param_groups is build_soda_pmuoneq_normuon_param_groups
+    assert SodaPmuonEqNorMuon is AnchorMuon
+    assert build_soda_pmuoneq_normuon_param_groups is build_param_groups
+    assert set(optimizer_module.__all__) == {"__version__", "AnchorMuon", "build_param_groups"}
     assert isinstance(__version__, str)
     assert len(groups) == 1
     assert sum(len(group["params"]) for group in groups) == 2
@@ -126,7 +125,7 @@ def test_public_names_and_tied_parameter_grouping_are_safe() -> None:
 
 def test_named_parameters_constructor_hides_grouping_from_training_code() -> None:
     model = TinyClassifier()
-    opt = SodaPmuonEqNorMuon(model.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4, warmup_steps=2)
+    opt = AnchorMuon(model.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4, warmup_steps=2)
     assert len(opt.param_groups) == 2
     assert opt.param_groups[0]["use_matrix_update"] is True
     assert opt.param_groups[1]["use_matrix_update"] is False
@@ -143,7 +142,7 @@ def test_named_parameters_constructor_hides_grouping_from_training_code() -> Non
 
 def test_named_constructor_preserves_external_lr_flag() -> None:
     model = TinyClassifier()
-    opt = SodaPmuonEqNorMuon(
+    opt = AnchorMuon(
         model,
         matrix_lr=1e-3,
         fallback_lr=1e-4,
@@ -162,7 +161,7 @@ def test_named_constructor_preserves_external_lr_flag() -> None:
 def test_soda_cannot_be_disabled_with_zero_scale() -> None:
     model = TinyClassifier()
     with pytest.raises(ValueError, match="SODA is always enabled"):
-        SodaPmuonEqNorMuon(model.named_parameters(), warmup_steps=2, soda_lambda_scale=0.0)
+        AnchorMuon(model.named_parameters(), warmup_steps=2, soda_lambda_scale=0.0)
 
 
 def test_min_matrix_dim_keeps_tiny_matrices_in_fallback() -> None:
@@ -170,7 +169,7 @@ def test_min_matrix_dim_keeps_tiny_matrices_in_fallback() -> None:
         ("blocks.0.mlp.fc1.weight", nn.Parameter(torch.zeros(8, 8))),
         ("blocks.0.router.weight", nn.Parameter(torch.zeros(1, 8))),
     ]
-    groups = build_soda_pmuoneq_normuon_param_groups(params, min_matrix_dim=2)
+    groups = build_param_groups(params, min_matrix_dim=2)
     assert len(groups) == 2
     assert groups[0]["param_names"] == ["blocks.0.mlp.fc1.weight"]
     assert groups[1]["param_names"] == ["blocks.0.router.weight"]
@@ -179,14 +178,14 @@ def test_min_matrix_dim_keeps_tiny_matrices_in_fallback() -> None:
 def test_unnamed_parameter_constructor_deduplicates_shared_tensors() -> None:
     shared = nn.Parameter(torch.zeros(8, 8))
     with pytest.warns(UserWarning, match="unnamed parameters"):
-        opt = SodaPmuonEqNorMuon([shared, shared], warmup_steps=2)
+        opt = AnchorMuon([shared, shared], warmup_steps=2)
     assert len(opt.param_groups) == 1
     assert len(opt.param_groups[0]["params"]) == 1
 
 
 def test_sparse_gradients_fail_with_clear_error() -> None:
     model = SparseEmbeddingNet()
-    opt = SodaPmuonEqNorMuon(model, warmup_steps=2)
+    opt = AnchorMuon(model, warmup_steps=2)
     loss = model(torch.tensor([1, 2, 3]))
     loss.backward()
     with pytest.raises(RuntimeError, match="does not support sparse gradients"):
@@ -195,7 +194,7 @@ def test_sparse_gradients_fail_with_clear_error() -> None:
 
 def test_default_recipe_matches_root_documented_winner() -> None:
     model = TinyClassifier()
-    opt = SodaPmuonEqNorMuon(model)
+    opt = AnchorMuon(model)
     assert opt.warmup_steps == 80
     assert {group["lr"] for group in opt.param_groups} == {8e-3}
     assert {group["base_lr"] for group in opt.param_groups} == {8e-3}
@@ -214,10 +213,10 @@ def test_from_model_constructor_matches_named_parameters_constructor() -> None:
     torch.manual_seed(5)
     direct_model = TinyClassifier()
     factory_model = copy.deepcopy(direct_model)
-    direct = SodaPmuonEqNorMuon(direct_model.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4, warmup_steps=2)
+    direct = AnchorMuon(direct_model.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4, warmup_steps=2)
     module_direct = copy.deepcopy(direct_model)
-    factory = SodaPmuonEqNorMuon.from_model(factory_model, matrix_lr=1e-3, fallback_lr=1e-4, warmup_steps=2)
-    module_opt = SodaPmuonEqNorMuon(module_direct, matrix_lr=1e-3, fallback_lr=1e-4, warmup_steps=2)
+    factory = AnchorMuon.from_model(factory_model, matrix_lr=1e-3, fallback_lr=1e-4, warmup_steps=2)
+    module_opt = AnchorMuon(module_direct, matrix_lr=1e-3, fallback_lr=1e-4, warmup_steps=2)
 
     for step in range(3):
         assert _run_step(direct_model, direct, step) == _run_step(factory_model, factory, step)
@@ -229,9 +228,9 @@ def test_from_model_constructor_matches_named_parameters_constructor() -> None:
         assert torch.allclose(a, b, atol=1e-6, rtol=1e-6)
 
 
-def test_golden_groups_do_not_expose_removed_ablation_flags() -> None:
+def test_anchor_groups_do_not_expose_removed_ablation_flags() -> None:
     model = TinyClassifier()
-    groups = build_golden_soda_pmuoneq_normuon_param_groups(model.named_parameters())
+    groups = build_param_groups(model.named_parameters())
     forbidden = {
         "amuse",
         "mimuon",
@@ -245,11 +244,11 @@ def test_golden_groups_do_not_expose_removed_ablation_flags() -> None:
         assert forbidden.isdisjoint(group.keys())
 
 
-def test_golden_step_is_finite_and_creates_only_row_pmuoneq_state() -> None:
+def test_anchor_step_is_finite_and_creates_only_row_pmuoneq_state() -> None:
     torch.manual_seed(0)
     model = TinyClassifier()
-    opt = GoldenSodaPmuonEqNorMuon(
-        build_golden_soda_pmuoneq_normuon_param_groups(model.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4),
+    opt = AnchorMuon(
+        build_param_groups(model.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4),
         warmup_steps=2,
     )
     before = model.fc1.weight.detach().clone()
@@ -269,14 +268,14 @@ def test_golden_step_is_finite_and_creates_only_row_pmuoneq_state() -> None:
     assert opt.last_stats["fallback_count"] >= 1
 
 
-def test_golden_matches_legacy_configured_as_winning_no_aspect_path() -> None:
+def test_anchor_matches_legacy_configured_as_winning_no_aspect_path() -> None:
     torch.manual_seed(7)
-    golden_model = TwoMatrixNet()
-    legacy_model = copy.deepcopy(golden_model)
+    anchor_model = TwoMatrixNet()
+    legacy_model = copy.deepcopy(anchor_model)
 
-    golden = GoldenSodaPmuonEqNorMuon(
-        build_golden_soda_pmuoneq_normuon_param_groups(
-            golden_model.named_parameters(),
+    anchor = AnchorMuon(
+        build_param_groups(
+            anchor_model.named_parameters(),
             matrix_lr=1e-3,
             fallback_lr=1e-4,
             fallback_betas=(0.9, 0.999),
@@ -313,21 +312,21 @@ def test_golden_matches_legacy_configured_as_winning_no_aspect_path() -> None:
     )
 
     for step in range(5):
-        golden_loss = _run_step(golden_model, golden, step)
+        anchor_loss = _run_step(anchor_model, anchor, step)
         legacy_loss = _run_step(legacy_model, legacy, step)
-        assert golden_loss == legacy_loss
+        assert anchor_loss == legacy_loss
 
-    for golden_param, legacy_param in zip(golden_model.parameters(), legacy_model.parameters(), strict=True):
-        assert torch.allclose(golden_param, legacy_param, atol=1e-6, rtol=1e-6)
+    for anchor_param, legacy_param in zip(anchor_model.parameters(), legacy_model.parameters(), strict=True):
+        assert torch.allclose(anchor_param, legacy_param, atol=1e-6, rtol=1e-6)
 
 
-def test_golden_same_shape_bucket_matches_split_matrix_groups() -> None:
+def test_anchor_same_shape_bucket_matches_split_matrix_groups() -> None:
     torch.manual_seed(9)
     bucketed = TwoMatrixNet()
     split = copy.deepcopy(bucketed)
 
-    opt_bucketed = GoldenSodaPmuonEqNorMuon(
-        build_golden_soda_pmuoneq_normuon_param_groups(bucketed.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4),
+    opt_bucketed = AnchorMuon(
+        build_param_groups(bucketed.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4),
         warmup_steps=2,
     )
     split_groups = [
@@ -360,7 +359,7 @@ def test_golden_same_shape_bucket_matches_split_matrix_groups() -> None:
             "base_lr": 1e-4,
         },
     ]
-    opt_split = GoldenSodaPmuonEqNorMuon(split_groups, warmup_steps=2)
+    opt_split = AnchorMuon(split_groups, warmup_steps=2)
 
     for step in range(5):
         _run_step(bucketed, opt_bucketed, step)
@@ -370,16 +369,16 @@ def test_golden_same_shape_bucket_matches_split_matrix_groups() -> None:
         assert torch.allclose(a, b, atol=1e-6, rtol=1e-6)
 
 
-def test_golden_state_dict_resume_matches_uninterrupted_training() -> None:
+def test_anchor_state_dict_resume_matches_uninterrupted_training() -> None:
     torch.manual_seed(11)
     uninterrupted = TinyClassifier()
     resume_source = copy.deepcopy(uninterrupted)
-    opt_uninterrupted = GoldenSodaPmuonEqNorMuon(
-        build_golden_soda_pmuoneq_normuon_param_groups(uninterrupted.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4),
+    opt_uninterrupted = AnchorMuon(
+        build_param_groups(uninterrupted.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4),
         warmup_steps=2,
     )
-    opt_resume_source = GoldenSodaPmuonEqNorMuon(
-        build_golden_soda_pmuoneq_normuon_param_groups(resume_source.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4),
+    opt_resume_source = AnchorMuon(
+        build_param_groups(resume_source.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4),
         warmup_steps=2,
     )
 
@@ -396,8 +395,8 @@ def test_golden_state_dict_resume_matches_uninterrupted_training() -> None:
 
     resumed = TinyClassifier()
     resumed.load_state_dict(torch.load(model_blob, weights_only=True))
-    opt_resumed = GoldenSodaPmuonEqNorMuon(
-        build_golden_soda_pmuoneq_normuon_param_groups(resumed.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4),
+    opt_resumed = AnchorMuon(
+        build_param_groups(resumed.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4),
         warmup_steps=2,
     )
     opt_resumed.load_state_dict(torch.load(opt_blob, weights_only=False))
@@ -410,11 +409,11 @@ def test_golden_state_dict_resume_matches_uninterrupted_training() -> None:
         assert torch.allclose(a, b, atol=1e-6, rtol=1e-6)
 
 
-def test_golden_short_training_sanity_loss_decreases() -> None:
+def test_anchor_short_training_sanity_loss_decreases() -> None:
     torch.manual_seed(42)
     model = TinyClassifier()
-    opt = GoldenSodaPmuonEqNorMuon(
-        build_golden_soda_pmuoneq_normuon_param_groups(model.named_parameters(), matrix_lr=2e-3, fallback_lr=2e-4),
+    opt = AnchorMuon(
+        build_param_groups(model.named_parameters(), matrix_lr=2e-3, fallback_lr=2e-4),
         warmup_steps=2,
     )
     x = torch.randn(32, 8)
