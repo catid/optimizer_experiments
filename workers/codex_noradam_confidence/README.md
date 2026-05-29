@@ -20,6 +20,8 @@ commit b009f03 Compare NorMuon base against AdamW
 - `models_vit5.py`, `rope.py`: minimal ViT-5 model code needed by the runner.
 - `experiments/run_cifar10_ablation.py`: CIFAR-10 HPO/final comparison runner.
 - `tests/`: optimizer unit tests and DDP smoke test.
+- `ALGORITHM_RESULTS.md`: self-contained algorithm and result summary for the
+  current best recipe.
 - `results/cifar10_confidence_noradam_20260528/`: committed result bundle, curves, and summary.
 - `results/cifar10_feedback_nosync_20260529/final50/`: latest committed
   feedback run with synchronization diagnostics disabled, comparison diagrams,
@@ -33,7 +35,7 @@ commit b009f03 Compare NorMuon base against AdamW
 ## Main Result
 
 Latest result summary:
-`results/cifar10_proper_split_20260529/summary.md`.
+`ALGORITHM_RESULTS.md` and `results/cifar10_proper_split_20260529/summary.md`.
 
 Latest diagrams:
 

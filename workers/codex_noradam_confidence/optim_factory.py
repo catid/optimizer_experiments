@@ -61,6 +61,7 @@ def create_optimizer(args, model):
         mimuon_mix=float(args.anchor_mimuon_mix),
         normuon=bool(args.anchor_normuon),
         normuon_beta=float(args.anchor_normuon_beta),
+        normuon_aspect_scale=bool(getattr(args, "anchor_normuon_aspect_scale", False)),
         normuon_eps=float(args.anchor_normuon_eps),
         eps=float(args.opt_eps),
         pmuon_eps=float(args.anchor_pmuon_eps),
