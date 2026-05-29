@@ -12,6 +12,29 @@ projects. The optimizer combines:
 - NorMuon row second-moment normalization after projection, optional via
   ``use_normuon``.
 
+Best compact ViT-5/CIFAR-10 recipe found in this worker:
+
+    use_amuse=False
+    use_soda=True
+    use_pmuoneq=True
+    use_gram=True
+    use_normuon=True
+    normuon_mode="row"
+    normuon_aspect_scale=True
+    lr=0.012
+    weight_decay=0.0
+    pmuon_beta=0.90
+    pmuon_row_gamma=0.15
+    pmuon_col_gamma=0.0
+    normuon_beta2=0.90
+
+This recipe reached 0.4079 +/- 0.0090 best validation loss and
+87.09% +/- 0.15 test accuracy in a 10k-step, 3-seed compact ViT-5/CIFAR-10
+comparison using a 2.69M-parameter model, batch size 256, eval batch size 1024,
+and a 45k/5k/10k train/validation/test split. The runner keeps defaults
+conservative; use the explicit flags above to reproduce the best recipe. Exact
+metadata is also exported as BEST_KNOWN_CONFIG.
+
 Recommended name: ``SodaMuseEq``.
 Short alias: ``EquiMuse``.
 """
@@ -33,6 +56,56 @@ DAO_POLAR_EXPRESS_COEFFS: tuple[tuple[float, float, float], ...] = (
     (3.160399673686287, -2.1496735790007567, 0.3996018288984032),
     (2.1910971618617306, -1.4419638886187698, 0.3281513704122412),
 )
+
+
+BEST_KNOWN_CONFIG: dict[str, Any] = {
+    "algorithm": "SODA+PMuonEq+Gram+NorMuon row+aspect",
+    "model": "compact ViT-5 CIFAR model",
+    "model_params": 2_691_274,
+    "dataset": "CIFAR-10",
+    "image_size": 32,
+    "patch_size": 4,
+    "embed_dim": 192,
+    "depth": 6,
+    "num_heads": 3,
+    "mlp_ratio": 4.0,
+    "architecture_notes": "RMSNorm, RoPE, q/k norm, layer scale, 4 register tokens",
+    "train_examples": 45_000,
+    "val_examples": 5_000,
+    "test_examples": 10_000,
+    "batch_size": 256,
+    "eval_batch_size": 1024,
+    "steps": 10_000,
+    "seeds": (0, 1, 2),
+    "split_seed": 12345,
+    "hpo_steps": 1_000,
+    "top_selection_steps": 3_000,
+    "eval_bins": 8,
+    "amp": "bf16_autocast",
+    "lr": 0.012,
+    "weight_decay": 0.0,
+    "momentum": 0.95,
+    "beta1": 0.6,
+    "beta2": 0.999,
+    "rho": 0.8,
+    "warmup_steps": 500,
+    "soda_warmup_steps": 500,
+    "use_soda": True,
+    "use_amuse": False,
+    "use_pmuoneq": True,
+    "use_gram": True,
+    "use_normuon": True,
+    "normuon_mode": "row",
+    "normuon_aspect_scale": True,
+    "pmuon_beta": 0.90,
+    "pmuon_row_gamma": 0.15,
+    "pmuon_col_gamma": 0.0,
+    "normuon_beta2": 0.90,
+    "best_val_loss_mean": 0.4079,
+    "best_val_loss_std": 0.0090,
+    "test_acc_mean": 0.8709,
+    "test_acc_std": 0.0015,
+}
 
 
 def _is_matrix_like(p: nn.Parameter) -> bool:
@@ -723,4 +796,4 @@ class SodaMuseEq(torch.optim.Optimizer):
 
 EquiMuse = SodaMuseEq
 
-__all__ = ["SodaMuseEq", "EquiMuse", "GramNewtonSchulzProjector", "make_sodamuseeq_param_groups"]
+__all__ = ["SodaMuseEq", "EquiMuse", "GramNewtonSchulzProjector", "make_sodamuseeq_param_groups", "BEST_KNOWN_CONFIG"]

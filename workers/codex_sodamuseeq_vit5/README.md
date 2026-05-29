@@ -26,6 +26,117 @@ The optimizer supports optional switches for:
 - Optional NorMuon orientation mode and tall-matrix aspect scaling, ported from
   `workers/codex_soda_pmuoneq_normuon`.
 
+## Current Algorithm
+
+The best current recipe is a no-AMUSE matrix optimizer:
+
+```text
+SODA + PMuonEq + Gram-Newton-Schulz + NorMuon row+aspect
+```
+
+For matrix parameters, the update is:
+
+1. Keep hidden 2D/4D matrix weights in the matrix optimizer path. Biases,
+   norms, embeddings, and heads use the fallback RMS/AdamW-style path.
+2. Apply SODA as an anchor correction after warmup, replacing ordinary weight
+   decay in the selected recipe.
+3. Build a Nesterov-style momentum matrix from the current gradient.
+4. Apply PMuonEq before projection with cheap row/column EMA gradient-power
+   scales. The winning setting uses row scaling only:
+   `pmuon_row_gamma=0.15`, `pmuon_col_gamma=0.0`.
+5. Apply Gram/Newton-Schulz projection to get a spectral matrix update.
+6. Apply NorMuon after projection with row second-moment normalization and the
+   tall-matrix aspect multiplier enabled.
+7. Apply the final learned update directly to the parameter.
+
+The important boundary is that PMuonEq acts before Gram projection, while
+NorMuon row+aspect acts after projection as a final learned-update rescale.
+AMUSE remains implemented and test-covered, but it was not part of the best
+compact ViT-5/CIFAR-10 result.
+
+## Best Version And Setup
+
+The best specific version found in this workspace is:
+
+```text
+SODA+PMuonEq+Gram+NorMuon row+aspect
+```
+
+It is the `soda_pmuoneq_normuon_aspect` family in the focused runner. The
+winning run disables AMUSE and MiMuon; it uses SODA, row-only PMuonEq before
+Gram projection, and NorMuon row normalization with the tall-matrix aspect
+multiplier after projection.
+
+Model and data:
+
+| Item | Value |
+| --- | --- |
+| Model | compact ViT-5 CIFAR model |
+| Trainable parameters | 2,691,274 |
+| Input | CIFAR images, 32x32 |
+| Patch size | 4 |
+| Embedding dim | 192 |
+| Depth | 6 |
+| Heads | 3 |
+| MLP ratio | 4 |
+| Extras | RMSNorm, RoPE, q/k norm, layer scale, 4 register tokens |
+| Dataset | CIFAR-10 |
+| Split | 45k train / 5k validation / 10k test |
+| Split seed | 12345 |
+| Train augmentation | random crop with padding 4, random horizontal flip, normalize |
+
+Training and tuning:
+
+| Item | Value |
+| --- | --- |
+| HPO budget | 1k-step sweep, seed 0 |
+| Top-selection budget | 3k-step rerun of top candidates, seed 0 |
+| Final budget | 10k steps, seeds 0/1/2 |
+| Final batch size | 256 |
+| Eval batch size | 1024 |
+| Data workers | 8 |
+| Eval bins | 8 |
+| Precision | CUDA BF16 autocast |
+| Scheduling | one trial per visible GPU |
+
+Best optimizer parameters:
+
+| Parameter | Value |
+| --- | --- |
+| `lr` | `0.012` |
+| `weight_decay` | `0.0` |
+| `momentum` | `0.95` |
+| `beta1` | `0.6` |
+| `beta2` | `0.999` |
+| `rho` | `0.8` |
+| `warmup_steps` | `500` |
+| `soda_warmup_steps` | `500` |
+| `use_soda` | `True` |
+| `use_amuse` | `False` |
+| `use_pmuoneq` | `True` |
+| `use_gram` | `True` |
+| `use_normuon` | `True` |
+| `normuon_mode` | `row` |
+| `normuon_aspect_scale` | `True` |
+| `pmuon_beta` | `0.90` |
+| `pmuon_row_gamma` | `0.15` |
+| `pmuon_col_gamma` | `0.0` |
+| `normuon_beta2` | `0.90` |
+
+Final 10k, 3-seed result:
+
+| Metric | Value |
+| --- | ---: |
+| Best validation loss | `0.4079 +/- 0.0090` |
+| Best validation accuracy | `87.15% +/- 0.08` |
+| Test accuracy | `87.09% +/- 0.15` |
+| Steps/sec | `42.84 +/- 0.06` |
+
+This is the version to reproduce first. The closest competitor was
+`SODA+PMuonEq+Gram` at `0.4210 +/- 0.0097` validation loss and
+`86.90% +/- 0.35` test accuracy; AdamW was faster but substantially worse at
+`0.6030 +/- 0.0167` validation loss and `81.27% +/- 0.74` test accuracy.
+
 ## Validation
 
 Validated in the source workspace before packaging:
@@ -144,9 +255,11 @@ The 3-seed 10k and seed-0 20k focused confidence pass found:
 | NorMuon+BaseGram | 20k, seed 0 | 0.5001 | 86.10% | 86.42% | 49.22 |
 | AdamW | 20k, seed 0 | 0.5967 | 82.46% | 82.25% | 59.19 |
 
-The result supports SODA+PMuonEq+Gram as the best quality recipe in this compact
-ViT-5/CIFAR-10 harness. NorMuon+BaseGram is faster than SODA+PMuonEq+Gram and
-better than AdamW, but it did not close the quality gap.
+The current best recipe is SODA+PMuonEq+Gram+NorMuon row+aspect. The gain over
+SODA+PMuonEq+Gram is modest but repeatable in the 10k 3-seed run:
+`0.4079` versus `0.4210` mean best validation loss. Validation accuracy is
+essentially tied, while test accuracy improves slightly. AdamW remains much
+faster per step but materially worse on loss and accuracy.
 
 Committed result artifacts:
 

@@ -2,6 +2,64 @@
 
 Compared the focused arms: AdamW baseline, NorMuon+BaseGram, SODA+PMuonEq+Gram, and the peer-suggested SODA+PMuonEq+Gram+NorMuon row+aspect recipe.
 
+## Best Specific Version
+
+The best version in this comparison is:
+
+```text
+soda_pmuoneq_normuon_aspect
+SODA+PMuonEq+Gram+NorMuon row+aspect
+```
+
+This is not the full AMUSE path. The winning config uses `use_amuse=False`,
+`use_soda=True`, `use_pmuoneq=True`, `use_gram=True`, and `use_normuon=True`.
+PMuonEq is row-only before Gram projection (`pmuon_row_gamma=0.15`,
+`pmuon_col_gamma=0.0`), then NorMuon applies row normalization with
+`normuon_aspect_scale=True` after the Gram/Newton-Schulz update direction is
+formed.
+
+## Model, Data, And Training Params
+
+| Item | Value |
+|---|---|
+| Model | compact ViT-5 CIFAR model |
+| Trainable parameters | 2,691,274 |
+| Image size | 32x32 |
+| Patch size | 4 |
+| Embed dim / depth / heads | 192 / 6 / 3 |
+| MLP ratio | 4 |
+| Architecture details | RMSNorm, RoPE, q/k norm, layer scale, 4 register tokens |
+| Dataset | CIFAR-10 |
+| Split | 45k train / 5k validation / 10k test |
+| Split seed | 12345 |
+| Training augmentation | random crop with padding 4, random horizontal flip, normalize |
+| Final steps | 10,000 |
+| Final seeds | 0, 1, 2 |
+| Batch size | 256 |
+| Eval batch size | 1024 |
+| Workers | 8 |
+| Eval bins | 8 |
+| Precision | CUDA BF16 autocast |
+
+## Winning Optimizer Params
+
+| Parameter | Value |
+|---|---:|
+| `lr` | `0.012` |
+| `weight_decay` | `0.0` |
+| `momentum` | `0.95` |
+| `beta1` | `0.6` |
+| `beta2` | `0.999` |
+| `rho` | `0.8` |
+| `warmup_steps` | `500` |
+| `soda_warmup_steps` | `500` |
+| `pmuon_beta` | `0.90` |
+| `pmuon_row_gamma` | `0.15` |
+| `pmuon_col_gamma` | `0.0` |
+| `normuon_beta2` | `0.90` |
+| `normuon_mode` | `row` |
+| `normuon_aspect_scale` | `True` |
+
 ## Artifacts
 
 - HPO table: `hpo1k_all_runs.csv`
