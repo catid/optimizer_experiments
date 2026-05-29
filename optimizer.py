@@ -78,9 +78,11 @@ For a matrix parameter ``W_t`` with gradient ``G_t``:
 Fallback parameters
 ===================
 
-Biases, norms, embeddings, heads, scalar/vector tensors, and any parameters
-routed to the fallback group use the same SODA anchor plus RMS/AdamW-style
-second-moment update used by the winning research path:
+Biases, norms, scalar/vector tensors, and any parameters routed to the fallback
+group use the same SODA anchor plus RMS/AdamW-style second-moment update used by
+the winning research path. Matrix eligibility is based on effective shape after
+ignoring singleton dimensions: for example ``[1, 1, width]`` is a vector, while
+``[1, tokens, width]`` is a matrix.
 
        v_t = beta_2 v_{t-1} + (1 - beta_2) g_t^2
        update = g_t / sqrt(v_t / (1 - beta_2^t) + eps)
@@ -119,10 +121,11 @@ Do not tune everything at once. Treat the knobs in three tiers:
 
     Tier 2, tune only after Tier 1:
         fallback_lr
-            LR for embeddings, heads, norms, biases, scalars, and vectors.
+            LR for norms, biases, scalars, vectors, and any tensors explicitly
+            routed to fallback.
             Default matches matrix_lr because this is what the strongest
-            reproduced CIFAR recipe used. For language models, consider lowering
-            it after tied embedding / LM-head routing has been audited.
+            reproduced CIFAR recipe used. For language models, audit tied
+            embedding / LM-head routing before lowering it.
 
         normuon_beta2
             Row second-moment smoothing after GramNS. Default 0.93. Try
@@ -223,11 +226,14 @@ POLAR_EXPRESS_COEFFICIENTS: tuple[tuple[float, float, float], ...] = tuple(
 
 @torch.no_grad()
 def _matrix_view(x: torch.Tensor) -> torch.Tensor:
-    if x.ndim < 2:
-        raise ValueError("matrix update requires a tensor with ndim >= 2")
-    if x.ndim == 2:
-        return x
-    return x.reshape(x.shape[0], -1)
+    effective_shape = tuple(int(dim) for dim in x.shape if int(dim) > 1)
+    if len(effective_shape) < 2:
+        raise ValueError("matrix update requires at least two non-singleton dimensions")
+    if len(effective_shape) == 2:
+        return x.reshape(effective_shape)
+    rows = effective_shape[0]
+    cols = math.prod(effective_shape[1:])
+    return x.reshape(rows, cols)
 
 
 @torch.no_grad()
@@ -286,38 +292,24 @@ def _is_default_fallback_name(name: str) -> bool:
     if any(part in norm_parts or part.endswith("norm") for part in parts):
         return True
 
-    embed_parts = {
-        "embed",
-        "token_embed",
-        "token_embedding",
-        "embedding",
-        "embeddings",
-        "wte",
-        "wpe",
-        "tok_embeddings",
-        "word_embeddings",
-        "word_embedding",
-        "pos_embed",
-        "position_embeddings",
-        "cls_token",
-        "reg_token",
-    }
-    if any(part in embed_parts for part in parts):
-        return True
-
-    known_head_tokens = ("lm_head", "classifier_head", "unembed")
-    if any(token in lower for token in known_head_tokens):
-        return True
-    return lower == "head.weight" or lower.endswith(".head.weight")
+    return False
 
 
 def _is_matrix_like_parameter(param: torch.Tensor, *, min_matrix_dim: int) -> bool:
-    """Return whether ``param`` is large enough for the spectral matrix path."""
+    """Return whether ``param`` is large enough for the spectral matrix path.
 
-    if param.ndim < 2 or not param.is_floating_point():
+    Singleton dimensions do not make a tensor matrix-like. For example, ViT
+    ``cls_token`` with shape ``[1, 1, width]`` is effectively a vector, while
+    ``pos_embed`` with shape ``[1, patches, width]`` is effectively a matrix.
+    """
+
+    if not param.is_floating_point():
         return False
-    rows = int(param.shape[0])
-    cols = int(param.numel() // max(rows, 1))
+    effective_shape = tuple(int(dim) for dim in param.shape if int(dim) > 1)
+    if len(effective_shape) < 2:
+        return False
+    rows = effective_shape[0]
+    cols = math.prod(effective_shape[1:])
     return min(rows, cols) >= int(min_matrix_dim)
 
 
@@ -582,6 +574,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                     group.setdefault("pmuoneq_eps", pmuoneq_eps)
                     group.setdefault("normuon_beta2", normuon_beta2)
                     group.setdefault("normuon_eps", normuon_eps)
+                    group.setdefault("min_matrix_dim", min_matrix_dim)
                 else:
                     group.setdefault("weight_decay", fallback_weight_decay)
                     group.setdefault("betas", fallback_betas)
@@ -626,6 +619,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                     "normuon_beta2": normuon_beta2,
                     "normuon_eps": normuon_eps,
                     "use_external_lr": use_external_lr,
+                    "min_matrix_dim": min_matrix_dim,
                 }
             )
         if fallback_params:
@@ -763,7 +757,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                     "SodaPmuonEqNorMuon does not support sparse gradients. "
                     "Use dense gradients for this parameter or a different optimizer for sparse embeddings."
                 )
-            if grad.ndim < 2:
+            if not _is_matrix_like_parameter(grad, min_matrix_dim=int(group.get("min_matrix_dim", 2))):
                 fallback_count += self._step_fallback_param(p, group, lr=lr, t=t)
                 continue
             anchor = self._soda_anchor(p)
@@ -890,13 +884,14 @@ def build_soda_pmuoneq_normuon_param_groups(
 ) -> list[dict[str, Any]]:
     """Split named parameters into matrix and fallback groups.
 
-    The default grouping keeps common embeddings, output heads, normalization
-    layers, and biases in the fallback path. For language models, audit tied
-    embedding / LM-head parameters before the full run.
+    The default grouping uses effective tensor shape, not broad name categories,
+    for matrix routing. Singleton dimensions are ignored, so ``[1, 1, width]``
+    is a vector and ``[1, tokens, width]`` is a matrix. Biases and normalization
+    parameters are still kept in the fallback path by name.
 
     Tied parameters are deduplicated by object identity. If any alias looks like
-    an embedding, output head, norm, bias, scalar, or vector, the shared tensor is
-    conservatively routed to the fallback group.
+    a norm or bias, the shared tensor is conservatively routed to the fallback
+    group; otherwise the effective shape decides.
     """
 
     if min_matrix_dim < 1:
@@ -955,6 +950,7 @@ def build_soda_pmuoneq_normuon_param_groups(
                 "normuon_beta2": normuon_beta2,
                 "normuon_eps": normuon_eps,
                 "use_external_lr": use_external_lr,
+                "min_matrix_dim": min_matrix_dim,
             }
         )
     if fallback_params:

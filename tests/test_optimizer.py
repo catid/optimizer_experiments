@@ -72,13 +72,16 @@ def _run_step(model: nn.Module, opt: torch.optim.Optimizer, step: int) -> float:
     return float(loss.detach())
 
 
-def test_golden_param_groups_keep_heads_norms_and_embeddings_in_fallback() -> None:
+def test_golden_param_groups_use_effective_shape_for_matrix_routing() -> None:
     params = [
         ("blocks.0.mlp.fc1.weight", nn.Parameter(torch.zeros(8, 8))),
         ("blocks.0.attn.head_projection.weight", nn.Parameter(torch.zeros(8, 8))),
         ("lm_head.weight", nn.Parameter(torch.zeros(8, 8))),
         ("head.weight", nn.Parameter(torch.zeros(8, 8))),
         ("token_embed.weight", nn.Parameter(torch.zeros(8, 8))),
+        ("cls_token", nn.Parameter(torch.zeros(1, 1, 8))),
+        ("pos_embed", nn.Parameter(torch.zeros(1, 16, 8))),
+        ("reg_token", nn.Parameter(torch.zeros(1, 4, 8))),
         ("blocks.0.layernorm.weight", nn.Parameter(torch.zeros(8, 8))),
         ("blocks.0.mlp.fc1.bias", nn.Parameter(torch.zeros(8))),
     ]
@@ -88,9 +91,12 @@ def test_golden_param_groups_keep_heads_norms_and_embeddings_in_fallback() -> No
     fallback_names = set(groups[1]["param_names"])
     assert "blocks.0.mlp.fc1.weight" in matrix_names
     assert "blocks.0.attn.head_projection.weight" in matrix_names
-    assert "lm_head.weight" in fallback_names
-    assert "head.weight" in fallback_names
-    assert "token_embed.weight" in fallback_names
+    assert "lm_head.weight" in matrix_names
+    assert "head.weight" in matrix_names
+    assert "token_embed.weight" in matrix_names
+    assert "pos_embed" in matrix_names
+    assert "reg_token" in matrix_names
+    assert "cls_token" in fallback_names
     assert "blocks.0.layernorm.weight" in fallback_names
     assert "blocks.0.mlp.fc1.bias" in fallback_names
 
@@ -108,11 +114,14 @@ def test_public_names_and_tied_parameter_grouping_are_safe() -> None:
     assert GoldenMuon is SodaPmuonEqNorMuon
     assert build_param_groups is build_soda_pmuoneq_normuon_param_groups
     assert isinstance(__version__, str)
-    assert len(groups) == 2
+    assert len(groups) == 1
     assert sum(len(group["params"]) for group in groups) == 2
-    fallback_names = set(groups[1]["param_names"])
-    assert "token_embed.weight|lm_head.weight" in fallback_names
-    assert groups[1]["param_aliases"] == [["token_embed.weight", "lm_head.weight"]]
+    matrix_names = set(groups[0]["param_names"])
+    assert "token_embed.weight|lm_head.weight" in matrix_names
+    assert groups[0]["param_aliases"] == [
+        ["blocks.0.mlp.fc1.weight"],
+        ["token_embed.weight", "lm_head.weight"],
+    ]
 
 
 def test_named_parameters_constructor_hides_grouping_from_training_code() -> None:
@@ -122,11 +131,12 @@ def test_named_parameters_constructor_hides_grouping_from_training_code() -> Non
     assert opt.param_groups[0]["use_matrix_update"] is True
     assert opt.param_groups[1]["use_matrix_update"] is False
     fallback_names = set(opt.param_groups[1]["param_names"])
-    assert "classifier_head.weight" in fallback_names
+    matrix_names = set(opt.param_groups[0]["param_names"])
+    assert "classifier_head.weight" in matrix_names
     assert "norm.weight" in fallback_names
     summary = opt.group_summary()
     assert summary[0]["use_matrix_update"] is True
-    assert summary[0]["param_count"] == 1
+    assert summary[0]["param_count"] == 2
     assert summary[1]["use_matrix_update"] is False
     assert summary[1]["named"] is True
 
@@ -269,17 +279,30 @@ def test_golden_matches_legacy_configured_as_winning_no_aspect_path() -> None:
         warmup_steps=2,
     )
     legacy = ReferenceSodaPmuonEqNorMuon(
-        build_reference_param_groups(
-            legacy_model.named_parameters(),
-            matrix_lr=1e-3,
-            adam_lr=1e-4,
-            pmuoneq_beta=0.90,
-            row_gamma=0.35,
-            col_gamma=0.0,
-            normuon_beta2=0.93,
-            normuon_mode="row",
-            normuon_aspect_scale=False,
-        ),
+        [
+            {
+                "params": [legacy_model.left.weight, legacy_model.right.weight, legacy_model.classifier_head.weight],
+                "use_matrix_update": True,
+                "lr": 1e-3,
+                "base_lr": 1e-3,
+            },
+            {
+                "params": [legacy_model.classifier_head.bias],
+                "use_matrix_update": False,
+                "lr": 1e-4,
+                "base_lr": 1e-4,
+            },
+        ],
+        matrix_lr=1e-3,
+        adam_lr=1e-4,
+        pmuoneq_beta=0.90,
+        row_gamma=0.35,
+        col_gamma=0.0,
+        normuon_beta2=0.93,
+        normuon_mode="row",
+        normuon_aspect_scale=False,
+        adam_betas=(0.9, 0.999),
+        eps=1e-10,
         warmup_steps=2,
     )
 
@@ -317,8 +340,15 @@ def test_golden_same_shape_bucket_matches_split_matrix_groups() -> None:
             "base_lr": 1e-3,
         },
         {
-            "params": list(split.classifier_head.parameters()),
-            "param_names": ["classifier_head.weight", "classifier_head.bias"],
+            "params": [split.classifier_head.weight],
+            "param_names": ["classifier_head.weight"],
+            "use_matrix_update": True,
+            "lr": 1e-3,
+            "base_lr": 1e-3,
+        },
+        {
+            "params": [split.classifier_head.bias],
+            "param_names": ["classifier_head.bias"],
             "use_matrix_update": False,
             "lr": 1e-4,
             "base_lr": 1e-4,
