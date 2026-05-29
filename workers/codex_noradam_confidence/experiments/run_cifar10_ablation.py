@@ -1263,6 +1263,30 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
         try:
             import matplotlib.pyplot as plt
 
+            def display_label(trial: str) -> str:
+                """Human-facing plot label; raw trial IDs remain in CSV/JSON."""
+                seed_suffix = ""
+                seed_match = re.search(r"_seed(\d+)$", trial)
+                if seed_match:
+                    seed_suffix = f" seed {seed_match.group(1)}"
+                    trial = trial[: seed_match.start()]
+                if trial.startswith("final_"):
+                    parts = trial.split("_", 2)
+                    if len(parts) == 3:
+                        trial = parts[2]
+                if trial.startswith("adamw_"):
+                    schedule = "cosine" if "cosine" in trial else "schedule"
+                    return f"AdamW {schedule}{seed_suffix}"
+                if trial.startswith("root_named_"):
+                    rest = trial[len("root_named_"):]
+                    schedule = rest.split("_", 1)[0]
+                    return f"AnchorMuon {schedule}{seed_suffix}"
+                if trial.startswith("root_"):
+                    rest = trial[len("root_"):]
+                    schedule = rest.split("_", 1)[0]
+                    return f"AnchorMuon {schedule}{seed_suffix}"
+                return f"{trial}{seed_suffix}"
+
             rows = collect_epoch_rows(output_dir)
             by_trial: dict[str, list[dict[str, float]]] = {}
             for row in rows:
@@ -1278,7 +1302,12 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
                 plt.figure(figsize=(9, 5))
                 for trial, vals in by_trial.items():
                     vals = sorted(vals, key=lambda x: x["step"])
-                    plt.plot([v["step"] for v in vals], [v[metric] for v in vals], marker="o", label=trial)
+                    plt.plot(
+                        [v["step"] for v in vals],
+                        [v[metric] for v in vals],
+                        marker="o",
+                        label=display_label(trial),
+                    )
                 plt.xlabel("optimizer step")
                 plt.ylabel(metric)
                 plt.legend(fontsize=7)
@@ -1295,7 +1324,7 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
                 available = sorted(available, key=lambda row: float(row[metric]), reverse=reverse)
                 height = max(4.0, 0.32 * len(available))
                 plt.figure(figsize=(11, height))
-                labels = [str(row["trial"]) for row in available]
+                labels = [display_label(str(row["trial"])) for row in available]
                 vals = [float(row[metric]) for row in available]
                 bars = plt.barh(labels, vals)
                 plt.gca().invert_yaxis()
