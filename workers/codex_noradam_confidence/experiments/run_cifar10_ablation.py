@@ -52,6 +52,7 @@ class TrialConfig:
     weight_decay: float = 0.05
     soda: str = "matrix"
     pmuon_eq: bool = True
+    use_gram: bool = True
     row_gamma: float = 0.20
     col_gamma: float = 0.0
     pmuon_beta: float = 0.95
@@ -102,6 +103,7 @@ def parse_args() -> argparse.Namespace:
             "root_soda_ablation",
             "root_lr_schedule_sweep",
             "sfplus_combo20",
+            "component_ablation",
         ],
     )
     parser.add_argument("--only", default="", help="Regex filter for trial names")
@@ -487,6 +489,146 @@ def trial_grid(preset: str) -> list[TrialConfig]:
                 sfplus_weight_lr_power=2.0,
             ))
         return trials
+    if preset == "component_ablation":
+        trials = [
+            TrialConfig("component_adamw_lr0.004_wd0.001", "adamw", 4e-3, lr_schedule="cosine", weight_decay=0.001),
+            TrialConfig("component_adamw_lr0.003_wd0.005", "adamw", 3e-3, lr_schedule="cosine", weight_decay=0.005),
+        ]
+
+        def add_family(
+            family: str,
+            *,
+            soda: str = "all",
+            pmuon_eq: bool = True,
+            use_gram: bool = True,
+            normuon: bool = True,
+            lr_values: list[float],
+            row_gamma_values: list[float],
+            pmuon_beta_values: list[float],
+            normuon_beta_values: list[float],
+        ) -> None:
+            for lr in lr_values:
+                for row_gamma in row_gamma_values:
+                    for pmuon_beta in pmuon_beta_values:
+                        for normuon_beta in normuon_beta_values:
+                            trials.append(TrialConfig(
+                                (
+                                    f"component_{family}_lr{lr:g}_rg{row_gamma:g}"
+                                    f"_pb{pmuon_beta:g}_nb{normuon_beta:g}"
+                                ),
+                                "anchormuon",
+                                lr,
+                                lr_schedule="wsd",
+                                weight_decay=0.001,
+                                soda=soda,
+                                pmuon_eq=pmuon_eq,
+                                use_gram=use_gram,
+                                row_gamma=row_gamma,
+                                col_gamma=0.0,
+                                pmuon_beta=pmuon_beta,
+                                momentum=0.95,
+                                amuse=False,
+                                normuon=normuon,
+                                normuon_beta=normuon_beta,
+                                normuon_aspect_scale=False,
+                            ))
+
+        # Progressive, comparable HPO around the current WSD winner. Each
+        # component-removal family gets LR tuning plus the relevant local knob.
+        add_family(
+            "full",
+            lr_values=[0.010, 0.012, 0.014],
+            row_gamma_values=[0.35],
+            pmuon_beta_values=[0.90],
+            normuon_beta_values=[0.93],
+        )
+        add_family(
+            "full",
+            lr_values=[0.012],
+            row_gamma_values=[0.25, 0.45],
+            pmuon_beta_values=[0.90],
+            normuon_beta_values=[0.93],
+        )
+        add_family(
+            "full",
+            lr_values=[0.012],
+            row_gamma_values=[0.35],
+            pmuon_beta_values=[0.95],
+            normuon_beta_values=[0.90, 0.95],
+        )
+        add_family(
+            "no_soda",
+            soda="none",
+            lr_values=[0.006, 0.008, 0.010, 0.012],
+            row_gamma_values=[0.35],
+            pmuon_beta_values=[0.90],
+            normuon_beta_values=[0.93],
+        )
+        add_family(
+            "no_soda",
+            soda="none",
+            lr_values=[0.008],
+            row_gamma_values=[0.25, 0.45],
+            pmuon_beta_values=[0.90],
+            normuon_beta_values=[0.93],
+        )
+        add_family(
+            "no_soda",
+            soda="none",
+            lr_values=[0.008],
+            row_gamma_values=[0.35],
+            pmuon_beta_values=[0.95],
+            normuon_beta_values=[0.90, 0.95],
+        )
+        add_family(
+            "no_pmuoneq",
+            pmuon_eq=False,
+            lr_values=[0.006, 0.008, 0.010, 0.012],
+            row_gamma_values=[0.0],
+            pmuon_beta_values=[0.90],
+            normuon_beta_values=[0.93],
+        )
+        add_family(
+            "no_pmuoneq",
+            pmuon_eq=False,
+            lr_values=[0.008, 0.010],
+            row_gamma_values=[0.0],
+            pmuon_beta_values=[0.95],
+            normuon_beta_values=[0.90, 0.95],
+        )
+        add_family(
+            "no_gram",
+            use_gram=False,
+            lr_values=[0.002, 0.004, 0.006, 0.008],
+            row_gamma_values=[0.35],
+            pmuon_beta_values=[0.90],
+            normuon_beta_values=[0.93],
+        )
+        add_family(
+            "no_gram",
+            use_gram=False,
+            lr_values=[0.004, 0.006],
+            row_gamma_values=[0.25, 0.45],
+            pmuon_beta_values=[0.90],
+            normuon_beta_values=[0.93],
+        )
+        add_family(
+            "no_normuon",
+            normuon=False,
+            lr_values=[0.004, 0.006, 0.008, 0.010],
+            row_gamma_values=[0.35],
+            pmuon_beta_values=[0.90],
+            normuon_beta_values=[0.93],
+        )
+        add_family(
+            "no_normuon",
+            normuon=False,
+            lr_values=[0.006, 0.008],
+            row_gamma_values=[0.25, 0.45],
+            pmuon_beta_values=[0.90],
+            normuon_beta_values=[0.93],
+        )
+        return trials
     feedback = [
         TrialConfig("adamw_cosine_lr0.004_wd0.001", "adamw", 4e-3, lr_schedule="cosine", weight_decay=0.001),
     ]
@@ -588,6 +730,9 @@ def trial_grid(preset: str) -> list[TrialConfig]:
 
 
 def trial_family(cfg: TrialConfig) -> str:
+    match = re.match(r"(?:final_)?component_(full|no_soda|no_pmuoneq|no_gram|no_normuon|adamw)", cfg.name)
+    if match:
+        return f"component_{match.group(1)}"
     if cfg.optimizer == "sfplus":
         match = re.search(r"sfplus_([PCBDMpcbdm]{5})", cfg.name)
         return f"sfplus_{match.group(1)}" if match else "sfplus"
@@ -861,6 +1006,7 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             weight_decay=cfg.weight_decay,
             soda=cfg.soda,
             pmuon_eq=cfg.pmuon_eq,
+            use_gram=cfg.use_gram,
             row_gamma=cfg.row_gamma,
             col_gamma=cfg.col_gamma,
             pmuon_beta=cfg.pmuon_beta,
@@ -1190,6 +1336,7 @@ def run_worker(args: argparse.Namespace) -> None:
         "weight_decay": cfg.weight_decay,
         "soda": cfg.soda,
         "pmuon_eq": cfg.pmuon_eq,
+        "use_gram": cfg.use_gram,
         "row_gamma": cfg.row_gamma,
         "col_gamma": cfg.col_gamma,
         "pmuon_beta": cfg.pmuon_beta,
@@ -1361,6 +1508,7 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
             weight_decay=float(row["weight_decay"]),
             soda=row["soda"],
             pmuon_eq=parse_bool(row["pmuon_eq"]),
+            use_gram=parse_bool(row.get("use_gram", True)),
             row_gamma=float(row["row_gamma"]),
             col_gamma=float(row["col_gamma"]),
             pmuon_beta=float(row.get("pmuon_beta", 0.95)),
@@ -1417,6 +1565,17 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
                     match = re.search(r"sfplus_([PCBDMpcbdm]{5})", trial)
                     code = match.group(1) if match else trial[len("sfplus_"):].split("_", 1)[0]
                     return f"SF+ {code}{seed_suffix}"
+                component = re.match(r"(?:final_)?component_(full|no_soda|no_pmuoneq|no_gram|no_normuon|adamw)", trial)
+                if component:
+                    labels = {
+                        "full": "AnchorMuon full",
+                        "no_soda": "AnchorMuon -SODA",
+                        "no_pmuoneq": "AnchorMuon -PMuonEq",
+                        "no_gram": "AnchorMuon -GramNS",
+                        "no_normuon": "AnchorMuon -NorMuon",
+                        "adamw": "AdamW",
+                    }
+                    return f"{labels[component.group(1)]}{seed_suffix}"
                 if trial.startswith("root_named_"):
                     rest = trial[len("root_named_"):]
                     schedule = rest.split("_", 1)[0]
@@ -1528,6 +1687,7 @@ def summaries_to_trials(rows: Iterable[dict]) -> list[TrialConfig]:
             weight_decay=float(row["weight_decay"]),
             soda=row["soda"],
             pmuon_eq=parse_bool(row["pmuon_eq"]),
+            use_gram=parse_bool(row.get("use_gram", True)),
             row_gamma=float(row["row_gamma"]),
             col_gamma=float(row["col_gamma"]),
             pmuon_beta=float(row.get("pmuon_beta", 0.95)),

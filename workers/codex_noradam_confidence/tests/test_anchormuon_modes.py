@@ -11,7 +11,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from optim_anchormuon import AnchorMuon, gram_newton_schulz, normuon_normalize_update, pmuon_eq_precondition
+from optim_anchormuon import (
+    AnchorMuon,
+    gram_newton_schulz,
+    normalized_matrix_direction,
+    normuon_normalize_update,
+    pmuon_eq_precondition,
+)
 from optim_factory import _anchor_param_groups
 
 
@@ -45,6 +51,7 @@ def _step(mode: dict) -> tuple[TinyNet, AnchorMuon]:
         warmup_steps=2,
         soda=mode.get("soda", "matrix"),
         pmuon_eq=mode.get("pmuon_eq", True),
+        use_gram=mode.get("use_gram", True),
         row_gamma=mode.get("row_gamma", 0.20),
         col_gamma=mode.get("col_gamma", 0.0),
         mimuon=mode.get("mimuon", False),
@@ -75,6 +82,16 @@ def test_gram_newton_schulz_shape_and_finiteness() -> None:
         update = gram_newton_schulz(torch.randn(*shape))
         assert update.shape == shape
         assert torch.isfinite(update).all()
+
+
+def test_normalized_matrix_direction_is_muon_scale_compatible() -> None:
+    torch.manual_seed(15)
+    update = torch.randn(7, 3)
+    out = normalized_matrix_direction(update)
+    assert out.shape == update.shape
+    assert torch.isfinite(out).all()
+    target_rms = 1.0 / math.sqrt(max(update.shape))
+    assert torch.allclose(out.square().mean().sqrt(), torch.tensor(target_rms), atol=1e-6, rtol=1e-6)
 
 
 def test_pmuon_eq_updates_state_and_preserves_shape() -> None:
@@ -135,6 +152,7 @@ def test_modes_run_without_nan_and_keep_gradients_unchanged() -> None:
         {"soda": "all", "pmuon_eq": True, "mimuon": False},
         {"soda": "matrix", "pmuon_eq": False, "mimuon": False},
         {"soda": "matrix", "pmuon_eq": True, "mimuon": True, "mimuon_mix": 0.75},
+        {"soda": "matrix", "pmuon_eq": True, "use_gram": False},
         {"soda": "all", "pmuon_eq": True, "normuon": True, "normuon_beta": 0.90},
         {"soda": "all", "pmuon_eq": True, "normuon": True, "normuon_beta": 0.95, "normuon_aspect_scale": True},
         {"soda": "all", "pmuon_eq": True, "mimuon": True, "mimuon_mix": 0.85, "normuon": True},
@@ -146,6 +164,10 @@ def test_modes_run_without_nan_and_keep_gradients_unchanged() -> None:
             assert opt.last_stats["mimuon_params"] > 0
         if mode.get("normuon"):
             assert opt.last_stats["normuon_params"] > 0
+        if mode.get("use_gram", True):
+            assert opt.last_stats["gram_params"] == opt.last_stats["matrix_params"]
+        else:
+            assert opt.last_stats["gram_params"] == 0.0
         assert isinstance(model, TinyNet)
 
 

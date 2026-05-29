@@ -16,6 +16,8 @@ blends the Muon branch with a normalized momentum-SGD branch, and
 ``normuon=True`` adds NorMuon-style row/column second-moment normalization after
 the Gram Newton-Schulz transform. ``normuon_aspect_scale=True`` optionally adds
 the peer-review aspect multiplier after that normalization.
+``use_gram=False`` is a diagnostic ablation that replaces the polar transform
+with an RMS-matched momentum direction.
 
 For matrix-like parameters, AnchorMuon computes
 
@@ -63,6 +65,7 @@ __all__ = [
     "AnchorMuon",
     "AnchorMuonEq",
     "gram_newton_schulz",
+    "normalized_matrix_direction",
     "normuon_normalize_update",
     "pmuon_eq_precondition",
 ]
@@ -126,6 +129,27 @@ def gram_newton_schulz(update: Tensor, *, steps: int = 5, eps: float = 1e-7) -> 
     if transposed:
         x = x.mT
     return x.float()
+
+
+@torch.no_grad()
+def normalized_matrix_direction(update: Tensor, *, eps: float = 1e-7) -> Tensor:
+    """Return a no-polar matrix direction with Muon-compatible RMS scale.
+
+    This is used only for ablations that remove Gram Newton-Schulz. The normal
+    Muon path produces an approximately polar matrix whose RMS is about
+    ``1 / sqrt(max(rows, cols))`` before AnchorMuon's standard ``0.2 *
+    sqrt(max(rows, cols))`` multiplier. Matching that pre-multiplier RMS keeps
+    the ablation's layer step scale comparable while removing only the polar
+    geometry.
+    """
+
+    if update.ndim != 2:
+        raise ValueError("normalized_matrix_direction expects a matrix")
+    x = update.float()
+    rows, cols = x.shape
+    target_rms = 1.0 / math.sqrt(max(rows, cols))
+    rms = x.square().mean().sqrt().clamp_min(float(eps))
+    return x * (target_rms / rms)
 
 
 def _normalized_inverse_power(values: Tensor, *, gamma: float, eps: float) -> Tensor:
@@ -240,6 +264,8 @@ class AnchorMuon(torch.optim.Optimizer):
       default is row-only PMuonEq, ``row_gamma=0.20`` and ``col_gamma=0.0``.
     * ``pmuon_eq``: enables the cheap row/column PMuonEq preconditioner before
       Newton-Schulz. Set false for a plain AMUSE/SODA+Muon ablation.
+    * ``use_gram``: enables the Gram Newton-Schulz polar transform. Set false
+      only for ablations; the fallback direction is RMS-matched but not polar.
     * ``mimuon``: blends the Muon direction with a normalized momentum direction
       after PMuonEq. This is off by default and exposed for ablations.
     * ``normuon``: applies NorMuon-style row/column second-moment normalization
@@ -272,6 +298,7 @@ class AnchorMuon(torch.optim.Optimizer):
         momentum: float = 0.95,
         pmuon_beta: float = 0.95,
         pmuon_eq: bool = True,
+        use_gram: bool = True,
         row_gamma: float = 0.20,
         col_gamma: float = 0.0,
         mimuon: bool = False,
@@ -320,6 +347,7 @@ class AnchorMuon(torch.optim.Optimizer):
             momentum=float(momentum),
             pmuon_beta=float(pmuon_beta),
             pmuon_eq=bool(pmuon_eq),
+            use_gram=bool(use_gram),
             row_gamma=float(row_gamma),
             col_gamma=float(col_gamma),
             mimuon=bool(mimuon),
@@ -483,6 +511,7 @@ class AnchorMuon(torch.optim.Optimizer):
 
         total_params = 0
         matrix_params = 0
+        gram_params = 0
         mimuon_params = 0
         normuon_params = 0
         normuon_aspect_params = 0
@@ -541,11 +570,18 @@ class AnchorMuon(torch.optim.Optimizer):
                         )
                     else:
                         preconditioned = nesterov_update.float()
-                    muon_matrix = gram_newton_schulz(
-                        preconditioned,
-                        steps=int(group["ns_steps"]),
-                        eps=float(group["pmuon_eps"]),
-                    )
+                    if bool(group.get("use_gram", True)):
+                        gram_params += 1
+                        muon_matrix = gram_newton_schulz(
+                            preconditioned,
+                            steps=int(group["ns_steps"]),
+                            eps=float(group["pmuon_eps"]),
+                        )
+                    else:
+                        muon_matrix = normalized_matrix_direction(
+                            preconditioned,
+                            eps=float(group["pmuon_eps"]),
+                        )
                     if bool(group["normuon"]):
                         normuon_params += 1
                         if bool(group.get("normuon_aspect_scale", False)):
@@ -609,6 +645,7 @@ class AnchorMuon(torch.optim.Optimizer):
             "beta": float(beta_last),
             "params": float(total_params),
             "matrix_params": float(matrix_params),
+            "gram_params": float(gram_params),
             "mimuon_params": float(mimuon_params),
             "normuon_params": float(normuon_params),
             "normuon_aspect_params": float(normuon_aspect_params),

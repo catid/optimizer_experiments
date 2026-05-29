@@ -168,6 +168,42 @@ It improved official test accuracy by +8.12 percentage points over AdamW and
 by +1.93 points over the previous three-seed mean constant-LR AnchorMuon result.
 AdamW remains the fastest per step.
 
+### Latest Component Removal Ablation
+
+This ablation tested whether each part of the worker AnchorMuon recipe was
+actually helping after short HPO and a longer replay. Each family received
+12-epoch HPO, then the family winner was replayed for 50 epochs. Protocol:
+`vit5_micro`, CIFAR-10 45k/5k train/validation split, official 10k test
+evaluated only at the end, batch size 512, seed `123`, BF16 autocast,
+channels-last tensors, 16 dataloader workers, and two GPUs scheduled one trial
+per GPU.
+
+50-epoch replay, sorted by official test accuracy:
+
+| Run | Final val loss | Best val loss | Final val acc | Best val acc | Official test loss | Official test acc | Step | Throughput |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| AnchorMuon -PMuonEq | 0.4225 | 0.4129 | 85.98% | 86.04% | 0.4395 | 85.28% | 18.52 ms | 27.7k ex/s |
+| AnchorMuon -NorMuon | 0.4237 | 0.4116 | 85.64% | 85.98% | 0.4460 | 84.99% | 18.90 ms | 27.1k ex/s |
+| AnchorMuon full | 0.4385 | 0.4165 | 84.82% | 85.96% | 0.4451 | 84.88% | 20.16 ms | 25.4k ex/s |
+| AnchorMuon -SODA | 0.4934 | 0.4648 | 84.66% | 84.70% | 0.5203 | 84.19% | 18.66 ms | 27.4k ex/s |
+| AnchorMuon -GramNS | 0.5680 | 0.5444 | 79.66% | 80.40% | 0.5663 | 80.49% | 16.59 ms | 30.9k ex/s |
+| AdamW baseline | 0.6133 | 0.5998 | 79.62% | 79.64% | 0.6240 | 79.55% | 11.56 ms | 44.3k ex/s |
+
+Findings: SODA should not be judged from short runs alone. The no-SODA family
+won the 12-epoch HPO stage, but fell behind by 50 epochs and lost 0.69 official
+test points versus the full recipe. GramNS is clearly important, losing 4.39
+official test points when removed. PMuonEq and NorMuon are less settled in this
+single-seed worker-run ablation: removing PMuonEq gave the best official test
+accuracy, while removing NorMuon gave the best validation loss. Before changing
+the shippable root default, rerun full vs `-PMuonEq` vs `-NorMuon` with multiple
+seeds and then validate the winner through root `optimizer.py`.
+
+Full component-ablation report and plots:
+`results/component_ablation_50e_20260529/summary.md`,
+`results/component_ablation_50e_20260529/final_bins/val_acc.png`,
+`results/component_ablation_50e_20260529/final_bins/val_loss.png`, and
+`results/component_ablation_50e_20260529/final_bins/step_time_ms_bar.png`.
+
 ### Latest Proper-Split Replay
 
 This replay holds out 5,000 examples from CIFAR-10 `train=True` for HPO and

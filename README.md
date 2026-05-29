@@ -51,6 +51,30 @@ The final 50-epoch schedule-winner plots are in
 
 ![Validation accuracy curves for the 50-epoch AnchorMuon schedule winners](workers/codex_noradam_confidence/results/root_lr_schedule_sweep_20260529/final50_schedule_winners/val_acc.png)
 
+**Component-removal ablation note:** a separate worker-research ablation tuned
+each component-removal family for 12 epochs, then replayed each selected winner
+for 50 epochs on the same ViT-5 micro CIFAR-10 split. This was motivated by the
+fact that SODA-like anchor effects can appear late. In that run, the no-SODA
+family won the 12-epoch HPO selector but fell behind by 50 epochs, losing 0.69
+official test points versus the full worker recipe. GramNS remained essential;
+removing it lost 4.39 official test points versus the full worker recipe.
+
+| Worker ablation | Official test acc | Best val acc | Step time | Takeaway |
+|---|---:|---:|---:|---|
+| AnchorMuon -PMuonEq | 85.28% | 86.04% | 18.52 ms | Best single-seed worker replay; needs multi-seed/root validation before changing the shippable default. |
+| AnchorMuon -NorMuon | 84.99% | 85.98% | 18.90 ms | Very close; best validation loss in this ablation. |
+| AnchorMuon full | 84.88% | 85.96% | 20.16 ms | Reference worker recipe. |
+| AnchorMuon -SODA | 84.19% | 84.70% | 18.66 ms | Looked better at 12 epochs, worse at 50 epochs. |
+| AnchorMuon -GramNS | 80.49% | 80.40% | 16.59 ms | Faster, but large quality loss. |
+| AdamW baseline | 79.55% | 79.64% | 11.56 ms | Fast per step, much worse accuracy. |
+
+This ablation does not supersede the root `optimizer.py` recommendation above:
+it is single-seed and uses the worker research optimizer path. It does set the
+next validation target: multi-seed full vs `-PMuonEq` vs `-NorMuon`, then replay
+the winner through root `optimizer.py` before changing the standalone default.
+Full report:
+`workers/codex_noradam_confidence/results/component_ablation_50e_20260529/summary.md`.
+
 **Previous three-seed direct root validation:** same ViT-5 micro CIFAR-10 split
 and official test protocol, but using the earlier constant-LR direct root
 recipe at `lr=8e-3` over seeds `123,456,789`.
