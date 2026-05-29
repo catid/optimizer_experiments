@@ -1,5 +1,23 @@
 # ViT-5: Vision Transformers for the Mid-2020s
 
+## Codex Optimizer Fork
+
+This fork adds `SodaMuseEq` optimizer experiments for CIFAR-10. The optimizer
+implementation is in `optim_sodamuseeq.py`, and focused optimizer comparison
+artifacts are committed one directory up at
+`../results/focused_optimizer_confidence/`.
+
+Best focused result in the compact ViT-5/CIFAR-10 harness:
+
+| Optimizer | 10k best val loss | 10k test acc | steps/sec |
+| --- | ---: | ---: | ---: |
+| SODA+PMuonEq+Gram | 0.4210 +/- 0.0097 | 86.90% +/- 0.35 | 42.84 +/- 0.20 |
+| NorMuon+BaseGram | 0.5069 +/- 0.0100 | 86.05% +/- 0.36 | 47.93 +/- 0.67 |
+| AdamW | 0.6030 +/- 0.0167 | 81.27% +/- 0.74 | 58.46 +/- 0.42 |
+
+AdamW is faster per iteration, but SODA+PMuonEq+Gram is the quality winner in
+the completed focused comparison.
+
 Official implementation of  
 **ViT-5: Vision Transformers for the Mid-2020s**
 
@@ -139,4 +157,3 @@ If you use ViT-5, please cite:
 # Acknowledgement
 
 This work builds upon the strong foundation of Vision Transformers and recent advances in scalable Transformer architectures. The code is basically built upon DeiT.
-

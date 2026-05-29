@@ -34,6 +34,19 @@ The focused comparison completed in the source workspace:
 
 The same ordering held in the 20k seed-0 check.
 
+Committed artifacts are in `results/focused_optimizer_confidence/`:
+
+- `experimental_results.md`: compact written result summary.
+- `val_loss_best_vs_adamw.png`: validation-loss curve for the winner versus
+  AdamW.
+- `train_loss_best_vs_adamw.png`: train interval-loss curve for the winner
+  versus AdamW.
+- `val_acc_best_vs_adamw.png`: validation-accuracy curve for the winner versus
+  AdamW.
+- `final_test_accuracy_bar.png`: 10k final test-accuracy comparison.
+- `iteration_speed_steps_per_sec.png`: iteration-speed comparison.
+- `final10k_all_runs.csv` and `long20k_all_runs.csv`: raw result tables.
+
 ## Feedback Applied
 
 - Added train-mode and eval-mode checkpoint resume parity tests.

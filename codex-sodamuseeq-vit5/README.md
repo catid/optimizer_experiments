@@ -12,6 +12,8 @@ Contents:
 - `vit5/experiments/focused_optimizer_confidence.py`: focused comparison runner
   for AdamW, NorMuon+BaseGram, and SODA+PMuonEq+Gram.
 - `vit5/tests/`: unit and DDP smoke tests for optimizer modes.
+- `results/focused_optimizer_confidence/`: committed result tables and plots
+  for the completed focused comparison.
 
 The optimizer supports optional switches for:
 
@@ -107,3 +109,24 @@ The 3-seed 10k and seed-0 20k focused confidence pass found:
 The result supports SODA+PMuonEq+Gram as the best quality recipe in this compact
 ViT-5/CIFAR-10 harness. NorMuon+BaseGram is faster than SODA+PMuonEq+Gram and
 better than AdamW, but it did not close the quality gap.
+
+Committed result artifacts:
+
+- Summary report: `results/focused_optimizer_confidence/experimental_results.md`
+- Validation loss, best optimizer vs AdamW:
+  `results/focused_optimizer_confidence/val_loss_best_vs_adamw.png`
+- Train interval loss, best optimizer vs AdamW:
+  `results/focused_optimizer_confidence/train_loss_best_vs_adamw.png`
+- Validation accuracy, best optimizer vs AdamW:
+  `results/focused_optimizer_confidence/val_acc_best_vs_adamw.png`
+- Final test accuracy bar chart:
+  `results/focused_optimizer_confidence/final_test_accuracy_bar.png`
+- Iteration speed bar chart:
+  `results/focused_optimizer_confidence/iteration_speed_steps_per_sec.png`
+- Raw final tables:
+  `results/focused_optimizer_confidence/final10k_all_runs.csv` and
+  `results/focused_optimizer_confidence/long20k_all_runs.csv`
+
+The optimizer implementation used for the completed result is
+`vit5/optim_sodamuseeq.py`; the current branch adds checkpoint/test hardening on
+top of that code path without changing the training update rule.
