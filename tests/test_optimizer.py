@@ -141,6 +141,32 @@ def test_named_parameters_constructor_hides_grouping_from_training_code() -> Non
     assert summary[1]["named"] is True
 
 
+def test_group_builder_can_disable_soda_only_for_fallback_params() -> None:
+    model = TinyClassifier()
+    groups = build_soda_pmuoneq_normuon_param_groups(
+        model.named_parameters(),
+        matrix_soda=True,
+        fallback_soda=False,
+    )
+    assert len(groups) == 2
+    assert groups[0]["use_matrix_update"] is True
+    assert groups[0]["use_soda"] is True
+    assert groups[0]["fallback_use_soda"] is False
+    assert groups[1]["use_matrix_update"] is False
+    assert groups[1]["use_soda"] is False
+
+    opt = SodaPmuonEqNorMuon(
+        model.named_parameters(),
+        matrix_lr=1e-3,
+        fallback_lr=1e-4,
+        warmup_steps=2,
+        matrix_soda=True,
+        fallback_soda=False,
+    )
+    assert opt.param_groups[0]["use_soda"] is True
+    assert opt.param_groups[1]["use_soda"] is False
+
+
 def test_named_constructor_preserves_external_lr_flag() -> None:
     model = TinyClassifier()
     opt = SodaPmuonEqNorMuon(

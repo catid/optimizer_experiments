@@ -87,6 +87,7 @@ def parse_args() -> argparse.Namespace:
             "best_cifar10",
             "root_normuon_ablation",
             "root_soda_ablation",
+            "root_soda_scope",
         ],
     )
     parser.add_argument("--only", default="", help="Regex filter for trial names")
@@ -417,6 +418,53 @@ def trial_grid(preset: str) -> list[TrialConfig]:
     ]
     if preset == "root_soda_ablation":
         return root_soda_ablation
+    root_soda_scope = [
+        TrialConfig("adamw_cosine_lr0.004_wd0.001", "adamw", 4e-3, lr_schedule="cosine", weight_decay=0.001),
+        TrialConfig(
+            "root_row_named_sodaall_mlr0.008_rg0.35_pb0.9_nb0.93",
+            "root",
+            8e-3,
+            soda="all",
+            row_gamma=0.35,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.93,
+            amuse=False,
+            root_grouping="named",
+            root_normuon_mode="row",
+        ),
+        TrialConfig(
+            "root_row_named_sodamatrix_mlr0.008_rg0.35_pb0.9_nb0.93",
+            "root",
+            8e-3,
+            soda="matrix",
+            row_gamma=0.35,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.93,
+            amuse=False,
+            root_grouping="named",
+            root_normuon_mode="row",
+        ),
+        TrialConfig(
+            "root_row_named_nosoda_mlr0.008_rg0.35_pb0.9_nb0.93",
+            "root",
+            8e-3,
+            soda="none",
+            row_gamma=0.35,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.93,
+            amuse=False,
+            root_grouping="named",
+            root_normuon_mode="row",
+        ),
+    ]
+    if preset == "root_soda_scope":
+        return root_soda_scope
     feedback = [
         TrialConfig("adamw_cosine_lr0.004_wd0.001", "adamw", 4e-3, lr_schedule="cosine", weight_decay=0.001),
     ]
@@ -788,8 +836,8 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             normuon_aspect_scale=cfg.normuon_aspect_scale,
         )
     if cfg.optimizer == "root":
-        if cfg.soda not in {"all", "none"}:
-            raise ValueError("root optimizer trainer adapter supports soda='all' or soda='none'")
+        if cfg.soda not in {"all", "matrix", "none"}:
+            raise ValueError("root optimizer trainer adapter supports soda='all', 'matrix', or 'none'")
         if cfg.col_gamma != 0.0:
             raise ValueError("root optimizer is row-only PMuonEq; col_gamma must be 0.0")
         if cfg.root_grouping not in {"anchor", "named"}:
@@ -801,7 +849,9 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             if cfg.root_normuon_mode == "orientation"
             else root_optimizer.SodaPmuonEqNorMuon
         )
-        soda_lambda_scale = 1.0 if cfg.soda == "all" else 0.0
+        soda_lambda_scale = 1.0 if cfg.soda in {"all", "matrix"} else 0.0
+        matrix_soda = cfg.soda in {"all", "matrix"}
+        fallback_soda = cfg.soda == "all"
         fallback_weight_decay = 0.0 if cfg.soda == "all" else cfg.weight_decay
         params = root_anchor_param_groups(model, cfg) if cfg.root_grouping == "anchor" else model.named_parameters()
         return opt_cls(
@@ -816,6 +866,8 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             fallback_betas=(0.9, 0.95),
             fallback_weight_decay=fallback_weight_decay,
             soda_lambda_scale=soda_lambda_scale,
+            matrix_soda=matrix_soda,
+            fallback_soda=fallback_soda,
             min_matrix_dim=int(getattr(args, "anchor_min_matrix_dim", 2)),
         )
     if cfg.optimizer == "golden":
