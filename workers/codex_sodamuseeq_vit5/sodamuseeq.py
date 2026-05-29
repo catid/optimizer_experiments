@@ -287,13 +287,32 @@ def _pmuoneq_precondition_entries(
     return stats
 
 
+def _normuon_second_shape(rows: int, cols: int, mode: str) -> tuple[int, int]:
+    if mode == "row":
+        return rows, 1
+    if mode == "orientation":
+        return (rows, 1) if rows >= cols else (1, cols)
+    raise ValueError(f"unknown NorMuon mode {mode!r}")
+
+
 @torch.no_grad()
-def _normuon_update(update: torch.Tensor, state: dict[str, Any], *, beta2: float, eps: float) -> torch.Tensor:
+def _normuon_update(
+    update: torch.Tensor,
+    state: dict[str, Any],
+    *,
+    beta2: float,
+    eps: float,
+    mode: str,
+    aspect_scale: bool,
+) -> torch.Tensor:
     if update.ndim != 2:
         return update
     work = update.float()
+    rows, cols = work.shape
     norm_before = work.norm(dim=(-2, -1), keepdim=True)
-    row_power = work.square().mean(dim=-1, keepdim=True)
+    second_shape = _normuon_second_shape(rows, cols, mode)
+    reduce_dim = -1 if second_shape[1] == 1 else -2
+    row_power = work.square().mean(dim=reduce_dim, keepdim=True)
     second = state.get("normuon_second_moment")
     if second is None or second.shape != row_power.shape or second.device != row_power.device:
         second = state["normuon_second_moment"] = torch.zeros_like(row_power, dtype=torch.float32)
@@ -301,6 +320,8 @@ def _normuon_update(update: torch.Tensor, state: dict[str, Any], *, beta2: float
     work = work * second.clamp_min(eps).rsqrt().to(work.dtype)
     norm_after = work.norm(dim=(-2, -1), keepdim=True)
     work = work * (norm_before / norm_after.clamp_min(eps))
+    if aspect_scale:
+        work = work * math.sqrt(max(1.0, rows / cols))
     return work.to(update.dtype)
 
 
@@ -344,6 +365,8 @@ class SodaMuseEq(torch.optim.Optimizer):
         use_normuon: bool = False,
         normuon_beta2: float = 0.95,
         normuon_eps: float = 1e-10,
+        normuon_mode: str = "row",
+        normuon_aspect_scale: bool = False,
         soda_warmup_steps: int = 200,
         soda_anchor: str = "warmup",
         soda_warmup_k_mode: str = "post_warmup",
@@ -359,6 +382,8 @@ class SodaMuseEq(torch.optim.Optimizer):
             raise ValueError("soda_warmup_k_mode must be 'post_warmup' or 'global'")
         if pmuon_sides not in {"none", "left", "right", "both", "min"}:
             raise ValueError(f"unknown PMuonEq sides mode {pmuon_sides!r}")
+        if normuon_mode not in {"row", "orientation"}:
+            raise ValueError(f"unknown NorMuon mode {normuon_mode!r}")
 
         self.beta1_init = float(beta1)
         self.rho = float(rho)
@@ -376,6 +401,8 @@ class SodaMuseEq(torch.optim.Optimizer):
         self.use_normuon = bool(use_normuon)
         self.normuon_beta2 = float(normuon_beta2)
         self.normuon_eps = float(normuon_eps)
+        self.normuon_mode = normuon_mode
+        self.normuon_aspect_scale = bool(normuon_aspect_scale)
         self.soda_warmup_steps = int(soda_warmup_steps)
         self.soda_anchor = soda_anchor
         self.soda_warmup_k_mode = soda_warmup_k_mode
@@ -760,6 +787,8 @@ class SodaMuseEq(torch.optim.Optimizer):
                             entry["state"],
                             beta2=self.normuon_beta2,
                             eps=self.normuon_eps,
+                            mode=self.normuon_mode,
+                            aspect_scale=self.normuon_aspect_scale,
                         )
                         second = entry["state"].get("normuon_second_moment")
                         if isinstance(second, torch.Tensor):

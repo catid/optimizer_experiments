@@ -10,7 +10,8 @@ Contents:
 - `vit5/optim_sodamuseeq.py`: ViT-integrated optimizer implementation.
 - `vit5/experiments/sodamuseeq_ablation.py`: broad SodaMuseEq ablation runner.
 - `vit5/experiments/focused_optimizer_confidence.py`: focused comparison runner
-  for AdamW, NorMuon+BaseGram, and SODA+PMuonEq+Gram.
+  for AdamW, NorMuon+BaseGram, SODA+PMuonEq+Gram, and the peer-suggested
+  SODA+PMuonEq+Gram+NorMuon row+aspect recipe.
 - `vit5/tests/`: unit and DDP smoke tests for optimizer modes.
 - `results/focused_optimizer_confidence/`: committed result tables and plots
   for the completed focused comparison.
@@ -22,6 +23,8 @@ The optimizer supports optional switches for:
 - PMuonEq row/column EMA equilibration before Gram-Newton-Schulz projection.
 - MiMuon branch selection.
 - NorMuon row second-moment normalization after projection.
+- Optional NorMuon orientation mode and tall-matrix aspect scaling, ported from
+  `workers/codex_soda_pmuoneq_normuon`.
 
 ## Validation
 
@@ -50,6 +53,9 @@ optimizer tensor state across ranks.
 The tests include:
 
 - all ablation modes run without NaNs,
+- named grouping keeps ViT `patch_embed` matrices in the matrix optimizer while
+  keeping heads/norms in fallback,
+- NorMuon row/aspect and orientation controls have shape and update tests,
 - batch projection parity against individual projection,
 - same-shape matrix bucket parity,
 - repeated schedule-free `train()` / `eval()` roundtrips,
@@ -87,13 +93,45 @@ uv run python vit5/experiments/focused_optimizer_confidence.py \
   --workers 8
 ```
 
-The runner schedules one trial per visible GPU. It intentionally compares only:
+The runner schedules one trial per visible GPU. It compares:
 
 - AdamW baseline.
 - NorMuon+BaseGram: no SODA, no AMUSE, no PMuonEq.
 - SODA+PMuonEq+Gram.
+- SODA+PMuonEq+Gram+NorMuon row+aspect.
 
 ## Focused Results
+
+Peer-feedback rerun, after adding row+aspect NorMuon support:
+
+| Variant | Budget | Val loss | Val acc | Test acc | Steps/sec |
+| --- | --- | ---: | ---: | ---: | ---: |
+| SODA+PMuonEq+Gram+NorMuon row+aspect | 10k, 3 seeds | 0.4079 +/- 0.0090 | 87.15% +/- 0.08 | 87.09% +/- 0.15 | 42.84 +/- 0.06 |
+| SODA+PMuonEq+Gram | 10k, 3 seeds | 0.4210 +/- 0.0097 | 87.19% +/- 0.24 | 86.90% +/- 0.35 | 43.05 +/- 0.27 |
+| NorMuon+BaseGram | 10k, 3 seeds | 0.5069 +/- 0.0100 | 86.21% +/- 0.49 | 86.05% +/- 0.36 | 47.44 +/- 0.34 |
+| AdamW | 10k, 3 seeds | 0.6030 +/- 0.0167 | 81.47% +/- 0.75 | 81.27% +/- 0.74 | 58.41 +/- 0.24 |
+
+Best row+aspect config:
+
+```text
+use_amuse = False
+use_soda = True
+use_pmuoneq = True
+use_gram = True
+use_normuon = True
+normuon_mode = row
+normuon_aspect_scale = True
+lr = 0.012
+pmuon_beta = 0.90
+pmuon_row_gamma = 0.15
+pmuon_col_gamma = 0.0
+normuon_beta2 = 0.90
+weight_decay = 0.0
+```
+
+Artifacts: `results/focused_peer_aspect/`.
+
+Previous focused confidence pass:
 
 The 3-seed 10k and seed-0 20k focused confidence pass found:
 

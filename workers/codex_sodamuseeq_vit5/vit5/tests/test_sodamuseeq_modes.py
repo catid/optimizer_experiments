@@ -38,6 +38,16 @@ class SameShapeBucketModel(nn.Module):
         return self.head(self.norm(x))
 
 
+class WideMatrixModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wide = nn.Linear(16, 8, bias=False)
+        self.head = nn.Linear(8, 5)
+
+    def forward(self, x):
+        return self.head(torch.tanh(self.wide(x)))
+
+
 def _batch():
     torch.manual_seed(123)
     return torch.randn(24, 12), torch.randint(0, 5, (24,))
@@ -46,6 +56,11 @@ def _batch():
 def _same_shape_batch():
     torch.manual_seed(124)
     return torch.randn(24, 8), torch.randint(0, 5, (24,))
+
+
+def _wide_batch():
+    torch.manual_seed(125)
+    return torch.randn(24, 16), torch.randint(0, 5, (24,))
 
 
 def _step(model, opt, x, y):
@@ -100,6 +115,49 @@ def test_all_ablation_modes_run_without_nan():
             assert stats["normuon_applied_count"] > 0.0
         else:
             assert stats["normuon_applied_count"] == 0.0
+
+
+def test_named_group_helper_keeps_patch_embed_matrix_but_head_aux():
+    model = TinyViTLike()
+    groups = make_sodamuseeq_param_groups(model, lr=1e-2, weight_decay=0.01)
+    matrix_names = {getattr(p, "_sodamuseeq_param_name") for p in groups[0]["params"]}
+    aux_names = {getattr(p, "_sodamuseeq_param_name") for p in groups[1]["params"]}
+    assert "patch_embed.weight" in matrix_names
+    assert "mlp.0.weight" in matrix_names
+    assert "mlp.2.weight" in matrix_names
+    assert "head.weight" in aux_names
+    assert "norm.weight" in aux_names
+
+
+def test_normuon_aspect_and_orientation_controls():
+    x, y = _batch()
+    torch.manual_seed(81)
+    row_aspect = TinyViTLike()
+    row_noaspect = TinyViTLike()
+    row_noaspect.load_state_dict(row_aspect.state_dict())
+    opt_aspect = _make_opt(row_aspect, use_soda=False, use_amuse=False, use_normuon=True, normuon_aspect_scale=True)
+    opt_noaspect = _make_opt(row_noaspect, use_soda=False, use_amuse=False, use_normuon=True, normuon_aspect_scale=False)
+    _step(row_aspect, opt_aspect, x, y)
+    _step(row_noaspect, opt_noaspect, x, y)
+    assert not torch.allclose(row_aspect.patch_embed.weight, row_noaspect.patch_embed.weight)
+
+    xw, yw = _wide_batch()
+    torch.manual_seed(82)
+    wide = WideMatrixModel()
+    opt_wide = SodaMuseEq(
+        make_sodamuseeq_param_groups(wide, lr=1e-2, weight_decay=0.01),
+        warmup_steps=1,
+        soda_warmup_steps=99,
+        stats_interval=1,
+        projection_dtype=torch.float32,
+        use_soda=False,
+        use_amuse=False,
+        use_normuon=True,
+        normuon_mode="orientation",
+    )
+    _step(wide, opt_wide, xw, yw)
+    second = opt_wide.state[wide.wide.weight]["normuon_second_moment"]
+    assert tuple(second.shape) == (1, wide.wide.weight.shape[1])
 
 
 def test_batch_projection_matches_individual_projection():

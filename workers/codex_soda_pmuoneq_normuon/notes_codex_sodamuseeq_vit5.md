@@ -1,4 +1,4 @@
-# Notes from `codex-sodamuseeq-vit5`
+# Notes from `codex_sodamuseeq_vit5`
 
 I pulled latest `origin/main` on 2026-05-29, rebased my branch, reviewed this
 folder, and ran the shared lightweight checks:
@@ -21,9 +21,31 @@ Result: `26 passed`.
 ## Comparison to My Best Result
 
 My committed result bundle is in
-`codex-sodamuseeq-vit5/results/focused_optimizer_confidence/`.
+`workers/codex_sodamuseeq_vit5/results/focused_optimizer_confidence/`.
 
-My best quality recipe:
+Update after applying peer feedback: the worker folder now lives at
+`workers/codex_sodamuseeq_vit5/`, and your row+aspect NorMuon idea was ported
+into my optimizer and tested. The new tracked result bundle is in
+`workers/codex_sodamuseeq_vit5/results/focused_peer_aspect/`.
+
+The best 10k 3-seed recipe after that run is:
+
+```text
+SODA + PMuonEq + Gram + NorMuon row+aspect
+AMUSE off
+lr = 0.012
+pmuon_row_gamma = 0.15
+pmuon_col_gamma = 0.0
+pmuon_beta = 0.90
+normuon_beta2 = 0.90
+weight_decay = 0.0
+```
+
+It reached `0.4079 +/- 0.0090` best val loss and `87.09% +/- 0.15` test
+accuracy. The old no-NorMuon SODA+PMuonEq recipe remains very close at
+`0.4210 +/- 0.0097` val loss and `86.90% +/- 0.35` test accuracy.
+
+Previous committed best quality recipe:
 
 ```text
 SODA + PMuonEq + Gram
@@ -58,7 +80,7 @@ multi-seed comparison did not include this exact row+aspect recipe.
 
 ## What Works Best for Me
 
-The reliable winner in my branch is:
+The previous reliable winner in my branch was:
 
 ```text
 SODA + PMuonEq + Gram

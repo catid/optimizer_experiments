@@ -43,6 +43,7 @@ RUN_LABELS = {
     "normuon_base": "NorMuon+BaseGram",
     "soda_pmuoneq_mimuon": "SODA+PMuonEq+MiMuon+Gram",
     "soda_pmuoneq_normuon": "SODA+PMuonEq+Gram+NorMuon",
+    "soda_pmuoneq_normuon_aspect": "SODA+PMuonEq+Gram+NorMuon row+aspect",
     "soda_pmuoneq_mimuon_normuon": "SODA+PMuonEq+MiMuon+Gram+NorMuon",
 }
 
@@ -54,6 +55,8 @@ class RunSpec:
     lr: float
     weight_decay: float = 0.05
     pmuon_gamma: float = 0.2
+    pmuon_row_gamma: float | None = None
+    pmuon_col_gamma: float | None = None
     pmuon_beta: float = 0.95
     use_soda: bool = True
     use_amuse: bool = True
@@ -63,6 +66,8 @@ class RunSpec:
     use_normuon: bool = False
     mimuon_tau: float = 0.005
     normuon_beta2: float = 0.95
+    normuon_mode: str = "row"
+    normuon_aspect_scale: bool = False
     beta1: float = 0.6
     rho: float = 0.8
     warmup_steps: int | None = None
@@ -87,6 +92,8 @@ class RunSpec:
             str(self.mimuon_tau),
             "--normuon-beta2",
             str(self.normuon_beta2),
+            "--normuon-mode",
+            self.normuon_mode,
             "--beta1",
             str(self.beta1),
             "--rho",
@@ -96,6 +103,10 @@ class RunSpec:
             out.extend(["--warmup-steps", str(self.warmup_steps)])
         if self.soda_warmup_steps is not None:
             out.extend(["--soda-warmup-steps", str(self.soda_warmup_steps)])
+        if self.pmuon_row_gamma is not None:
+            out.extend(["--pmuon-row-gamma", str(self.pmuon_row_gamma)])
+        if self.pmuon_col_gamma is not None:
+            out.extend(["--pmuon-col-gamma", str(self.pmuon_col_gamma)])
         for flag, value in (
             ("--use-soda", self.use_soda),
             ("--use-amuse", self.use_amuse),
@@ -105,6 +116,7 @@ class RunSpec:
             ("--use-normuon", self.use_normuon),
         ):
             out.append(flag if value else flag.replace("--use-", "--no-"))
+        out.append("--normuon-aspect-scale" if self.normuon_aspect_scale else "--no-normuon-aspect-scale")
         out.append("--soda-replaces-weight-decay" if self.soda_replaces_weight_decay else "--soda-keeps-weight-decay")
         return out
 
@@ -209,11 +221,15 @@ def create_optimizer(args, model):
         use_pmuoneq=args.use_pmuoneq,
         pmuon_beta=args.pmuon_beta,
         pmuon_gamma=args.pmuon_gamma,
+        pmuon_row_gamma=args.pmuon_row_gamma,
+        pmuon_col_gamma=args.pmuon_col_gamma,
         use_gram=args.use_gram,
         use_mimuon=args.use_mimuon,
         mimuon_tau=args.mimuon_tau,
         use_normuon=args.use_normuon,
         normuon_beta2=args.normuon_beta2,
+        normuon_mode=args.normuon_mode,
+        normuon_aspect_scale=args.normuon_aspect_scale,
         batch_project=args.batch_project,
         stats_interval=args.stats_interval,
     )
@@ -351,6 +367,8 @@ def train_trial(args):
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "pmuon_gamma": args.pmuon_gamma,
+        "pmuon_row_gamma": args.pmuon_row_gamma if args.pmuon_row_gamma is not None else args.pmuon_gamma,
+        "pmuon_col_gamma": args.pmuon_col_gamma if args.pmuon_col_gamma is not None else args.pmuon_gamma,
         "pmuon_beta": args.pmuon_beta,
         "beta1": args.beta1,
         "rho": args.rho,
@@ -362,6 +380,8 @@ def train_trial(args):
         "use_normuon": args.use_normuon,
         "mimuon_tau": args.mimuon_tau,
         "normuon_beta2": args.normuon_beta2,
+        "normuon_mode": args.normuon_mode,
+        "normuon_aspect_scale": args.normuon_aspect_scale,
         "soda_replaces_weight_decay": args.soda_replaces_weight_decay,
         "warmup_steps": args.warmup_steps,
         "soda_warmup_steps": args.soda_warmup_steps,
@@ -474,6 +494,7 @@ def normuon_tune_specs(args) -> list[RunSpec]:
         "soda_pmuoneq": {"use_mimuon": False, "use_normuon": False},
         "soda_pmuoneq_mimuon": {"use_mimuon": True, "use_normuon": False},
         "soda_pmuoneq_normuon": {"use_mimuon": False, "use_normuon": True},
+        "soda_pmuoneq_normuon_aspect": {"use_mimuon": False, "use_normuon": True, "normuon_aspect_scale": True},
         "soda_pmuoneq_mimuon_normuon": {"use_mimuon": True, "use_normuon": True},
     }
     for variant, overrides in variants.items():
@@ -603,6 +624,8 @@ def final_specs_from_hpo(hpo_rows: list[dict[str, Any]]) -> list[RunSpec]:
             continue
         if row["optimizer"] == "adamw":
             key = "adamw"
+        elif not row.get("use_amuse") and row.get("use_normuon") and _as_bool(row.get("normuon_aspect_scale"), False):
+            key = "soda_pmuoneq_normuon_aspect"
         elif not row.get("use_amuse") and row.get("use_mimuon") and row.get("use_normuon"):
             key = "soda_pmuoneq_mimuon_normuon"
         elif not row.get("use_amuse") and row.get("use_mimuon"):
@@ -633,6 +656,9 @@ def final_specs_from_hpo(hpo_rows: list[dict[str, Any]]) -> list[RunSpec]:
                 lr=float(row["lr"]),
                 weight_decay=float(row["weight_decay"]),
                 pmuon_gamma=float(row.get("pmuon_gamma", 0.2)),
+                pmuon_row_gamma=float(row["pmuon_row_gamma"]) if row.get("pmuon_row_gamma") not in {None, "", "None"} else None,
+                pmuon_col_gamma=float(row["pmuon_col_gamma"]) if row.get("pmuon_col_gamma") not in {None, "", "None"} else None,
+                pmuon_beta=float(row.get("pmuon_beta", 0.95)),
                 use_soda=bool(row.get("use_soda", True)),
                 use_amuse=bool(row.get("use_amuse", True)),
                 use_pmuoneq=bool(row.get("use_pmuoneq", True)),
@@ -646,6 +672,8 @@ def final_specs_from_hpo(hpo_rows: list[dict[str, Any]]) -> list[RunSpec]:
                 soda_replaces_weight_decay=_as_bool(row.get("soda_replaces_weight_decay"), True),
                 mimuon_tau=float(row.get("mimuon_tau", 0.005)),
                 normuon_beta2=float(row.get("normuon_beta2", 0.95)),
+                normuon_mode=str(row.get("normuon_mode", "row")),
+                normuon_aspect_scale=_as_bool(row.get("normuon_aspect_scale"), False),
             )
         )
     return final
@@ -880,6 +908,8 @@ def parse_args():
     p.add_argument("--beta2", type=float, default=0.999)
     p.add_argument("--rho", type=float, default=0.8)
     p.add_argument("--pmuon-gamma", type=float, default=0.2)
+    p.add_argument("--pmuon-row-gamma", type=float, default=None)
+    p.add_argument("--pmuon-col-gamma", type=float, default=None)
     p.add_argument("--pmuon-beta", type=float, default=0.95)
     p.add_argument("--mimuon-tau", type=float, default=0.005)
     p.add_argument("--use-soda", action="store_true", default=True)
@@ -897,6 +927,9 @@ def parse_args():
     p.add_argument("--use-normuon", action="store_true", default=False)
     p.add_argument("--no-normuon", action="store_false", dest="use_normuon")
     p.add_argument("--normuon-beta2", type=float, default=0.95)
+    p.add_argument("--normuon-mode", choices=["row", "orientation"], default="row")
+    p.add_argument("--normuon-aspect-scale", action="store_true", default=False)
+    p.add_argument("--no-normuon-aspect-scale", action="store_false", dest="normuon_aspect_scale")
     p.add_argument("--batch-project", action="store_true", default=True)
     p.add_argument("--warmup-steps", type=int, default=50)
     p.add_argument("--soda-warmup-steps", type=int, default=50)

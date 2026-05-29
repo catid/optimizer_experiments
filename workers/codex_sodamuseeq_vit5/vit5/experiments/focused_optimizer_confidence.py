@@ -25,6 +25,7 @@ LABELS = {
     "adamw": "AdamW",
     "soda_pmuoneq": "SODA+PMuonEq+Gram",
     "normuon_base": "NorMuon+BaseGram",
+    "soda_pmuoneq_normuon_aspect": "SODA+PMuonEq+Gram+NorMuon row+aspect",
 }
 
 
@@ -96,8 +97,39 @@ def normuon_base_specs() -> list[Trial]:
     return specs
 
 
+def soda_pmuoneq_normuon_aspect_specs() -> list[Trial]:
+    specs: list[Trial] = []
+    for lr in (0.010, 0.012, 0.014):
+        for row_gamma in (0.15, 0.25, 0.35):
+            for col_gamma in (0.0, 0.05):
+                for beta2 in (0.90, 0.93, 0.95):
+                    spec = RunSpec(
+                        f"hpo_soda_pmuoneq_normuon_aspect_lr{lr:g}_rg{row_gamma:g}_cg{col_gamma:g}_nb{beta2:g}",
+                        "sodamuseeq",
+                        lr=lr,
+                        weight_decay=0.0,
+                        pmuon_gamma=0.0,
+                        pmuon_row_gamma=row_gamma,
+                        pmuon_col_gamma=col_gamma,
+                        pmuon_beta=0.90,
+                        use_soda=True,
+                        use_amuse=False,
+                        use_pmuoneq=True,
+                        use_gram=True,
+                        use_normuon=True,
+                        normuon_beta2=beta2,
+                        normuon_mode="row",
+                        normuon_aspect_scale=True,
+                        soda_replaces_weight_decay=True,
+                        warmup_steps=500,
+                        soda_warmup_steps=500,
+                    )
+                    specs.append(Trial(spec, "soda_pmuoneq_normuon_aspect", 0))
+    return specs
+
+
 def hpo_trials() -> list[Trial]:
-    return adamw_specs() + soda_pmuoneq_specs() + normuon_base_specs()
+    return adamw_specs() + soda_pmuoneq_specs() + normuon_base_specs() + soda_pmuoneq_normuon_aspect_specs()
 
 
 def _row_key(row: dict[str, Any]) -> tuple[float, float]:
@@ -237,6 +269,8 @@ def _spec_from_row(row: dict[str, Any], name: str) -> RunSpec:
         lr=float(row["lr"]),
         weight_decay=float(row["weight_decay"]),
         pmuon_gamma=float(row.get("pmuon_gamma", 0.0)),
+        pmuon_row_gamma=float(row["pmuon_row_gamma"]) if row.get("pmuon_row_gamma") not in {None, "", "None"} else None,
+        pmuon_col_gamma=float(row["pmuon_col_gamma"]) if row.get("pmuon_col_gamma") not in {None, "", "None"} else None,
         pmuon_beta=float(row.get("pmuon_beta", 0.95)),
         use_soda=_as_bool(row.get("use_soda"), True),
         use_amuse=_as_bool(row.get("use_amuse"), False),
@@ -246,6 +280,8 @@ def _spec_from_row(row: dict[str, Any], name: str) -> RunSpec:
         use_normuon=_as_bool(row.get("use_normuon"), False),
         mimuon_tau=float(row.get("mimuon_tau", 0.005)),
         normuon_beta2=float(row.get("normuon_beta2", 0.95)),
+        normuon_mode=str(row.get("normuon_mode", "row")),
+        normuon_aspect_scale=_as_bool(row.get("normuon_aspect_scale"), False),
         beta1=float(row.get("beta1", 0.6)),
         rho=float(row.get("rho", 0.8)),
         warmup_steps=int(float(row.get("warmup_steps", 500))) or None,
@@ -268,6 +304,16 @@ def _as_bool(value: Any, default: bool = False) -> bool:
         if lowered in {"0", "false", "no", "off"}:
             return False
     return default
+
+
+def _float_or(row: dict[str, Any], key: str, fallback: float) -> float:
+    value = row.get(key)
+    if value in {None, "", "None"}:
+        return fallback
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 def top_trials(rows: list[dict[str, Any]], n: int, prefix: str, seeds: list[int] | None = None) -> list[Trial]:
@@ -301,7 +347,7 @@ def write_report(args, roots: dict[str, Path], rows_by_phase: dict[str, list[dic
     lines = [
         "# Focused Optimizer Confidence Comparison",
         "",
-        "Compared only the requested arms: AdamW baseline, NorMuon+BaseGram, and SODA+PMuonEq+Gram.",
+        "Compared the focused arms: AdamW baseline, NorMuon+BaseGram, SODA+PMuonEq+Gram, and the peer-suggested SODA+PMuonEq+Gram+NorMuon row+aspect recipe.",
         "",
         "## Artifacts",
         "",
@@ -356,16 +402,19 @@ def write_report(args, roots: dict[str, Path], rows_by_phase: dict[str, list[dic
             "",
             "## Selected Configs",
             "",
-            "| phase | family | run | lr | wd | pmuon_gamma | normuon_beta2 | seed | best val loss |",
-            "|---|---|---|---:|---:|---:|---:|---:|---:|",
+            "| phase | family | run | lr | wd | pmuon row/col gamma | normuon beta2 | aspect | seed | best val loss |",
+            "|---|---|---|---:|---:|---:|---:|---|---:|---:|",
         ]
     )
     for phase in ("top3k", "final", "long"):
         for row in sorted([r for r in rows_by_phase.get(phase, []) if r.get("status") == "ok"], key=lambda r: (str(r.get("family")), int(r.get("seed", 0)), _row_key(r))):
             lines.append(
                 f"| {phase} | `{row['family']}` | `{row['run_name']}` | {float(row['lr']):.5g} | "
-                f"{float(row['weight_decay']):.5g} | {float(row.get('pmuon_gamma', 0.0)):.5g} | "
-                f"{float(row.get('normuon_beta2', 0.95)):.5g} | {int(row.get('seed', 0))} | "
+                f"{float(row['weight_decay']):.5g} | "
+                f"{_float_or(row, 'pmuon_row_gamma', float(row.get('pmuon_gamma', 0.0))):.5g}/"
+                f"{_float_or(row, 'pmuon_col_gamma', float(row.get('pmuon_gamma', 0.0))):.5g} | "
+                f"{float(row.get('normuon_beta2', 0.95)):.5g} | "
+                f"{_as_bool(row.get('normuon_aspect_scale'), False)} | {int(row.get('seed', 0))} | "
                 f"{float(row['best_val_loss']):.4f} |"
             )
 
@@ -394,6 +443,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top-steps", type=int, default=3000)
     p.add_argument("--final-steps", type=int, default=10000)
     p.add_argument("--long-steps", type=int, default=20000)
+    p.add_argument("--skip-long", action="store_true", default=False)
     p.add_argument("--top-n", type=int, default=3)
     p.add_argument("--final-seeds", default="0,1,2")
     p.add_argument("--long-seed", type=int, default=0)
@@ -422,9 +472,12 @@ def main() -> None:
     final_trials = top_trials(top_rows, 1, "final10k", seeds=seeds)
     final_root, final_rows = launch_trials(args, final_trials, "final10k", args.final_steps, eval_bins=8, eval_test=True)
     write_final_bin_table_and_plots(final_root)
-    long_trials = top_trials(top_rows, 1, "long20k", seeds=[args.long_seed])
-    long_root, long_rows = launch_trials(args, long_trials, "long20k", args.long_steps, eval_bins=8, eval_test=True)
-    write_final_bin_table_and_plots(long_root)
+    long_root = Path(args.out_dir) / "long20k"
+    long_rows: list[dict[str, Any]] = []
+    if not args.skip_long and args.long_steps > 0:
+        long_trials = top_trials(top_rows, 1, "long20k", seeds=[args.long_seed])
+        long_root, long_rows = launch_trials(args, long_trials, "long20k", args.long_steps, eval_bins=8, eval_test=True)
+        write_final_bin_table_and_plots(long_root)
     report = write_report(
         args,
         {"hpo1k": hpo_root, "top3k": top_root, "final": final_root, "long": long_root},

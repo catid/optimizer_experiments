@@ -83,6 +83,8 @@ def create_vit5_optimizer(args, model):
         mimuon_tau=args.sodamuse_mimuon_tau,
         use_normuon=args.sodamuse_use_normuon,
         normuon_beta2=args.sodamuse_normuon_beta2,
+        normuon_mode=args.sodamuse_normuon_mode,
+        normuon_aspect_scale=args.sodamuse_normuon_aspect_scale,
         batch_project=args.sodamuse_batch_project,
         stats_interval=args.sodamuse_stats_interval,
     )
@@ -149,6 +151,9 @@ def get_args_parser():
     parser.add_argument('--sodamuse-use-normuon', action='store_true', default=False)
     parser.add_argument('--sodamuse-no-normuon', action='store_false', dest='sodamuse_use_normuon')
     parser.add_argument('--sodamuse-normuon-beta2', type=float, default=0.95)
+    parser.add_argument('--sodamuse-normuon-mode', choices=['row', 'orientation'], default='row')
+    parser.add_argument('--sodamuse-normuon-aspect-scale', action='store_true', default=False)
+    parser.add_argument('--sodamuse-no-normuon-aspect-scale', action='store_false', dest='sodamuse_normuon_aspect_scale')
     parser.add_argument('--sodamuse-pmuon-beta', type=float, default=0.95)
     parser.add_argument('--sodamuse-pmuon-gamma', type=float, default=0.2)
     parser.add_argument('--sodamuse-pmuon-row-gamma', type=float, default=None)

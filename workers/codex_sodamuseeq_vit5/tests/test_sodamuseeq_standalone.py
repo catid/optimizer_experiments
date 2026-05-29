@@ -24,6 +24,16 @@ class TinyModel(nn.Module):
         return self.head(x)
 
 
+class WideModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wide = nn.Linear(16, 8, bias=False)
+        self.head = nn.Linear(8, 4)
+
+    def forward(self, x):
+        return self.head(torch.tanh(self.wide(x)))
+
+
 def _batch():
     torch.manual_seed(123)
     return torch.randint(0, 16, (12, 5)), torch.randint(0, 4, (12,))
@@ -65,6 +75,49 @@ def test_named_group_helper_keeps_embed_norm_and_head_in_fallback():
     aux_names = {getattr(p, "_sodamuseeq_param_name") for p in groups[1]["params"]}
     assert {"block.0.weight", "block.2.weight"} == matrix_names
     assert {"embed.weight", "block.0.bias", "block.2.bias", "norm.weight", "norm.bias", "head.weight", "head.bias"} == aux_names
+
+
+def test_standalone_normuon_aspect_and_orientation_controls():
+    torch.manual_seed(6)
+    base = TinyModel()
+    row_aspect = copy.deepcopy(base)
+    row_noaspect = copy.deepcopy(base)
+    x, y = _batch()
+    opt_aspect = SodaMuseEq(
+        make_sodamuseeq_param_groups(row_aspect, lr=1e-2, weight_decay=0.01),
+        warmup_steps=1,
+        soda_warmup_steps=99,
+        use_normuon=True,
+        normuon_aspect_scale=True,
+        projection_dtype=torch.float32,
+    )
+    opt_noaspect = SodaMuseEq(
+        make_sodamuseeq_param_groups(row_noaspect, lr=1e-2, weight_decay=0.01),
+        warmup_steps=1,
+        soda_warmup_steps=99,
+        use_normuon=True,
+        normuon_aspect_scale=False,
+        projection_dtype=torch.float32,
+    )
+    _step(row_aspect, opt_aspect, x, y)
+    _step(row_noaspect, opt_noaspect, x, y)
+    assert not torch.allclose(row_aspect.block[0].weight, row_noaspect.block[0].weight)
+
+    wide = WideModel()
+    opt_wide = SodaMuseEq(
+        make_sodamuseeq_param_groups(wide, lr=1e-2, weight_decay=0.01),
+        warmup_steps=1,
+        soda_warmup_steps=99,
+        use_normuon=True,
+        normuon_mode="orientation",
+        projection_dtype=torch.float32,
+    )
+    torch.manual_seed(66)
+    xw = torch.randn(12, 16)
+    yw = torch.randint(0, 4, (12,))
+    _step(wide, opt_wide, xw, yw)
+    second = opt_wide.state[wide.wide.weight]["normuon_second_moment"]
+    assert tuple(second.shape) == (1, wide.wide.weight.shape[1])
 
 
 def test_standalone_step_train_eval_and_stats_are_finite():
