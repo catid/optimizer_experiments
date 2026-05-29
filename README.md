@@ -54,14 +54,60 @@ data in `all_metrics_flat.csv`, and the mean/std table in
 
 ![Iteration step-time bars for the 5-seed CIFAR-10 optimizer confirmation](workers/codex_noradam_confidence/results/cifar5_baseline_confidence_20260529/final50_5seed/iteration_step_time_ms_bar_mean.png)
 
+## WikiText-103 50M LLM Byte-Level Check
+
+After the synthetic language-model proxy, I reran the comparison on actual
+WikiText-103 raw text. The runner encodes the corpus as UTF-8 bytes, so this is
+a real next-byte language-model workload, not a standard BPE/word-level
+WikiText perplexity. It is still the better signal for optimizer transfer than
+the deterministic synthetic motif stream.
+
+Protocol: `wikitext-103-raw-v1`, `32,000,000` cached training bytes,
+`1,148,008` validation bytes, decoder-only GPT with `10` layers, width `640`,
+`10` heads, context `128`, byte vocab `256`, `49,424,640` trainable
+parameters, batch `32 x 128`, BF16 autocast, WSD schedule with 20-step warmup,
+and two RTX PRO 6000 Blackwell GPUs scheduled one trial per GPU. I fixed a
+benchmark-runner bug before this final table: trainer-side scheduling now
+scales each optimizer group from its own initial LR, so AnchorMuon
+`fallback_lr_mult` is respected.
+
+Each HPO candidate ran `800` steps and the best candidate per optimizer family
+was replayed for `800` steps. This is a bounded single-seed transfer check, not
+a final language-modeling claim.
+
+| Rank | Optimizer | Selected config | Final val loss | Final byte acc | Step time | Throughput |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | AnchorMuon | `lr=0.00175`, `row_gamma=0.45`, `soda_lambda_scale=0.1`, `fallback=AdamATan2@0.5x` | 1.3614 | 59.93% | 15.52 ms | 263.9k byte/s |
+| 2 | Plain Muon | `lr=0.0015`, `wd=0.05` | 1.3672 | 59.57% | 17.05 ms | 240.2k byte/s |
+| 3 | AdamW-Atan2 | `lr=0.0003`, `wd=0.05` | 1.5914 | 53.42% | 10.52 ms | 389.2k byte/s |
+| 4 | AdamW | `lr=0.0003`, `wd=0.05` | 1.5955 | 53.46% | 10.29 ms | 398.0k byte/s |
+
+Takeaway: on real WikiText-103 bytes, tuned AnchorMuon does transfer much
+better than the original synthetic proxy suggested. It narrowly beats plain
+Muon on loss/accuracy and is about 9% faster per step than plain Muon, while
+AdamW and AdamW-Atan2 remain materially faster per step but much worse in
+early loss at this model/batch/step budget.
+
+Result bundle:
+`workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529/`.
+
+![WikiText-103 byte-level validation loss](workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529/plots/val_loss_curve.png)
+
+![WikiText-103 byte-level validation accuracy](workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529/plots/val_acc_curve.png)
+
+![WikiText-103 byte-level training loss](workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529/plots/train_loss_curve.png)
+
+![WikiText-103 byte-level step time](workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529/plots/step_time_ms_bar.png)
+
 ## Synthetic 50M LLM Proxy
 
-I added a basic local language-model proxy benchmark because no cached natural
-text corpus was available in the workspace. The runner trains a 51.9M parameter
-decoder-only GPT on a deterministic repeated-motif token stream and validates on
-a held-out stream from the same motif bank. This is a useful optimizer
-smoke/proxy test for next-token loss, accuracy, and iteration speed, but it is
-not a claim about OpenWebText/FineWeb pretraining.
+This earlier local language-model proxy is retained only as historical context.
+It trained a 51.9M parameter decoder-only GPT on a deterministic repeated-motif
+token stream and validated on a held-out stream from the same motif bank. It is
+useful as an optimizer smoke/proxy test, but the WikiText-103 result above is
+the relevant real-data signal. The benchmark runner has since been fixed to
+preserve per-group scheduled learning rates; do not use this older synthetic
+table for fallback-LR conclusions.
 
 Protocol: `10` layers, width `640`, `10` heads, context `128`, vocab `4096`,
 batch `32 x 128`, BF16 autocast, 2 RTX PRO 6000 Blackwell GPUs with one trial

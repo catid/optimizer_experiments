@@ -470,6 +470,8 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
     ).to(device)
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     optimizer = make_optimizer(model, trial)
+    for group in optimizer.param_groups:
+        group["_bench_base_lr"] = float(group.get("lr", trial.lr))
     train_stream = SyntheticMotifStream(
         vocab_size=args.vocab_size,
         motif_count=args.motif_count,
@@ -505,7 +507,7 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
         for step in range(1, trial.steps + 1):
             scale = lr_scale(step, trial.steps, trial.warmup_steps, trial.final_lr_scale, trial.wsd_decay_frac)
             for group in optimizer.param_groups:
-                group["lr"] = trial.lr * scale
+                group["lr"] = float(group.get("_bench_base_lr", trial.lr)) * scale
             x, y = train_stream.batch(batch_size=args.batch_size, block_size=args.block_size, generator=train_gen)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
