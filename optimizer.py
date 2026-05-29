@@ -31,9 +31,23 @@ The known disagreement options are configurable:
     ns_variant="polar_express" or "classic_muon"
         Selects the Gram Newton-Schulz coefficient family.
 
-Use build_param_groups(model.named_parameters()) for normal training so
-embeddings, tied heads, norms, biases, vectors, and tiny tensors stay on the
-fallback path.
+Default numeric starting point:
+
+    matrix_lr = 8e-3
+    fallback_lr = matrix_lr
+    row_gamma = 0.35
+    col_gamma = 0.0
+    normuon_beta2 = 0.93
+    warmup_steps = 80
+
+Preferred use:
+
+    optimizer = SodaPmuonEqNorMuon(model)
+
+Passing a ``torch.nn.Module`` or ``model.named_parameters()`` lets the optimizer
+keep embeddings, tied heads, norms, biases, vectors, and tiny tensors on the
+fallback path. Passing raw ``model.parameters()`` is supported, but names are not
+available, so all matrix-like tensors are routed by shape only.
 """
 
 from __future__ import annotations
@@ -44,6 +58,8 @@ from collections.abc import Callable, Iterable
 from typing import Any, TypeAlias
 
 import torch
+
+__version__ = "0.3.0"
 
 try:
     from torch.optim.optimizer import ParamsT
@@ -154,6 +170,7 @@ class GramNewtonSchulz:
         steps: int = 5,
         epsilon: float = 1e-7,
         compute_dtype: torch.dtype | None = None,
+        reset_iterations: Iterable[int] = (2,),
     ) -> None:
         if variant not in {"polar_express", "classic_muon"}:
             raise ValueError("ns_variant must be 'polar_express' or 'classic_muon'")
@@ -163,6 +180,14 @@ class GramNewtonSchulz:
         self.steps = int(steps)
         self.epsilon = float(epsilon)
         self.compute_dtype = compute_dtype
+        self.reset_iterations = set(int(i) for i in reset_iterations)
+        if self.variant == "classic_muon":
+            self.coefficients = (CLASSIC_MUON_COEFFICIENT,) * self.steps
+        else:
+            coeffs = POLAR_EXPRESS_COEFFICIENTS[: self.steps]
+            if len(coeffs) < self.steps:
+                coeffs = coeffs + (POLAR_EXPRESS_COEFFICIENTS[-1],) * (self.steps - len(coeffs))
+            self.coefficients = coeffs
 
     def _compute_dtype_for(self, x: torch.Tensor) -> torch.dtype:
         if self.compute_dtype is not None:
@@ -190,21 +215,50 @@ class GramNewtonSchulz:
         work = work / (work.norm(dim=(-2, -1), keepdim=True) + self.epsilon)
         work = work.to(self._compute_dtype_for(work))
 
-        if self.variant == "classic_muon":
-            coeffs = (CLASSIC_MUON_COEFFICIENT,) * self.steps
+        if max(work.shape[-2:]) > min(work.shape[-2:]) and self.variant == "polar_express":
+            work = self._gram_recurrence(work)
         else:
-            coeffs = POLAR_EXPRESS_COEFFICIENTS[: self.steps]
-            if len(coeffs) < self.steps:
-                coeffs = coeffs + (POLAR_EXPRESS_COEFFICIENTS[-1],) * (self.steps - len(coeffs))
-
-        for a, b, c in coeffs:
-            gram = work @ work.mT
-            poly = torch.baddbmm(gram, gram, gram, alpha=c, beta=b)
-            work = torch.baddbmm(work, poly, work, beta=a)
+            work = self._standard_recurrence(work)
 
         if transposed:
             work = work.mT
         return work.to(original_dtype).reshape(original_shape)
+
+    def _standard_recurrence(self, work: torch.Tensor) -> torch.Tensor:
+        for a, b, c in self.coefficients:
+            gram = work @ work.mT
+            poly = torch.baddbmm(gram, gram, gram, alpha=c, beta=b)
+            work = torch.baddbmm(work, poly, work, beta=a)
+        return work
+
+    def _gram_recurrence(self, work: torch.Tensor) -> torch.Tensor:
+        gram = work @ work.mT
+        eye = torch.eye(gram.size(-1), device=work.device, dtype=work.dtype).expand(gram.size(0), -1, -1).contiguous()
+        q: torch.Tensor | None = None
+
+        for i, (a, b, c) in enumerate(self.coefficients):
+            if i in self.reset_iterations and i != 0:
+                if q is None:
+                    raise RuntimeError("Gram Newton-Schulz reset reached without an inverse estimate")
+                work = q @ work
+                gram = work @ work.mT
+                q = None
+
+            z = torch.baddbmm(gram, gram, gram, alpha=c, beta=b)
+            if i == 0 or i in self.reset_iterations:
+                q = z + a * eye
+            else:
+                if q is None:
+                    raise RuntimeError("Gram Newton-Schulz inverse estimate was not initialized")
+                q = torch.baddbmm(q, q, z, beta=a)
+
+            if i < len(self.coefficients) - 1 and i + 1 not in self.reset_iterations:
+                rz = torch.baddbmm(gram, gram, z, beta=a)
+                gram = torch.baddbmm(rz, z, rz, beta=a)
+
+        if q is None:
+            raise RuntimeError("Gram Newton-Schulz finished without an inverse estimate")
+        return q @ work
 
 
 @torch.no_grad()
@@ -242,7 +296,7 @@ def build_param_groups(
     named_parameters: Iterable[tuple[str, torch.Tensor]],
     *,
     matrix_lr: float = 8e-3,
-    fallback_lr: float = 8e-4,
+    fallback_lr: float | None = None,
     matrix_weight_decay: float = 0.0,
     fallback_weight_decay: float = 0.05,
     min_matrix_dim: int = 2,
@@ -253,41 +307,51 @@ def build_param_groups(
 
     The helper deduplicates tied/shared parameters and keeps common embeddings,
     heads, norms, biases, vectors, and tiny matrices off the spectral path.
+    If any alias of a tied tensor looks like an embedding/head/norm/bias, the
+    shared tensor is conservatively routed to the fallback path.
     """
 
+    fallback_lr = matrix_lr if fallback_lr is None else fallback_lr
     matrix_params: list[torch.Tensor] = []
     matrix_names: list[str] = []
+    matrix_aliases: list[list[str]] = []
     fallback_params: list[torch.Tensor] = []
     fallback_names: list[str] = []
-    seen: set[int] = set()
+    fallback_aliases: list[list[str]] = []
+    unique: dict[int, tuple[torch.Tensor, list[str]]] = {}
 
     for name, param in named_parameters:
         if not param.requires_grad:
             continue
         ident = id(param)
-        if ident in seen:
-            continue
-        seen.add(ident)
+        if ident not in unique:
+            unique[ident] = (param, [name])
+        else:
+            unique[ident][1].append(name)
 
+    for _ident, (param, names) in unique.items():
         rows = int(param.shape[0]) if param.ndim >= 1 else 1
         cols = int(param.numel() // max(rows, 1))
         eligible = (
             param.is_floating_point()
             and param.ndim >= 2
             and min(rows, cols) >= int(min_matrix_dim)
-            and not _is_default_fallback_name(name)
+            and not any(_is_default_fallback_name(name) for name in names)
         )
-        if force_fallback is not None and force_fallback(name, param):
-            eligible = False
-        if force_matrix is not None and force_matrix(name, param):
+        if force_matrix is not None and any(force_matrix(name, param) for name in names):
             eligible = True
+        if force_fallback is not None and any(force_fallback(name, param) for name in names):
+            eligible = False
 
+        display_name = "|".join(names)
         if eligible:
             matrix_params.append(param)
-            matrix_names.append(name)
+            matrix_names.append(display_name)
+            matrix_aliases.append(names)
         else:
             fallback_params.append(param)
-            fallback_names.append(name)
+            fallback_names.append(display_name)
+            fallback_aliases.append(names)
 
     groups: list[dict[str, Any]] = []
     if matrix_params:
@@ -295,6 +359,7 @@ def build_param_groups(
             {
                 "params": matrix_params,
                 "param_names": matrix_names,
+                "param_aliases": matrix_aliases,
                 "use_matrix_update": True,
                 "lr": float(matrix_lr),
                 "base_lr": float(matrix_lr),
@@ -306,6 +371,7 @@ def build_param_groups(
             {
                 "params": fallback_params,
                 "param_names": fallback_names,
+                "param_aliases": fallback_aliases,
                 "use_matrix_update": False,
                 "lr": float(fallback_lr),
                 "base_lr": float(fallback_lr),
@@ -327,10 +393,10 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
 
     def __init__(
         self,
-        params: ParamsT,
+        params: ParamsT | Iterable[tuple[str, torch.Tensor]] | torch.nn.Module,
         *,
         matrix_lr: float = 8e-3,
-        fallback_lr: float = 8e-4,
+        fallback_lr: float | None = None,
         momentum: float = 0.95,
         beta2: float = 0.999,
         eps: float = 1e-10,
@@ -340,7 +406,9 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         soda_lambda_scale: float = 1.0,
         soda_lambda_power: float = 1.0,
         soda_on_fallback: bool = True,
-        soda_replaces_weight_decay: bool = True,
+        soda_replaces_weight_decay: bool | None = None,
+        soda_replaces_matrix_weight_decay: bool = True,
+        soda_replaces_fallback_weight_decay: bool = False,
         pmuoneq_beta: float = 0.90,
         row_gamma: float = 0.35,
         col_gamma: float = 0.0,
@@ -353,17 +421,44 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         ns_steps: int = 5,
         ns_epsilon: float = 1e-7,
         ns_compute_dtype: torch.dtype | None = None,
+        ns_reset_iterations: Iterable[int] = (2,),
         use_external_lr: bool = False,
         min_matrix_dim: int = 2,
+        matrix_filter: Callable[[str, torch.Tensor], bool] | None = None,
+        fallback_filter: Callable[[str, torch.Tensor], bool] | None = None,
     ) -> None:
+        if isinstance(params, torch.nn.Module):
+            params = params.named_parameters()
+        fallback_lr = matrix_lr if fallback_lr is None else fallback_lr
+        if float(matrix_lr) < 0.0 or float(fallback_lr) < 0.0:
+            raise ValueError("learning rates must be non-negative")
         if int(warmup_steps) <= 0:
             raise ValueError("warmup_steps must be positive")
+        if not (0.0 <= float(momentum) < 1.0):
+            raise ValueError("momentum must be in [0, 1)")
+        if not (0.0 <= float(beta2) < 1.0):
+            raise ValueError("beta2 must be in [0, 1)")
+        if not (0.0 <= float(pmuoneq_beta) < 1.0):
+            raise ValueError("pmuoneq_beta must be in [0, 1)")
+        if float(row_gamma) < 0.0 or float(col_gamma) < 0.0:
+            raise ValueError("PMuonEq gamma values must be non-negative")
+        if not (0.0 <= float(normuon_beta2) < 1.0):
+            raise ValueError("normuon_beta2 must be in [0, 1)")
+        if float(eps) <= 0.0 or float(pmuoneq_eps) <= 0.0 or float(normuon_eps) <= 0.0 or float(ns_epsilon) <= 0.0:
+            raise ValueError("epsilon values must be positive")
+        if float(matrix_weight_decay) < 0.0 or float(fallback_weight_decay) < 0.0:
+            raise ValueError("weight decay values must be non-negative")
+        if int(min_matrix_dim) < 1:
+            raise ValueError("min_matrix_dim must be >= 1")
         if float(soda_lambda_scale) < 0.0:
             raise ValueError("soda_lambda_scale must be non-negative")
         if float(soda_lambda_power) <= 0.0:
             raise ValueError("soda_lambda_power must be positive")
         if normuon_mode not in {"row", "orientation"}:
             raise ValueError("normuon_mode must be 'row' or 'orientation'")
+        if soda_replaces_weight_decay is not None:
+            soda_replaces_matrix_weight_decay = bool(soda_replaces_weight_decay)
+            soda_replaces_fallback_weight_decay = bool(soda_replaces_weight_decay)
 
         prepared = self._prepare_param_groups(
             params,
@@ -383,9 +478,12 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             normuon_mode=normuon_mode,
             normuon_aspect_scale=normuon_aspect_scale,
             soda_on_fallback=soda_on_fallback,
-            soda_replaces_weight_decay=soda_replaces_weight_decay,
+            soda_replaces_matrix_weight_decay=soda_replaces_matrix_weight_decay,
+            soda_replaces_fallback_weight_decay=soda_replaces_fallback_weight_decay,
             use_external_lr=use_external_lr,
             min_matrix_dim=min_matrix_dim,
+            matrix_filter=matrix_filter,
+            fallback_filter=fallback_filter,
         )
         super().__init__(prepared, defaults={})
 
@@ -396,6 +494,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             steps=ns_steps,
             epsilon=ns_epsilon,
             compute_dtype=ns_compute_dtype,
+            reset_iterations=ns_reset_iterations,
         )
         self.last_stats: dict[str, float] = {}
 
@@ -404,9 +503,15 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             group.setdefault("warmup_steps", int(warmup_steps))
             group.setdefault("base_lr", float(group["lr"]))
 
+    @classmethod
+    def from_model(cls, model: torch.nn.Module, **kwargs: Any) -> "SodaPmuonEqNorMuon":
+        """Construct from ``model.named_parameters()`` with safe grouping."""
+
+        return cls(model.named_parameters(), **kwargs)
+
     @staticmethod
     def _prepare_param_groups(
-        params: ParamsT,
+        params: ParamsT | Iterable[tuple[str, torch.Tensor]],
         *,
         matrix_lr: float,
         fallback_lr: float,
@@ -424,13 +529,33 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         normuon_mode: str,
         normuon_aspect_scale: bool,
         soda_on_fallback: bool,
-        soda_replaces_weight_decay: bool,
+        soda_replaces_matrix_weight_decay: bool,
+        soda_replaces_fallback_weight_decay: bool,
         use_external_lr: bool,
         min_matrix_dim: int,
+        matrix_filter: Callable[[str, torch.Tensor], bool] | None,
+        fallback_filter: Callable[[str, torch.Tensor], bool] | None,
     ) -> list[dict[str, Any]]:
         items = list(params)
         if not items:
             raise ValueError("optimizer got an empty parameter list")
+
+        if (
+            isinstance(items[0], tuple)
+            and len(items[0]) == 2
+            and isinstance(items[0][0], str)
+            and isinstance(items[0][1], torch.Tensor)
+        ):
+            items = build_param_groups(
+                items,  # type: ignore[arg-type]
+                matrix_lr=matrix_lr,
+                fallback_lr=fallback_lr,
+                matrix_weight_decay=matrix_weight_decay,
+                fallback_weight_decay=fallback_weight_decay,
+                min_matrix_dim=min_matrix_dim,
+                force_matrix=matrix_filter,
+                force_fallback=fallback_filter,
+            )
 
         if isinstance(items[0], dict):
             groups = [dict(group) for group in items]  # type: ignore[arg-type]
@@ -452,7 +577,10 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                 group.setdefault("normuon_mode", normuon_mode)
                 group.setdefault("normuon_aspect_scale", normuon_aspect_scale)
                 group.setdefault("soda_enabled", is_matrix or soda_on_fallback)
-                group.setdefault("soda_replaces_weight_decay", soda_replaces_weight_decay)
+                group.setdefault(
+                    "soda_replaces_weight_decay",
+                    soda_replaces_matrix_weight_decay if is_matrix else soda_replaces_fallback_weight_decay,
+                )
                 group.setdefault("use_external_lr", use_external_lr)
                 group.setdefault("min_matrix_dim", min_matrix_dim)
             return groups
@@ -494,7 +622,10 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             group.setdefault("normuon_mode", normuon_mode)
             group.setdefault("normuon_aspect_scale", normuon_aspect_scale)
             group.setdefault("soda_enabled", is_matrix or soda_on_fallback)
-            group.setdefault("soda_replaces_weight_decay", soda_replaces_weight_decay)
+            group.setdefault(
+                "soda_replaces_weight_decay",
+                soda_replaces_matrix_weight_decay if is_matrix else soda_replaces_fallback_weight_decay,
+            )
             group.setdefault("use_external_lr", use_external_lr)
             group.setdefault("min_matrix_dim", min_matrix_dim)
         return groups
@@ -716,16 +847,25 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
 
 
 FavoriteOptimizer = SodaPmuonEqNorMuon
+GoldenSodaPmuonEqNorMuon = SodaPmuonEqNorMuon
 GoldenOptimizer = SodaPmuonEqNorMuon
+GoldenMuon = SodaPmuonEqNorMuon
 Optimizer = SodaPmuonEqNorMuon
+build_soda_pmuoneq_normuon_param_groups = build_param_groups
+build_golden_soda_pmuoneq_normuon_param_groups = build_param_groups
 
 
 __all__ = [
+    "__version__",
     "FavoriteOptimizer",
+    "GoldenSodaPmuonEqNorMuon",
     "GoldenOptimizer",
+    "GoldenMuon",
     "GramNewtonSchulz",
     "Optimizer",
     "SodaPmuonEqNorMuon",
+    "build_golden_soda_pmuoneq_normuon_param_groups",
     "build_optimizer_param_groups",
     "build_param_groups",
+    "build_soda_pmuoneq_normuon_param_groups",
 ]

@@ -46,6 +46,46 @@ def test_named_grouping_keeps_embeddings_heads_and_norms_in_fallback() -> None:
     assert "lm_head.weight" in fallback_names
 
 
+def test_tied_aliases_route_to_fallback_if_any_alias_is_head_or_embedding() -> None:
+    shared = nn.Parameter(torch.randn(16, 8))
+    groups = build_param_groups(
+        [
+            ("blocks.0.mlp.weight", shared),
+            ("lm_head.weight", shared),
+        ]
+    )
+
+    matrix_names = [name for group in groups if group["use_matrix_update"] for name in group["param_names"]]
+    fallback_names = [name for group in groups if not group["use_matrix_update"] for name in group["param_names"]]
+
+    assert not matrix_names
+    assert fallback_names == ["blocks.0.mlp.weight|lm_head.weight"]
+
+
+def test_module_constructor_uses_safe_named_grouping() -> None:
+    torch.manual_seed(0)
+    model = TinyModel()
+    opt = SodaPmuonEqNorMuon(model)
+
+    loss = _one_step(model, opt)
+
+    assert torch.isfinite(torch.tensor(loss))
+    assert opt.last_stats["matrix_count"] == 2.0
+    assert opt.last_stats["fallback_count"] == 6.0
+
+
+def test_named_parameter_constructor_uses_safe_grouping() -> None:
+    torch.manual_seed(0)
+    model = TinyModel()
+    opt = SodaPmuonEqNorMuon(model.named_parameters())
+
+    loss = _one_step(model, opt)
+
+    assert torch.isfinite(torch.tensor(loss))
+    assert opt.last_stats["matrix_count"] == 2.0
+    assert opt.last_stats["fallback_count"] == 6.0
+
+
 def test_default_optimizer_step_is_finite() -> None:
     torch.manual_seed(1)
     model = TinyModel()
@@ -58,6 +98,23 @@ def test_default_optimizer_step_is_finite() -> None:
     assert opt.last_stats["matrix_count"] == 2.0
     assert opt.last_stats["fallback_count"] == 6.0
     assert all(torch.isfinite(param).all() for param in model.parameters())
+
+
+def test_default_fallback_weight_decay_is_active_when_soda_does_not_replace_it() -> None:
+    p = nn.Parameter(torch.tensor([1.0, -2.0]))
+    opt = SodaPmuonEqNorMuon(
+        [p],
+        matrix_lr=0.1,
+        fallback_lr=0.1,
+        fallback_weight_decay=0.1,
+        warmup_steps=1,
+        soda_lambda_scale=0.0,
+    )
+
+    p.grad = torch.zeros_like(p)
+    opt.step()
+
+    assert torch.allclose(p, torch.tensor([0.99, -1.98]))
 
 
 def test_disagreement_options_step_is_finite() -> None:
