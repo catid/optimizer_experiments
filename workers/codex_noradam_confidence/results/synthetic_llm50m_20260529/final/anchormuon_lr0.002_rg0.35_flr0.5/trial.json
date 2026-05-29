@@ -1,0 +1,15 @@
+{
+  "name": "anchormuon_lr0.002_rg0.35_flr0.5",
+  "family": "anchormuon",
+  "lr": 0.002,
+  "weight_decay": 0.05,
+  "row_gamma": 0.35,
+  "fallback_lr_mult": 0.5,
+  "fallback_mode": "atan2",
+  "seed": 123,
+  "steps": 800,
+  "eval_every": 100,
+  "warmup_steps": 20,
+  "final_lr_scale": 0.1,
+  "wsd_decay_frac": 0.2
+}

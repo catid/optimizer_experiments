@@ -1,0 +1,34 @@
+{
+  "torch": "2.13.0.dev20260506+cu130",
+  "cuda": "13.0",
+  "gpu_count": 2,
+  "gpus": [
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+  ],
+  "args": {
+    "worker": false,
+    "trial_json": null,
+    "output_dir": "/home/catid/screen/repos/optimizer_experiments/workers/codex_noradam_confidence/results/synthetic_llm50m_20260529",
+    "preset": "main",
+    "seed": 123,
+    "vocab_size": 4096,
+    "block_size": 128,
+    "n_layer": 10,
+    "n_head": 10,
+    "n_embd": 640,
+    "dropout": 0.0,
+    "batch_size": 32,
+    "hpo_steps": 800,
+    "final_steps": 800,
+    "eval_bins": 8,
+    "train_tokens": 8000000,
+    "val_tokens": 1000000,
+    "motif_count": 2048,
+    "motif_len": 16,
+    "warmup_steps": 20,
+    "log_every": 100,
+    "max_hpo_trials": 0,
+    "final_only": null
+  }
+}

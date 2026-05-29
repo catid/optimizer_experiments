@@ -54,6 +54,43 @@ data in `all_metrics_flat.csv`, and the mean/std table in
 
 ![Iteration step-time bars for the 5-seed CIFAR-10 optimizer confirmation](workers/codex_noradam_confidence/results/cifar5_baseline_confidence_20260529/final50_5seed/iteration_step_time_ms_bar_mean.png)
 
+## Synthetic 50M LLM Proxy
+
+I added a basic local language-model proxy benchmark because no cached natural
+text corpus was available in the workspace. The runner trains a 51.9M parameter
+decoder-only GPT on a deterministic repeated-motif token stream and validates on
+a held-out stream from the same motif bank. This is a useful optimizer
+smoke/proxy test for next-token loss, accuracy, and iteration speed, but it is
+not a claim about OpenWebText/FineWeb pretraining.
+
+Protocol: `10` layers, width `640`, `10` heads, context `128`, vocab `4096`,
+batch `32 x 128`, BF16 autocast, 2 RTX PRO 6000 Blackwell GPUs with one trial
+per GPU. The final reported pass used full-budget tuning: each candidate trained
+for `800` steps, then the best run per optimizer family was replayed for another
+`800` steps.
+
+| Rank | Optimizer | Selected config | Final val loss | Final val acc | Step time | Throughput |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | AdamW-Atan2 | `lr=0.0005`, `wd=0.05` | 0.3922 | 92.62% | 10.95 ms | 374.2k tok/s |
+| 2 | AdamW | `lr=0.0005`, `wd=0.05` | 0.3924 | 92.58% | 10.78 ms | 380.0k tok/s |
+| 3 | Muon | `lr=0.001`, `wd=0.05` | 0.3934 | 92.56% | 17.53 ms | 233.7k tok/s |
+| 4 | AnchorMuon | `lr=0.001`, `row_gamma=0.25`, `fallback_lr_mult=0.5` | 0.4123 | 92.44% | 16.03 ms | 255.6k tok/s |
+
+Takeaway: on this synthetic 50M LLM proxy, the CIFAR-winning AnchorMuon recipe
+does not transfer as-is. AdamW-Atan2 has the best loss by a tiny margin, AdamW is
+essentially tied while fastest, and plain Muon is close on loss but slower.
+
+Result bundle:
+`workers/codex_noradam_confidence/results/synthetic_llm50m_20260529/`.
+
+![Synthetic 50M LLM validation loss](workers/codex_noradam_confidence/results/synthetic_llm50m_20260529/plots/val_loss_curve.png)
+
+![Synthetic 50M LLM validation accuracy](workers/codex_noradam_confidence/results/synthetic_llm50m_20260529/plots/val_acc_curve.png)
+
+![Synthetic 50M LLM training loss](workers/codex_noradam_confidence/results/synthetic_llm50m_20260529/plots/train_loss_curve.png)
+
+![Synthetic 50M LLM step time](workers/codex_noradam_confidence/results/synthetic_llm50m_20260529/plots/step_time_ms_bar.png)
+
 The previous single-seed AdamATan2/AdamC fallback comparison is retained below
 as historical context; its Atan2 win did not separate cleanly under the 5-seed
 confirmation.
