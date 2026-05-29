@@ -114,6 +114,20 @@ def test_normuon_precondition_preserves_frobenius_norm() -> None:
     assert torch.allclose(out.norm(), update.norm(), atol=1e-6, rtol=1e-6)
 
 
+def test_normuon_auto_orientation_uses_columns_for_wide_matrix() -> None:
+    update = torch.arange(1.0, 13.0).reshape(2, 6)
+    row_moment = torch.zeros(2, 1)
+    col_moment = torch.zeros(1, 6)
+    auto_out = normuon_precondition(update, col_moment, beta2=0.9, orientation="auto")
+    col_out = normuon_precondition(update, torch.zeros(1, 6), beta2=0.9, orientation="column")
+    row_out = normuon_precondition(update, row_moment, beta2=0.9, orientation="row")
+    assert col_moment.shape == (1, 6)
+    assert torch.all(col_moment > 0)
+    assert torch.allclose(auto_out, col_out, atol=1e-6, rtol=1e-6)
+    assert not torch.allclose(auto_out, row_out, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(auto_out.norm(), update.norm(), atol=1e-6, rtol=1e-6)
+
+
 def test_state_dict_roundtrip() -> None:
     params = _make_params()
     opt = EquiMuseNorMuon(_groups(params, batch_muon=True), beta1=0.6, warmup_steps=2)
