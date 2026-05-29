@@ -35,7 +35,7 @@ for reuse in other projects. It exposes:
 ```python
 from optimizer import SodaPmuonEqNorMuon
 
-optimizer = SodaPmuonEqNorMuon(model.named_parameters())
+optimizer = SodaPmuonEqNorMuon(model)
 ```
 
 The root file implements only the focused winner: SODA anchor updates,
@@ -53,13 +53,13 @@ experiments:
 |---|---:|---|---|
 | `matrix_lr` | `8e-3` | Yes | Main LR for matrix weights. Try `0.004`, `0.006`, `0.008` first. |
 | `row_gamma` | `0.35` | Yes | PMuonEq row scaling strength. Try `0.25`, `0.35`, `0.45`. |
-| `fallback_lr` | `8e-4` | Later | LR for embeddings, heads, norms, biases, scalars, vectors. |
+| `fallback_lr` | same as `matrix_lr` | Later | LR for embeddings, heads, norms, biases, scalars, vectors. |
 | `normuon_beta2` | `0.93` | Later | Row second-moment smoothing after GramNS. Try `0.90`, `0.93`, `0.95`. |
 | `fallback_weight_decay` | `0.05` | Later | Applies only to fallback parameters; matrix params use SODA instead. |
-| `warmup_steps` | `10` | Rarely | Increase only if the first few steps are unstable. |
+| `warmup_steps` | `80` | Rarely | Increase if early steps are unstable; shorten only by ablation. |
 | `momentum` | `0.95` | Usually no | Momentum for the matrix source update. |
 | `pmuoneq_beta` | `0.90` | Usually no | EMA for row gradient-power estimates. |
-| `fallback_betas` | `(0.9, 0.999)` | Usually no | RMS/AdamW-style fallback moments. |
+| `fallback_betas` | `(0.9, 0.95)` | Usually no | RMS/AdamW-style fallback moments. |
 | `soda_lambda_scale`, `soda_lambda_power` | `1.0`, `1.0` | Usually no | SODA anchor schedule; changing this changes the regularizer. |
 | `eps` values and `ns_compute_dtype` | internal defaults | No | Numerical and profiling knobs. |
 

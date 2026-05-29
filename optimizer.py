@@ -97,12 +97,12 @@ the CIFAR-10 ViT-5 sweeps above plus cross-worker comparisons against AdamW and
 nearby aspect/column/MiMuon ablations. New projects should start with:
 
     matrix_lr       = 8e-3
-    fallback_lr     = 8e-4
+    fallback_lr     = matrix_lr
     momentum        = 0.95
     pmuoneq_beta    = 0.90
     row_gamma       = 0.35
     normuon_beta2   = 0.93
-    warmup_steps    = 10
+    warmup_steps    = 80
     fallback_weight_decay = 0.05
 
 Do not tune everything at once. Treat the knobs in three tiers:
@@ -120,8 +120,9 @@ Do not tune everything at once. Treat the knobs in three tiers:
     Tier 2, tune only after Tier 1:
         fallback_lr
             LR for embeddings, heads, norms, biases, scalars, and vectors.
-            Default is 10x below matrix_lr. For language models, keep it low
-            until tied embedding / LM-head routing has been audited.
+            Default matches matrix_lr because this is what the strongest
+            reproduced CIFAR recipe used. For language models, consider lowering
+            it after tied embedding / LM-head routing has been audited.
 
         normuon_beta2
             Row second-moment smoothing after GramNS. Default 0.93. Try
@@ -132,8 +133,9 @@ Do not tune everything at once. Treat the knobs in three tiers:
             parameters use SODA instead of ordinary weight decay.
 
         warmup_steps
-            Short optimizer-local linear warmup. Default 10 worked for the
-            CIFAR sweeps. Increase only when the first few steps are unstable.
+            Optimizer-local linear warmup. Default 80 matches the strongest
+            reproduced proper-split CIFAR recipe. Increase it if early steps
+            are unstable; shorten it only after a controlled ablation.
 
     Tier 3, normally leave fixed:
         momentum = 0.95
@@ -142,7 +144,7 @@ Do not tune everything at once. Treat the knobs in three tiers:
         pmuoneq_beta = 0.90
             EMA coefficient for row gradient-power estimates.
 
-        fallback_betas = (0.9, 0.999)
+        fallback_betas = (0.9, 0.95)
             RMS/AdamW-style fallback second-moment defaults.
 
         soda_lambda_scale = 1.0, soda_lambda_power = 1.0
@@ -184,6 +186,9 @@ from collections.abc import Callable, Iterable
 from typing import Any, TypeAlias
 
 import torch
+
+
+__version__ = "0.2.0"
 
 try:
     from torch.optim.optimizer import ParamsT
@@ -392,11 +397,12 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
 
     Preferred use:
 
-        optimizer = SodaPmuonEqNorMuon(model.named_parameters())
+        optimizer = SodaPmuonEqNorMuon(model)
 
-    Passing named parameters lets the optimizer keep embeddings, output heads,
-    normalization weights, biases, scalars, and vectors in the fallback path
-    while sending ordinary large matrices through PMuonEq/GramNS/NorMuon.
+    Passing a ``torch.nn.Module`` or ``model.named_parameters()`` lets the
+    optimizer keep embeddings, output heads, normalization weights, biases,
+    scalars, and vectors in the fallback path while sending ordinary large
+    matrices through PMuonEq/GramNS/NorMuon.
 
     The defaults are intentionally usable. For a new workload, tune
     ``matrix_lr`` and ``row_gamma`` first; tune ``fallback_lr`` and
@@ -406,15 +412,15 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
 
     def __init__(
         self,
-        params: ParamsT | Iterable[tuple[str, torch.nn.Parameter]],
+        params: ParamsT | Iterable[tuple[str, torch.nn.Parameter]] | torch.nn.Module,
         *,
         matrix_lr: float = 8e-3,
-        fallback_lr: float = 8e-4,
+        fallback_lr: float | None = None,
         momentum: float = 0.95,
-        fallback_betas: tuple[float, float] = (0.9, 0.999),
-        eps: float = 1e-10,
+        fallback_betas: tuple[float, float] = (0.9, 0.95),
+        eps: float = 1e-8,
         fallback_weight_decay: float = 0.05,
-        warmup_steps: int = 10,
+        warmup_steps: int = 80,
         soda_lambda_scale: float = 1.0,
         soda_lambda_power: float = 1.0,
         pmuoneq_beta: float = 0.90,
@@ -427,6 +433,9 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         use_external_lr: bool = False,
         matrix_filter: Callable[[str, torch.nn.Parameter], bool] | None = None,
     ) -> None:
+        if isinstance(params, torch.nn.Module):
+            params = params.named_parameters()
+        fallback_lr = matrix_lr if fallback_lr is None else fallback_lr
         if warmup_steps <= 0:
             raise ValueError("warmup_steps must be positive")
         if matrix_lr < 0.0 or fallback_lr < 0.0:
@@ -728,7 +737,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             state["step"] = 0
         state["step"] = int(state.get("step", 0)) + 1
         _beta1, beta2 = group.get("betas", (0.9, 0.999))
-        eps = float(group.get("eps", 1e-10))
+        eps = float(group.get("eps", 1e-8))
         g = grad.detach().to(torch.float32)
         exp_avg_sq.mul_(float(beta2)).addcmul_(g, g, value=1.0 - float(beta2))
         step = int(state["step"])
@@ -794,11 +803,11 @@ def build_soda_pmuoneq_normuon_param_groups(
     named_parameters: Iterable[tuple[str, torch.nn.Parameter]],
     *,
     matrix_lr: float = 8e-3,
-    fallback_lr: float = 8e-4,
+    fallback_lr: float | None = None,
     fallback_weight_decay: float = 0.05,
     momentum: float = 0.95,
-    fallback_betas: tuple[float, float] = (0.9, 0.999),
-    eps: float = 1e-10,
+    fallback_betas: tuple[float, float] = (0.9, 0.95),
+    eps: float = 1e-8,
     pmuoneq_beta: float = 0.90,
     row_gamma: float = 0.35,
     pmuoneq_eps: float = 1e-6,
@@ -816,6 +825,8 @@ def build_soda_pmuoneq_normuon_param_groups(
     an embedding, output head, norm, bias, scalar, or vector, the shared tensor is
     conservatively routed to the fallback group.
     """
+
+    fallback_lr = matrix_lr if fallback_lr is None else fallback_lr
 
     matrix_params: list[torch.nn.Parameter] = []
     matrix_names: list[str] = []
@@ -887,12 +898,17 @@ def build_soda_pmuoneq_normuon_param_groups(
 
 GoldenSodaPmuonEqNorMuon = SodaPmuonEqNorMuon
 build_golden_soda_pmuoneq_normuon_param_groups = build_soda_pmuoneq_normuon_param_groups
+GoldenMuon = SodaPmuonEqNorMuon
+build_param_groups = build_soda_pmuoneq_normuon_param_groups
 
 
 __all__ = [
+    "__version__",
     "SodaPmuonEqNorMuon",
     "GoldenSodaPmuonEqNorMuon",
+    "GoldenMuon",
     "GramNewtonSchulz",
     "build_soda_pmuoneq_normuon_param_groups",
     "build_golden_soda_pmuoneq_normuon_param_groups",
+    "build_param_groups",
 ]

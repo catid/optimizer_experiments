@@ -16,7 +16,10 @@ if str(REF_ROOT) not in sys.path:
 
 from optimizer import (
     GoldenSodaPmuonEqNorMuon,
+    GoldenMuon,
     SodaPmuonEqNorMuon,
+    __version__,
+    build_param_groups,
     build_golden_soda_pmuoneq_normuon_param_groups,
     build_soda_pmuoneq_normuon_param_groups,
 )
@@ -92,6 +95,9 @@ def test_public_names_and_tied_parameter_grouping_are_safe() -> None:
         ]
     )
     assert GoldenSodaPmuonEqNorMuon is SodaPmuonEqNorMuon
+    assert GoldenMuon is SodaPmuonEqNorMuon
+    assert build_param_groups is build_soda_pmuoneq_normuon_param_groups
+    assert isinstance(__version__, str)
     assert len(groups) == 2
     assert sum(len(group["params"]) for group in groups) == 2
     fallback_names = set(groups[1]["param_names"])
@@ -110,17 +116,39 @@ def test_named_parameters_constructor_hides_grouping_from_training_code() -> Non
     assert "norm.weight" in fallback_names
 
 
+def test_default_recipe_matches_root_documented_winner() -> None:
+    model = TinyClassifier()
+    opt = SodaPmuonEqNorMuon(model)
+    assert opt.warmup_steps == 80
+    assert {group["lr"] for group in opt.param_groups} == {8e-3}
+    assert {group["base_lr"] for group in opt.param_groups} == {8e-3}
+    matrix_group = next(group for group in opt.param_groups if group["use_matrix_update"])
+    fallback_group = next(group for group in opt.param_groups if not group["use_matrix_update"])
+    assert matrix_group["momentum"] == 0.95
+    assert matrix_group["pmuoneq_beta"] == 0.90
+    assert matrix_group["row_gamma"] == 0.35
+    assert matrix_group["normuon_beta2"] == 0.93
+    assert fallback_group["betas"] == (0.9, 0.95)
+    assert fallback_group["eps"] == 1e-8
+    assert fallback_group["weight_decay"] == 0.05
+
+
 def test_from_model_constructor_matches_named_parameters_constructor() -> None:
     torch.manual_seed(5)
     direct_model = TinyClassifier()
     factory_model = copy.deepcopy(direct_model)
     direct = SodaPmuonEqNorMuon(direct_model.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4, warmup_steps=2)
+    module_direct = copy.deepcopy(direct_model)
     factory = SodaPmuonEqNorMuon.from_model(factory_model, matrix_lr=1e-3, fallback_lr=1e-4, warmup_steps=2)
+    module_opt = SodaPmuonEqNorMuon(module_direct, matrix_lr=1e-3, fallback_lr=1e-4, warmup_steps=2)
 
     for step in range(3):
         assert _run_step(direct_model, direct, step) == _run_step(factory_model, factory, step)
+        _run_step(module_direct, module_opt, step)
 
     for a, b in zip(direct_model.parameters(), factory_model.parameters(), strict=True):
+        assert torch.allclose(a, b, atol=1e-6, rtol=1e-6)
+    for a, b in zip(direct_model.parameters(), module_direct.parameters(), strict=True):
         assert torch.allclose(a, b, atol=1e-6, rtol=1e-6)
 
 
@@ -170,7 +198,13 @@ def test_golden_matches_legacy_configured_as_winning_no_aspect_path() -> None:
     legacy_model = copy.deepcopy(golden_model)
 
     golden = GoldenSodaPmuonEqNorMuon(
-        build_golden_soda_pmuoneq_normuon_param_groups(golden_model.named_parameters(), matrix_lr=1e-3, fallback_lr=1e-4),
+        build_golden_soda_pmuoneq_normuon_param_groups(
+            golden_model.named_parameters(),
+            matrix_lr=1e-3,
+            fallback_lr=1e-4,
+            fallback_betas=(0.9, 0.999),
+            eps=1e-10,
+        ),
         warmup_steps=2,
     )
     legacy = ReferenceSodaPmuonEqNorMuon(
