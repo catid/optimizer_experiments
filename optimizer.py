@@ -17,9 +17,10 @@ switches:
     no optional NorMuon disable path
 
 It does expose a small fallback-only ``fallback_mode`` knob for scalar/vector
-tensors. The default remains the RMS fallback used by the original winning
-recipe; ``"atan2"`` and ``"adamc"`` are available for narrow fallback-path
-experiments and do not alter the matrix direction.
+tensors. The default is now the AdamATan2 fallback because it gave the best
+validation loss/accuracy in the latest fallback sweep while remaining tied with
+RMS on official test accuracy. ``"rms"`` and ``"adamc"`` remain available for
+fallback-path experiments and do not alter the matrix direction.
 
 The current best-supported recipe comes from a CIFAR-10 train/validation/test
 split with the official test split evaluated only once at the end:
@@ -30,18 +31,18 @@ split with the official test split evaluated only once at the end:
     seeds:    123, 456, 789, 101112, 131415
     schedule: trainer-side WSD with 80-step warmup
 
-    lr=0.012, fallback_mode="rms", row_gamma=0.35,
+    lr=0.014, fallback_lr=0.007, fallback_mode="atan2", row_gamma=0.35,
     pmuoneq_beta=0.90, normuon_beta2=0.93
 
-    official test loss: 0.4203 +/- 0.0239
-    official test acc:  87.61% +/- 0.48
-    step time:          17.27 +/- 0.07 ms
+    official test loss: 0.4147 +/- 0.0152
+    official test acc:  87.57% +/- 0.39
+    step time:          17.51 +/- 0.16 ms
 
 A 5-seed CIFAR-10 follow-up found that ``fallback_mode="atan2"``,
 ``lr=0.014``, and ``fallback_lr=0.007`` slightly improved final validation
-accuracy/loss but was essentially tied with RMS on official test accuracy
-within seed variance. RMS remains the constructor default because it was the
-slightly better mean official-test recipe in that replay.
+accuracy/loss and was essentially tied with RMS on official test accuracy
+within seed variance. AdamATan2 is now the constructor default for fallback
+parameters so new users get that stronger validation-loss recipe by default.
 
 The aspect-scaled variant was close and sometimes won on other CIFAR proxies,
 but no-aspect won the cleanest official-test protocol. This root file keeps
@@ -93,23 +94,25 @@ Fallback parameters
 ===================
 
 Scalar/vector tensors and any parameters explicitly placed in a fallback group
-use the same SODA anchor plus the RMS-style second-moment update used by the
-winning research path by default. Optional fallback modes exist for narrow
-experiments on scalar/vector parameters only, but they do not affect the matrix
-direction generator. Automatic matrix eligibility is based only on effective
-shape after ignoring singleton dimensions: for example ``[1, 1, width]`` is a
-vector, while ``[1, tokens, width]`` is a matrix. Names are never used for
-routing in this standalone file.
+use the same SODA anchor plus AdamATan2 by default. Optional fallback modes
+exist for narrow experiments on scalar/vector parameters only, but they do not
+affect the matrix direction generator. Automatic matrix eligibility is based
+only on effective shape after ignoring singleton dimensions: for example
+``[1, 1, width]`` is a vector, while ``[1, tokens, width]`` is a matrix. Names
+are never used for routing in this standalone file.
 
-       v_t = beta_2 v_{t-1} + (1 - beta_2) g_t^2
-       update = g_t / (sqrt(v_t / (1 - beta_2^t)) + eps)
-
-The optional ``fallback_mode="atan2"`` keeps Adam first/second moments but uses
+The default ``fallback_mode="atan2"`` keeps Adam first/second moments but uses
 an AdamATan2-style bounded angular update:
 
        m_t = beta_1 m_{t-1} + (1 - beta_1) g_t
        v_t = beta_2 v_{t-1} + (1 - beta_2) g_t^2
        update = atan2(m_hat_t, sqrt(v_hat_t) + eps)
+
+The optional ``fallback_mode="rms"`` uses the earlier RMS-style second-moment
+fallback:
+
+       v_t = beta_2 v_{t-1} + (1 - beta_2) g_t^2
+       update = g_t / (sqrt(v_t / (1 - beta_2^t)) + eps)
 
 The optional ``fallback_mode="adamc"`` uses the AdamC adaptive direction on
 fallback tensors. If ``fallback_weight_decay`` is nonzero, it applies AdamC's
@@ -176,13 +179,13 @@ Do not tune everything at once. Treat the knobs in three tiers:
         pmuoneq_beta = 0.90
             EMA coefficient for row gradient-power estimates.
 
-        fallback_mode = "rms"
-            Scalar/vector fallback update. Leave at "rms" unless specifically
-            testing "atan2" or "adamc" for fallback-only ablations.
+        fallback_mode = "atan2"
+            Scalar/vector fallback update. Leave at "atan2" unless
+            specifically testing "rms" or "adamc" for fallback-only ablations.
 
         fallback_betas = (0.9, 0.95)
             Fallback first/second moment defaults. The first value is ignored
-            by the default RMS mode.
+            by "rms" mode.
 
         soda_lambda_scale = 1.0, soda_lambda_power = 1.0
             SODA anchor pull schedule. Changing these changes the regularizer,
@@ -256,7 +259,7 @@ from typing import Any, TypeAlias
 import torch
 
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 try:
     from torch.optim.optimizer import ParamsT
@@ -464,7 +467,7 @@ class AnchorMuon(torch.optim.Optimizer):
         *,
         lr: float = 8e-3,
         fallback_lr: float | None = None,
-        fallback_mode: str = "rms",
+        fallback_mode: str = "atan2",
         momentum: float = 0.95,
         fallback_betas: tuple[float, float] = (0.9, 0.95),
         fallback_weight_decay: float = 0.0,
@@ -678,7 +681,7 @@ class AnchorMuon(torch.optim.Optimizer):
                     "numel": int(sum(p.numel() for p in params)),
                     "named": bool(names),
                     "param_names": names,
-                    "fallback_mode": str(group.get("fallback_mode", "rms")),
+                    "fallback_mode": str(group.get("fallback_mode", "atan2")),
                 }
             )
         return summary
@@ -826,7 +829,7 @@ class AnchorMuon(torch.optim.Optimizer):
                 "Use dense gradients for this parameter or a different optimizer for sparse embeddings."
             )
         state = self.state[p]
-        mode = str(group.get("fallback_mode", "rms")).lower()
+        mode = str(group.get("fallback_mode", "atan2")).lower()
         if mode not in FALLBACK_MODES:
             raise ValueError(f"fallback_mode must be one of {sorted(FALLBACK_MODES)}")
         exp_avg_sq = state.get("exp_avg_sq")
@@ -914,7 +917,7 @@ def build_param_groups(
     *,
     lr: float = 8e-3,
     fallback_lr: float | None = None,
-    fallback_mode: str = "rms",
+    fallback_mode: str = "atan2",
     momentum: float = 0.95,
     fallback_betas: tuple[float, float] = (0.9, 0.95),
     fallback_weight_decay: float = 0.0,

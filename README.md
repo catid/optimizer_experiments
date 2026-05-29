@@ -21,17 +21,16 @@ visible RTX PRO 6000 Blackwell GPUs scheduled one trial per GPU. A 12-epoch HPO
 picked the best config for AdamW, plain Muon, previous-best RMS AnchorMuon, and
 AdamATan2-fallback AnchorMuon; only those winners were replayed for 50 epochs.
 
-The best specific version by official test accuracy is still root `AnchorMuon`
-with trainer-side 80-step warmup, WSD schedule, and RMS fallback on
-scalar/vector tensors:
-`lr=0.012`, `fallback_lr=None`, `fallback_mode="rms"`,
+The default shippable version is now root `AnchorMuon` with trainer-side
+80-step warmup, WSD schedule, and AdamATan2 fallback on scalar/vector tensors:
+`lr=0.014`, `fallback_lr=0.007`, `fallback_mode="atan2"`,
 `lr_final_scale=0.1`, `wsd_decay_frac=0.2`, `row_gamma=0.35`,
 `pmuoneq_beta=0.90`, `normuon_beta2=0.93`, and `fallback_beta2=0.95`.
 
-AdamATan2 fallback remains a useful ablation and had slightly better mean final
-validation accuracy/loss in this run, but RMS had slightly better mean official
-test accuracy. The difference is much smaller than seed-to-seed variance, so the
-constructor default remains `fallback_mode="rms"` for now.
+AdamATan2 fallback had slightly better mean final validation accuracy/loss in
+this run and was effectively tied with RMS on official test accuracy. The
+constructor default is therefore `fallback_mode="atan2"`; RMS remains available
+as `fallback_mode="rms"` for reproducing the previous official-test mean winner.
 
 | Recipe | Selected config | Final val acc | Official test acc | Final val loss | Official test loss | Step time | Examples/sec |
 |---|---|---:|---:|---:|---:|---:|---:|
@@ -193,7 +192,7 @@ optimizer = AnchorMuon(
     model,
     lr=8e-3,
     fallback_lr=None,  # defaults to lr
-    fallback_mode="rms",
+    fallback_mode="atan2",
     row_gamma=0.35,
     normuon_beta2=0.93,
 )
@@ -214,15 +213,15 @@ experiments:
 
 | Parameter | Default | Start by tuning? | Notes |
 |---|---:|---|---|
-| `lr` | `8e-3` | Yes | Conservative starting LR consumed from the param group. For this ViT-5 CIFAR-10 harness, the latest 12-epoch HPO selected `0.012` for RMS-fallback AnchorMuon with WSD. |
+| `lr` | `8e-3` | Yes | Conservative starting LR consumed from the param group. For this ViT-5 CIFAR-10 harness, the latest 12-epoch HPO selected `0.014` for AdamATan2-fallback AnchorMuon with WSD. |
 | `row_gamma` | `0.35` | Yes | Row-only PMuonEq scaling strength before GramNS. Try `0.25`, `0.35`, `0.45`. |
 | `fallback_lr` | same as `lr` | Later | LR for scalar/vector/fallback tensors. Leave as `None` first. |
-| `fallback_mode` | `"rms"` | Later | Scalar/vector fallback update. `"atan2"` remains competitive, but the latest 5-seed CIFAR-10 replay did not clearly beat RMS on official test accuracy. |
+| `fallback_mode` | `"atan2"` | Later | Scalar/vector fallback update. AdamATan2 had the best mean validation loss/accuracy in the latest 5-seed CIFAR-10 replay and was tied with RMS within seed variance on official test accuracy. |
 | `normuon_beta2` | `0.93` | Later | Row second-moment smoothing after GramNS. Try `0.90`, `0.93`, `0.95`. |
 | `min_matrix_dim` | `2` | Rarely | Keeps tiny effective matrices out of the spectral path. |
 | `momentum` | `0.95` | Usually no | Momentum for the matrix source update. |
 | `pmuoneq_beta` | `0.90` | Usually no | EMA for row gradient-power estimates. |
-| `fallback_betas` | `(0.9, 0.95)` | Usually no | Fallback moments. The first value is ignored by `"rms"` and used by `"atan2"`/`"adamc"`. |
+| `fallback_betas` | `(0.9, 0.95)` | Usually no | Fallback moments. Both values are used by `"atan2"` and `"adamc"`; the first value is ignored by `"rms"`. |
 | `fallback_weight_decay` | `0.0` | Usually no | Optional AdamC-style `lr^2 * weight_decay` decay for fallback tensors only. Leave at zero unless specifically testing AdamC decay. |
 | `soda_lambda_scale`, `soda_lambda_power` | `1.0`, `1.0` | Usually no | SODA anchor schedule; changing this changes the regularizer. |
 | `eps` values and `ns_compute_dtype` | internal defaults | No | Numerical and profiling knobs. |
@@ -239,8 +238,9 @@ Only revisit `fallback_lr`/`fallback_mode`/`normuon_beta2` if the result is
 close. On this CIFAR-10 harness, a 5-seed follow-up found
 `fallback_mode="atan2"`, `lr=0.014`, and `fallback_lr=0.007` slightly improved
 mean final validation accuracy/loss, while RMS fallback at `lr=0.012` slightly
-improved mean official test accuracy. Keep RMS as the default until a larger or
-more task-diverse replay separates them.
+improved mean official test accuracy. The default now follows the lower
+validation-loss AdamATan2 recipe; use RMS as the fallback-path control if a new
+workload is noisy or unstable.
 
 ## References
 
@@ -249,7 +249,7 @@ more task-diverse replay separates them.
 - NorMuon / HTMuon lineage: [HTMuon: Improving Muon via Heavy-Tailed Spectral Correction](https://arxiv.org/abs/2603.10067) and the [HTMuon reference code](https://github.com/TDCSZ327/HTmuon). AnchorMuon uses the post-Gram row-normalization idea, not the full HTMuon optimizer.
 - PMuon lineage: the [PMuon track-3 implementation notes](https://github.com/zzp1012/modded-nanogpt/tree/pmuon-track3-3225/records/track_3_optimization/results/20260507_pmuon) motivated the pre-polar preconditioning idea. AnchorMuon implements only a cheap row-only PMuonEq approximation, not dense two-sided PMuon.
 - WSD schedule context: [Understanding Warmup-Stable-Decay Learning Rates](https://arxiv.org/abs/2410.05192). WSD is implemented in the training harness, not in `optimizer.py`.
-- AdamATan2 fallback context: [Scaling Exponents Across Parameterizations and Optimizers](https://arxiv.org/abs/2407.05872) by Everett et al. introduces the Adam-atan2 code change in Appendix C.5, replacing Adam's unbounded `m / sqrt(v)` update with `atan2(m, sqrt(v))` to reduce epsilon sensitivity. AnchorMuon applies this only after matrix-direction construction and only on fallback tensors.
+- AdamATan2 fallback context: [Scaling Exponents Across Parameterizations and Optimizers](https://arxiv.org/abs/2407.05872) by Everett et al. introduces the Adam-atan2 code change in Appendix C.5, replacing Adam's unbounded `m / sqrt(v)` update with `atan2(m, sqrt(v))` to reduce epsilon sensitivity. AnchorMuon uses this as the default only after matrix-direction construction and only on fallback tensors.
 - AdamC fallback context: the optional fallback mode follows the AdamC-style
   vector update and supports `lr^2 * weight_decay` fallback decay. The default
   keeps this decay at zero so SODA remains the primary regularizer.

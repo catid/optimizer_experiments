@@ -178,7 +178,7 @@ def test_default_recipe_matches_root_documented_winner() -> None:
     assert matrix_group["pmuoneq_beta"] == 0.90
     assert matrix_group["row_gamma"] == 0.35
     assert matrix_group["normuon_beta2"] == 0.93
-    assert fallback_group["fallback_mode"] == "rms"
+    assert fallback_group["fallback_mode"] == "atan2"
     assert fallback_group["betas"] == (0.9, 0.95)
     assert fallback_group["fallback_weight_decay"] == 0.0
     assert fallback_group["eps"] == 1e-8
