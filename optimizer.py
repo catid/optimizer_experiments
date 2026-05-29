@@ -50,7 +50,10 @@ selected ``lr=0.0015``, ``fallback_lr=0.00075``, ``row_gamma=0.55``, and
 family replay. It narrowly beat plain Muon on validation loss while running
 faster per step. This is real text data but byte-level and single-seed; treat it
 as an initial LM starting point rather than a standard WikiText perplexity
-result.
+result. A longer 10k-step FineWeb-Edu byte-level run with those exact settings
+beat AdamW/AdamW-Atan2 but lost to plain Muon on validation loss, so better
+pretraining data needs its own AnchorMuon HPO rather than blindly reusing the
+WikiText point.
 
 The aspect-scaled variant was close and sometimes won on other CIFAR proxies,
 but no-aspect won the cleanest official-test protocol. This root file keeps

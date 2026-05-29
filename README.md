@@ -54,6 +54,48 @@ data in `all_metrics_flat.csv`, and the mean/std table in
 
 ![Iteration step-time bars for the 5-seed CIFAR-10 optimizer confirmation](workers/codex_noradam_confidence/results/cifar5_baseline_confidence_20260529/final50_5seed/iteration_step_time_ms_bar_mean.png)
 
+## FineWeb-Edu 50M LLM Longer Run
+
+The better-data language-modeling check uses `HuggingFaceFW/fineweb-edu`,
+configuration `sample-10BT`, streamed through Hugging Face datasets and cached
+locally as disjoint UTF-8 byte slices. This is a stronger pretraining-style
+corpus than WikiText-103. It is still byte-level, not BPE-tokenized, so these
+numbers should be read as optimizer-transfer signals rather than standard LM
+perplexities.
+
+Protocol: `268,435,456` cached training bytes, `4,194,304` cached validation
+bytes, decoder-only GPT with `10` layers, width `640`, `10` heads, context
+`128`, byte vocab `256`, `49,424,640` trainable parameters, batch `32 x 128`,
+BF16 autocast, WSD schedule with 100-step warmup, 10,000 training steps, 32
+validation batches per evaluation point, and two RTX PRO 6000 Blackwell GPUs
+scheduled one trial per GPU. AnchorMuon used the harder WikiText-selected
+settings directly: `lr=0.0015`, `row_gamma=0.55`,
+`soda_lambda_scale=0.01`, and `fallback=AdamATan2@0.5x`.
+
+| Rank | Optimizer | Config | Final val loss | Final byte acc | Step time | Throughput |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | Plain Muon | `lr=0.0012`, `wd=0.05` | 1.1696 | 64.56% | 16.89 ms | 242.5k byte/s |
+| 2 | AnchorMuon | `lr=0.0015`, `row_gamma=0.55`, `soda=0.01`, `fallback=AdamATan2@0.5x` | 1.1791 | 64.34% | 15.11 ms | 271.1k byte/s |
+| 3 | AdamW | `lr=0.0003`, `wd=0.05` | 1.1981 | 63.85% | 10.08 ms | 406.5k byte/s |
+| 4 | AdamW-Atan2 | `lr=0.0003`, `wd=0.05` | 1.1991 | 63.78% | 10.20 ms | 401.4k byte/s |
+
+Takeaway: better data changes the picture. The WikiText-tuned AnchorMuon
+settings transfer well enough to beat AdamW and AdamW-Atan2, and AnchorMuon is
+about 11% faster per step than plain Muon, but plain Muon has the best loss on
+this longer FineWeb-Edu run. The next useful experiment is FineWeb-specific HPO
+for AnchorMuon instead of assuming the WikiText settings are optimal.
+
+Result bundle:
+`workers/codex_noradam_confidence/results/finewebedu_llm50m_long_20260529/`.
+
+![FineWeb-Edu byte-level validation loss](workers/codex_noradam_confidence/results/finewebedu_llm50m_long_20260529/plots/val_loss_curve.png)
+
+![FineWeb-Edu byte-level validation accuracy](workers/codex_noradam_confidence/results/finewebedu_llm50m_long_20260529/plots/val_acc_curve.png)
+
+![FineWeb-Edu byte-level training loss](workers/codex_noradam_confidence/results/finewebedu_llm50m_long_20260529/plots/train_loss_curve.png)
+
+![FineWeb-Edu byte-level step time](workers/codex_noradam_confidence/results/finewebedu_llm50m_long_20260529/plots/step_time_ms_bar.png)
+
 ## WikiText-103 50M LLM Byte-Level Check
 
 After the synthetic language-model proxy, I reran the comparison on actual

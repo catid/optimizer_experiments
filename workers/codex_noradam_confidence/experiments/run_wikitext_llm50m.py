@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run a 50M-parameter WikiText byte-level LM optimizer comparison.
+"""Run a 50M-parameter byte-level LM optimizer comparison.
 
-The benchmark uses real WikiText text, encoded directly as UTF-8 bytes. This
-avoids tokenizer downloads while still measuring an actual next-token language
-model workload with embeddings, attention, MLPs, and tied output head.
+The benchmark uses real text encoded directly as UTF-8 bytes. This avoids
+tokenizer downloads while still measuring an actual next-token language model
+workload with embeddings, attention, MLPs, and tied output head.
 """
 
 from __future__ import annotations
@@ -77,8 +77,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--trial-json", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529"))
-    parser.add_argument("--preset", choices=["smoke", "main", "anchor_deep", "anchor_harder"], default="anchor_deep")
+    parser.add_argument("--preset", choices=["smoke", "main", "anchor_deep", "anchor_harder", "fineweb_long"], default="anchor_deep")
+    parser.add_argument("--dataset-source", choices=["wikitext", "hf_text"], default="wikitext")
     parser.add_argument("--wiki-config", default="wikitext-103-raw-v1")
+    parser.add_argument("--hf-dataset", default="HuggingFaceFW/fineweb-edu")
+    parser.add_argument("--hf-config", default="sample-10BT")
+    parser.add_argument("--hf-split", default="train")
+    parser.add_argument("--hf-val-split", default="")
+    parser.add_argument("--hf-text-field", default="text")
+    parser.add_argument("--hf-shuffle-buffer", type=int, default=10_000)
     parser.add_argument("--cache-dir", type=Path, default=Path("workers/codex_noradam_confidence/data/wikitext_bytes"))
     parser.add_argument("--max-train-bytes", type=int, default=32_000_000)
     parser.add_argument("--max-val-bytes", type=int, default=2_000_000)
@@ -96,7 +103,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--max-hpo-trials", type=int, default=0)
+    parser.add_argument("--final-only", action="store_true")
     return parser.parse_args()
+
+
+def _safe_name(text: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in text)
+
+
+def dataset_label(args: argparse.Namespace) -> str:
+    if args.dataset_source == "wikitext":
+        return f"wikitext/{args.wiki_config}"
+    config = args.hf_config or "default"
+    return f"{args.hf_dataset}/{config}:{args.hf_split}"
 
 
 def _bytes_from_dataset(config: str, split: str, max_bytes: int) -> np.ndarray:
@@ -130,6 +149,67 @@ def prepare_wikitext_cache(args: argparse.Namespace) -> tuple[Path, Path]:
         val = _bytes_from_dataset(args.wiki_config, "validation", args.max_val_bytes)
         np.save(val_path, val)
     return train_path, val_path
+
+
+def _row_text(row: dict[str, Any], text_field: str) -> str:
+    value = row.get(text_field, "")
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _consume_text_bytes(rows: Any, *, text_field: str, max_bytes: int) -> np.ndarray:
+    out = bytearray()
+    for row in rows:
+        data = (_row_text(row, text_field) + "\n").encode("utf-8", errors="replace")
+        remaining = max_bytes - len(out)
+        if remaining <= 0:
+            break
+        out.extend(data[:remaining])
+        if len(out) >= max_bytes:
+            break
+    if not out:
+        raise RuntimeError("dataset stream produced no text bytes")
+    return np.frombuffer(bytes(out), dtype=np.uint8).copy()
+
+
+def prepare_hf_text_cache(args: argparse.Namespace) -> tuple[Path, Path]:
+    from datasets import load_dataset
+
+    args.cache_dir.mkdir(parents=True, exist_ok=True)
+    safe = _safe_name(f"{args.hf_dataset}_{args.hf_config}_{args.hf_split}_{args.hf_text_field}_shuf{args.hf_shuffle_buffer}_seed{args.seed}")
+    train_path = args.cache_dir / f"{safe}_train_{args.max_train_bytes}.uint8.npy"
+    val_path = args.cache_dir / f"{safe}_validation_{args.max_val_bytes}.uint8.npy"
+    if train_path.exists() and val_path.exists():
+        return train_path, val_path
+
+    name = args.hf_config or None
+    if args.hf_val_split:
+        val_ds = load_dataset(args.hf_dataset, name=name, split=args.hf_val_split, streaming=True)
+        train_ds = load_dataset(args.hf_dataset, name=name, split=args.hf_split, streaming=True)
+        if args.hf_shuffle_buffer > 0:
+            train_ds = train_ds.shuffle(buffer_size=args.hf_shuffle_buffer, seed=args.seed)
+        val = _consume_text_bytes(iter(val_ds), text_field=args.hf_text_field, max_bytes=args.max_val_bytes)
+        train = _consume_text_bytes(iter(train_ds), text_field=args.hf_text_field, max_bytes=args.max_train_bytes)
+    else:
+        ds = load_dataset(args.hf_dataset, name=name, split=args.hf_split, streaming=True)
+        if args.hf_shuffle_buffer > 0:
+            ds = ds.shuffle(buffer_size=args.hf_shuffle_buffer, seed=args.seed)
+        iterator = iter(ds)
+        val = _consume_text_bytes(iterator, text_field=args.hf_text_field, max_bytes=args.max_val_bytes)
+        train = _consume_text_bytes(iterator, text_field=args.hf_text_field, max_bytes=args.max_train_bytes)
+
+    np.save(val_path, val)
+    np.save(train_path, train)
+    return train_path, val_path
+
+
+def prepare_text_cache(args: argparse.Namespace) -> tuple[Path, Path]:
+    if args.dataset_source == "wikitext":
+        return prepare_wikitext_cache(args)
+    return prepare_hf_text_cache(args)
 
 
 def make_optimizer(model: nn.Module, trial: TrialConfig) -> torch.optim.Optimizer:
@@ -192,7 +272,7 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     device = torch.device("cuda")
-    train_path, val_path = prepare_wikitext_cache(args)
+    train_path, val_path = prepare_text_cache(args)
 
     model = TinyGPT(
         vocab_size=256,
@@ -277,7 +357,7 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
     final_eval = eval_rows[-1]
     summary = {
         **asdict(trial),
-        "dataset": args.wiki_config,
+        "dataset": dataset_label(args),
         "train_bytes": int(np.load(train_path, mmap_mode="r").shape[0]),
         "val_bytes": int(np.load(val_path, mmap_mode="r").shape[0]),
         "param_count": param_count,
@@ -306,6 +386,28 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
         ]
 
     trials: list[TrialConfig] = []
+    if args.preset == "fineweb_long":
+        trials = [
+            TrialConfig(
+                "fineweb_anchor_lr0.0015_rg0.55_soda0.01_pb0.9_nb0.93_flr0.5_atan2",
+                "anchormuon",
+                0.0015,
+                row_gamma=0.55,
+                pmuoneq_beta=0.90,
+                normuon_beta2=0.93,
+                fallback_lr_mult=0.5,
+                fallback_mode="atan2",
+                soda_lambda_scale=0.01,
+                steps=args.hpo_steps,
+            ),
+            TrialConfig("fineweb_muon_lr0.0012", "muon", 0.0012, steps=args.hpo_steps),
+            TrialConfig("fineweb_adamatan2_lr0.0003", "adamatan2", 0.0003, steps=args.hpo_steps),
+            TrialConfig("fineweb_adamw_lr0.0003", "adamw", 0.0003, steps=args.hpo_steps),
+        ]
+        eval_every = max(1, args.hpo_steps // max(args.eval_bins, 1))
+        warmup = min(args.warmup_steps, max(1, args.hpo_steps // 4))
+        return [replace(trial, eval_every=eval_every, warmup_steps=warmup) for trial in trials]
+
     if args.preset == "anchor_harder":
         by_name: dict[str, TrialConfig] = {}
 
@@ -521,6 +623,23 @@ def final_trials_from_hpo(args: argparse.Namespace, hpo_rows: list[dict[str, Any
     return trials
 
 
+def final_trials_from_preset(args: argparse.Namespace) -> list[TrialConfig]:
+    eval_every = max(1, args.final_steps // max(args.eval_bins, 1))
+    warmup = min(args.warmup_steps, max(1, args.final_steps // 4))
+    trials: list[TrialConfig] = []
+    for trial in hpo_trials(args):
+        trials.append(
+            replace(
+                trial,
+                name=f"final_{trial.name}",
+                steps=args.final_steps,
+                eval_every=eval_every,
+                warmup_steps=warmup,
+            )
+        )
+    return trials
+
+
 def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> list[dict[str, Any]]:
     gpu_count = torch.cuda.device_count()
     if gpu_count < 1:
@@ -562,8 +681,22 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> list[d
                 str(trial_file),
                 "--output-dir",
                 str(args.output_dir),
+                "--dataset-source",
+                str(args.dataset_source),
                 "--wiki-config",
                 str(args.wiki_config),
+                "--hf-dataset",
+                str(args.hf_dataset),
+                "--hf-config",
+                str(args.hf_config),
+                "--hf-split",
+                str(args.hf_split),
+                "--hf-val-split",
+                str(args.hf_val_split),
+                "--hf-text-field",
+                str(args.hf_text_field),
+                "--hf-shuffle-buffer",
+                str(args.hf_shuffle_buffer),
                 "--cache-dir",
                 str(args.cache_dir),
                 "--max-train-bytes",
@@ -667,19 +800,19 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
     labels = {"anchormuon": "AnchorMuon", "adamw": "AdamW", "adamatan2": "AdamW-Atan2", "muon": "Muon"}
     final_sorted = sorted(final_rows, key=lambda r: float(r["final_val_loss"]))
     lines = [
-        "# WikiText 50M LLM Optimizer Comparison",
+        "# Byte-Level 50M LLM Optimizer Comparison",
         "",
-        "This benchmark uses actual WikiText raw text encoded as UTF-8 bytes. It is byte-level rather than BPE-tokenized, so the numbers should not be compared to standard word/BPE WikiText perplexities. It is still a real text next-byte language-model optimizer comparison.",
+        "This benchmark uses real text encoded as UTF-8 bytes. It is byte-level rather than BPE-tokenized, so the numbers should not be compared to standard word/BPE perplexities. It is still a real text next-byte language-model optimizer comparison.",
         "",
         "## Setup",
         "",
-        f"- Dataset: `{args.wiki_config}`",
+        f"- Dataset: `{dataset_label(args)}`",
         f"- Train bytes cached: {int(final_rows[0]['train_bytes']) if final_rows else args.max_train_bytes:,}",
         f"- Validation bytes cached: {int(final_rows[0]['val_bytes']) if final_rows else args.max_val_bytes:,}",
         f"- Model: decoder-only GPT, layers={args.n_layer}, width={args.n_embd}, heads={args.n_head}, context={args.block_size}, byte vocab=256",
         f"- Trainable parameters: {int(final_rows[0]['param_count']) if final_rows else 'n/a'}",
         f"- Batch: {args.batch_size} sequences x {args.block_size} bytes",
-        f"- HPO: {args.hpo_steps} steps per candidate, selected by best validation loss",
+        f"- HPO: {'skipped; fixed preset configs replayed directly' if args.final_only else f'{args.hpo_steps} steps per candidate, selected by best validation loss'}",
         f"- Final replay: {args.final_steps} steps per selected optimizer",
         f"- Validation estimate: {args.eval_batches} random batches per evaluation point",
         f"- GPUs: {torch.cuda.device_count()} visible, one trial per GPU",
@@ -717,17 +850,20 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
         "",
         "![Token throughput](plots/tokens_per_sec_bar.png)",
         "",
-        "## HPO Candidates",
-        "",
-        "| Family | Trial | LR | Best val loss | Final val loss | Step time |",
-        "|---|---|---:|---:|---:|---:|",
     ]
-    for row in sorted(hpo_rows, key=lambda r: (str(r["family"]), float(r["best_val_loss"]))):
-        lines.append(
-            f"| {row['family']} | `{row['name']}` | {float(row['lr']):g} | "
-            f"{float(row['best_val_loss']):.4f} | {float(row['final_val_loss']):.4f} | "
-            f"{float(row['mean_step_time_ms']):.2f} ms |"
-        )
+    if hpo_rows:
+        lines += [
+            "## HPO Candidates",
+            "",
+            "| Family | Trial | LR | Best val loss | Final val loss | Step time |",
+            "|---|---|---:|---:|---:|---:|",
+        ]
+        for row in sorted(hpo_rows, key=lambda r: (str(r["family"]), float(r["best_val_loss"]))):
+            lines.append(
+                f"| {row['family']} | `{row['name']}` | {float(row['lr']):g} | "
+                f"{float(row['best_val_loss']):.4f} | {float(row['final_val_loss']):.4f} | "
+                f"{float(row['mean_step_time_ms']):.2f} ms |"
+            )
     (args.output_dir / "summary.md").write_text("\n".join(lines) + "\n")
 
 
@@ -742,7 +878,7 @@ def main() -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
         raise RuntimeError("CUDA is required; refusing to fall back to CPU")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    train_path, val_path = prepare_wikitext_cache(args)
+    train_path, val_path = prepare_text_cache(args)
     env = {
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
@@ -753,9 +889,13 @@ def main() -> None:
         "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
     }
     (args.output_dir / "environment.json").write_text(json.dumps(env, indent=2) + "\n")
-    hpo_rows = launch_trials(args, hpo_trials(args))
-    write_csv(args.output_dir / "hpo_summary.csv", hpo_rows)
-    final_rows = launch_trials(args, final_trials_from_hpo(args, hpo_rows))
+    if args.final_only:
+        hpo_rows: list[dict[str, Any]] = []
+        final_rows = launch_trials(args, final_trials_from_preset(args))
+    else:
+        hpo_rows = launch_trials(args, hpo_trials(args))
+        write_csv(args.output_dir / "hpo_summary.csv", hpo_rows)
+        final_rows = launch_trials(args, final_trials_from_hpo(args, hpo_rows))
     write_csv(args.output_dir / "final_summary.csv", final_rows)
     make_plots(args, final_rows)
     write_summary(args, hpo_rows, final_rows)
