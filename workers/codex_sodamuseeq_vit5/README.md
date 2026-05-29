@@ -6,6 +6,8 @@ workers in the monorepo.
 Contents:
 
 - `sodamuseeq.py`: standalone optimizer module for reuse in other projects.
+- `golden_soda_pmuoneq_normuon.py`: fixed final optimizer library for the
+  current repo-wide LM candidate.
 - `vit5/`: compact ViT-5 CIFAR-10 experiment fork with optimizer ablations.
 - `vit5/optim_sodamuseeq.py`: ViT-integrated optimizer implementation.
 - `vit5/experiments/sodamuseeq_ablation.py`: broad SodaMuseEq ablation runner.
@@ -25,6 +27,48 @@ The optimizer supports optional switches for:
 - NorMuon row second-moment normalization after projection.
 - Optional NorMuon orientation mode and tall-matrix aspect scaling, ported from
   `workers/codex_soda_pmuoneq_normuon`.
+
+## Golden Optimizer Library
+
+Use `golden_soda_pmuoneq_normuon.py` when you want the fixed version of my best
+reported optimizer without ablation switches:
+
+```text
+SODA + row-only PMuonEq + Gram/Newton-Schulz + row-wise NorMuon with aspect
+AMUSE off / MiMuon off
+```
+
+This is the exact row+aspect recipe that produced my best compact
+ViT-5/CIFAR-10 result. The latest cross-worker LM recommendation still keeps
+aspect as an ablation because one proper-split worker result slightly preferred
+no-aspect on official test accuracy. This golden file is therefore the
+reproducible version of my best result, not a claim that aspect is settled for
+language modeling.
+
+Typical usage:
+
+```python
+from golden_soda_pmuoneq_normuon import (
+    GoldenSodaPmuonEqNorMuon,
+    build_golden_param_groups,
+)
+
+optimizer = GoldenSodaPmuonEqNorMuon(
+    build_golden_param_groups(
+        model,
+        lr=0.012,
+        weight_decay=0.0,
+    ),
+    warmup_steps=500,
+    soda_warmup_steps=500,
+)
+```
+
+The named grouping helper keeps embeddings, tied LM heads, norms, biases, and
+small non-matrix tensors in the fallback path by default. Hidden 2D/4D matrix
+weights go through the spectral path. The golden tests verify deterministic
+update parity against the flexible `SodaMuseEq` implementation configured with
+the best row+aspect flags.
 
 ## Current Algorithm
 
@@ -151,6 +195,7 @@ python -m py_compile \
   vit5/experiments/focused_optimizer_confidence.py
 
 python -m pytest \
+  tests/test_golden_soda_pmuoneq_normuon.py \
   vit5/tests/test_sodamuseeq_modes.py \
   tests/test_sodamuseeq_standalone.py
 
@@ -163,6 +208,8 @@ optimizer tensor state across ranks.
 
 The tests include:
 
+- golden optimizer update parity against flexible `SodaMuseEq` configured with
+  the best row+aspect flags,
 - all ablation modes run without NaNs,
 - named grouping keeps ViT `patch_embed` matrices in the matrix optimizer while
   keeping heads/norms in fallback,
