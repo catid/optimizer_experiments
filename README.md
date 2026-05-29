@@ -66,38 +66,45 @@ Protocol: `wikitext-103-raw-v1`, `32,000,000` cached training bytes,
 `1,148,008` validation bytes, decoder-only GPT with `10` layers, width `640`,
 `10` heads, context `128`, byte vocab `256`, `49,424,640` trainable
 parameters, batch `32 x 128`, BF16 autocast, WSD schedule with 20-step warmup,
-and two RTX PRO 6000 Blackwell GPUs scheduled one trial per GPU. I fixed a
-benchmark-runner bug before this final table: trainer-side scheduling now
-scales each optimizer group from its own initial LR, so AnchorMuon
-`fallback_lr_mult` is respected.
+and two RTX PRO 6000 Blackwell GPUs scheduled one trial per GPU. The
+benchmark runner scales each optimizer group from its own initial LR, so
+AnchorMuon `fallback_lr_mult` is respected.
 
-Each HPO candidate ran `800` steps and the best candidate per optimizer family
-was replayed for `800` steps. This is a bounded single-seed transfer check, not
-a final language-modeling claim.
+The harder follow-up ran `213` HPO candidates for `1200` steps each with `16`
+validation batches per evaluation point, then replayed the best candidate per
+optimizer family for `1600` steps. This is still a bounded single-seed transfer
+check, not a final language-modeling claim.
 
 | Rank | Optimizer | Selected config | Final val loss | Final byte acc | Step time | Throughput |
 |---:|---|---|---:|---:|---:|---:|
-| 1 | AnchorMuon | `lr=0.00175`, `row_gamma=0.45`, `soda_lambda_scale=0.1`, `fallback=AdamATan2@0.5x` | 1.3614 | 59.93% | 15.52 ms | 263.9k byte/s |
-| 2 | Plain Muon | `lr=0.0015`, `wd=0.05` | 1.3672 | 59.57% | 17.05 ms | 240.2k byte/s |
-| 3 | AdamW-Atan2 | `lr=0.0003`, `wd=0.05` | 1.5914 | 53.42% | 10.52 ms | 389.2k byte/s |
-| 4 | AdamW | `lr=0.0003`, `wd=0.05` | 1.5955 | 53.46% | 10.29 ms | 398.0k byte/s |
+| 1 | AnchorMuon | `lr=0.0015`, `row_gamma=0.55`, `soda_lambda_scale=0.01`, `fallback=AdamATan2@0.5x` | 1.2473 | 63.06% | 15.32 ms | 267.3k byte/s |
+| 2 | Plain Muon | `lr=0.0012`, `wd=0.05` | 1.2501 | 62.72% | 16.94 ms | 241.8k byte/s |
+| 3 | AdamW-Atan2 | `lr=0.0003`, `wd=0.05` | 1.3552 | 60.03% | 10.42 ms | 392.9k byte/s |
+| 4 | AdamW | `lr=0.0003`, `wd=0.05` | 1.3553 | 60.12% | 10.18 ms | 402.5k byte/s |
 
 Takeaway: on real WikiText-103 bytes, tuned AnchorMuon does transfer much
-better than the original synthetic proxy suggested. It narrowly beats plain
-Muon on loss/accuracy and is about 9% faster per step than plain Muon, while
-AdamW and AdamW-Atan2 remain materially faster per step but much worse in
-early loss at this model/batch/step budget.
+better than the original synthetic proxy suggested. The harder HPO shifted the
+LM starting point down to `lr=0.0015`, increased row-gamma to `0.55`, and
+reduced SODA to `0.01`. AnchorMuon narrowly beats plain Muon on loss/accuracy
+and is about 10% faster per step than plain Muon, while AdamW and AdamW-Atan2
+remain materially faster per step but substantially worse in early loss at this
+model/batch/step budget.
 
 Result bundle:
+`workers/codex_noradam_confidence/results/wikitext103_llm50m_harder_20260529/`.
+
+![WikiText-103 byte-level validation loss](workers/codex_noradam_confidence/results/wikitext103_llm50m_harder_20260529/plots/val_loss_curve.png)
+
+![WikiText-103 byte-level validation accuracy](workers/codex_noradam_confidence/results/wikitext103_llm50m_harder_20260529/plots/val_acc_curve.png)
+
+![WikiText-103 byte-level training loss](workers/codex_noradam_confidence/results/wikitext103_llm50m_harder_20260529/plots/train_loss_curve.png)
+
+![WikiText-103 byte-level step time](workers/codex_noradam_confidence/results/wikitext103_llm50m_harder_20260529/plots/step_time_ms_bar.png)
+
+The previous 800-step coarse WikiText pass selected
+`lr=0.00175`, `row_gamma=0.45`, `soda_lambda_scale=0.1`, and
+`fallback=AdamATan2@0.5x`; it is retained in
 `workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529/`.
-
-![WikiText-103 byte-level validation loss](workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529/plots/val_loss_curve.png)
-
-![WikiText-103 byte-level validation accuracy](workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529/plots/val_acc_curve.png)
-
-![WikiText-103 byte-level training loss](workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529/plots/train_loss_curve.png)
-
-![WikiText-103 byte-level step time](workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529/plots/step_time_ms_bar.png)
 
 ## Synthetic 50M LLM Proxy
 

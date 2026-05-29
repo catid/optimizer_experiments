@@ -1,0 +1,35 @@
+{
+  "torch": "2.13.0.dev20260506+cu130",
+  "cuda": "13.0",
+  "gpu_count": 2,
+  "gpus": [
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+  ],
+  "train_cache": "/home/catid/screen/repos/optimizer_experiments/workers/codex_noradam_confidence/data/wikitext_bytes/wikitext-103-raw-v1_train_32000000.uint8.npy",
+  "val_cache": "/home/catid/screen/repos/optimizer_experiments/workers/codex_noradam_confidence/data/wikitext_bytes/wikitext-103-raw-v1_validation_2000000.uint8.npy",
+  "args": {
+    "worker": false,
+    "trial_json": null,
+    "output_dir": "/home/catid/screen/repos/optimizer_experiments/workers/codex_noradam_confidence/results/wikitext103_llm50m_harder_20260529",
+    "preset": "anchor_harder",
+    "wiki_config": "wikitext-103-raw-v1",
+    "cache_dir": "/home/catid/screen/repos/optimizer_experiments/workers/codex_noradam_confidence/data/wikitext_bytes",
+    "max_train_bytes": 32000000,
+    "max_val_bytes": 2000000,
+    "seed": 123,
+    "block_size": 128,
+    "n_layer": 10,
+    "n_head": 10,
+    "n_embd": 640,
+    "dropout": 0.0,
+    "batch_size": 32,
+    "hpo_steps": 1200,
+    "final_steps": 1600,
+    "eval_bins": 8,
+    "eval_batches": 16,
+    "warmup_steps": 20,
+    "log_every": 150,
+    "max_hpo_trials": 0
+  }
+}

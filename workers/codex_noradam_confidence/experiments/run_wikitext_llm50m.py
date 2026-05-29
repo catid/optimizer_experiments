@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--trial-json", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529"))
-    parser.add_argument("--preset", choices=["smoke", "main", "anchor_deep"], default="anchor_deep")
+    parser.add_argument("--preset", choices=["smoke", "main", "anchor_deep", "anchor_harder"], default="anchor_deep")
     parser.add_argument("--wiki-config", default="wikitext-103-raw-v1")
     parser.add_argument("--cache-dir", type=Path, default=Path("workers/codex_noradam_confidence/data/wikitext_bytes"))
     parser.add_argument("--max-train-bytes", type=int, default=32_000_000)
@@ -92,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hpo-steps", type=int, default=800)
     parser.add_argument("--final-steps", type=int, default=800)
     parser.add_argument("--eval-bins", type=int, default=8)
+    parser.add_argument("--eval-batches", type=int, default=8)
     parser.add_argument("--warmup-steps", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--max-hpo-trials", type=int, default=0)
@@ -255,7 +256,7 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
                     val_stream,
                     batch_size=args.batch_size,
                     block_size=args.block_size,
-                    batches=8,
+                    batches=args.eval_batches,
                     generator=val_gen,
                 )
                 recent = step_times[-max(1, min(len(step_times), trial.eval_every)):]
@@ -305,6 +306,105 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
         ]
 
     trials: list[TrialConfig] = []
+    if args.preset == "anchor_harder":
+        by_name: dict[str, TrialConfig] = {}
+
+        def add(trial: TrialConfig) -> None:
+            by_name.setdefault(trial.name, trial)
+
+        # Refined baselines around the previous winners. Adam variants won at
+        # the low edge before; Muon was close to AnchorMuon, so give it a
+        # denser local LR search.
+        for lr in (1e-4, 2e-4, 3e-4, 4e-4, 5e-4, 6e-4, 8e-4, 1e-3):
+            add(TrialConfig(f"adamw_lr{lr:g}", "adamw", lr, steps=args.hpo_steps))
+            add(TrialConfig(f"adamatan2_lr{lr:g}", "adamatan2", lr, steps=args.hpo_steps))
+        for lr in (1e-3, 1.2e-3, 1.4e-3, 1.5e-3, 1.6e-3, 1.75e-3, 2e-3, 2.25e-3):
+            add(TrialConfig(f"muon_lr{lr:g}", "muon", lr, steps=args.hpo_steps))
+
+        # Dense local AnchorMuon grid around the corrected WikiText winner:
+        # lr=0.00175, row_gamma=0.45, soda=0.1, fallback=AdamAtan2@0.5x.
+        for lr in (0.0015, 0.00165, 0.00175, 0.0019, 0.00205, 0.0022, 0.00235):
+            for row_gamma in (0.35, 0.45, 0.55):
+                for soda_lambda_scale in (0.01, 0.03, 0.07, 0.1, 0.2):
+                    add(
+                        TrialConfig(
+                            f"anchor_hard_lr{lr:g}_rg{row_gamma:g}_soda{soda_lambda_scale:g}_pb0.9_nb0.93_flr0.5_atan2",
+                            "anchormuon",
+                            lr,
+                            row_gamma=row_gamma,
+                            pmuoneq_beta=0.90,
+                            normuon_beta2=0.93,
+                            fallback_lr_mult=0.5,
+                            fallback_mode="atan2",
+                            soda_lambda_scale=soda_lambda_scale,
+                            steps=args.hpo_steps,
+                        )
+                    )
+
+        # Check row-gamma extremes only near the best LR/SODA region.
+        for lr in (0.00165, 0.00175, 0.0019):
+            for row_gamma in (0.25, 0.65):
+                for soda_lambda_scale in (0.03, 0.07, 0.1):
+                    add(
+                        TrialConfig(
+                            f"anchor_hard_lr{lr:g}_rg{row_gamma:g}_soda{soda_lambda_scale:g}_pb0.9_nb0.93_flr0.5_atan2",
+                            "anchormuon",
+                            lr,
+                            row_gamma=row_gamma,
+                            pmuoneq_beta=0.90,
+                            normuon_beta2=0.93,
+                            fallback_lr_mult=0.5,
+                            fallback_mode="atan2",
+                            soda_lambda_scale=soda_lambda_scale,
+                            steps=args.hpo_steps,
+                        )
+                    )
+
+        # Fallback-path sweep at the matrix settings that looked strongest.
+        for lr in (0.00165, 0.00175, 0.0019):
+            for fallback_lr_mult in (0.25, 0.5, 0.75, 1.0):
+                for fallback_mode in ("atan2", "rms", "adamc"):
+                    add(
+                        TrialConfig(
+                            f"anchor_hard_lr{lr:g}_rg0.45_soda0.1_pb0.9_nb0.93_flr{fallback_lr_mult:g}_{fallback_mode}",
+                            "anchormuon",
+                            lr,
+                            row_gamma=0.45,
+                            pmuoneq_beta=0.90,
+                            normuon_beta2=0.93,
+                            fallback_lr_mult=fallback_lr_mult,
+                            fallback_mode=fallback_mode,
+                            soda_lambda_scale=0.1,
+                            steps=args.hpo_steps,
+                        )
+                    )
+
+        # Matrix-path beta sweep around the same local optimum.
+        for lr in (0.00165, 0.00175, 0.0019):
+            for pmuoneq_beta in (0.85, 0.90, 0.95, 0.98):
+                for normuon_beta2 in (0.90, 0.93, 0.95):
+                    add(
+                        TrialConfig(
+                            f"anchor_hard_lr{lr:g}_rg0.45_soda0.1_pb{pmuoneq_beta:g}_nb{normuon_beta2:g}_flr0.5_atan2",
+                            "anchormuon",
+                            lr,
+                            row_gamma=0.45,
+                            pmuoneq_beta=pmuoneq_beta,
+                            normuon_beta2=normuon_beta2,
+                            fallback_lr_mult=0.5,
+                            fallback_mode="atan2",
+                            soda_lambda_scale=0.1,
+                            steps=args.hpo_steps,
+                        )
+                    )
+
+        trials = list(by_name.values())
+        if args.max_hpo_trials:
+            trials = trials[: args.max_hpo_trials]
+        eval_every = max(1, args.hpo_steps // max(args.eval_bins, 1))
+        warmup = min(args.warmup_steps, max(1, args.hpo_steps // 4))
+        return [replace(trial, eval_every=eval_every, warmup_steps=warmup) for trial in trials]
+
     # Tuned baselines, kept modest because the user asked to spend extra effort
     # on AnchorMuon rather than only retesting Adam.
     for lr in (3e-4, 5e-4, 8e-4, 1e-3):
@@ -488,6 +588,8 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> list[d
                 str(args.final_steps),
                 "--eval-bins",
                 str(args.eval_bins),
+                "--eval-batches",
+                str(args.eval_batches),
                 "--warmup-steps",
                 str(args.warmup_steps),
                 "--log-every",
@@ -579,6 +681,7 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
         f"- Batch: {args.batch_size} sequences x {args.block_size} bytes",
         f"- HPO: {args.hpo_steps} steps per candidate, selected by best validation loss",
         f"- Final replay: {args.final_steps} steps per selected optimizer",
+        f"- Validation estimate: {args.eval_batches} random batches per evaluation point",
         f"- GPUs: {torch.cuda.device_count()} visible, one trial per GPU",
         "",
         "## Final Results",

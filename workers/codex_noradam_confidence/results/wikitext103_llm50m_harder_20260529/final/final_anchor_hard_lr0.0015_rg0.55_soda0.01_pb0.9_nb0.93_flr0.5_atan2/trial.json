@@ -1,0 +1,19 @@
+{
+  "name": "final_anchor_hard_lr0.0015_rg0.55_soda0.01_pb0.9_nb0.93_flr0.5_atan2",
+  "family": "anchormuon",
+  "lr": 0.0015,
+  "weight_decay": 0.05,
+  "row_gamma": 0.55,
+  "pmuoneq_beta": 0.9,
+  "normuon_beta2": 0.93,
+  "fallback_lr_mult": 0.5,
+  "fallback_mode": "atan2",
+  "soda_lambda_scale": 0.01,
+  "soda_lambda_power": 1.0,
+  "seed": 123,
+  "steps": 1600,
+  "eval_every": 200,
+  "warmup_steps": 20,
+  "final_lr_scale": 0.1,
+  "wsd_decay_frac": 0.2
+}

@@ -45,11 +45,12 @@ within seed variance. AdamATan2 is now the constructor default for fallback
 parameters so new users get that stronger validation-loss recipe by default.
 
 Language-model transfer note: a bounded WikiText-103 byte-level 49.4M GPT check
-selected ``lr=0.00175``, ``fallback_lr=0.000875``, ``row_gamma=0.45``, and
-``soda_lambda_scale=0.1`` over 800-step HPO/final runs, narrowly beating plain
-Muon on validation loss while running faster per step. This is real text data
-but byte-level and single-seed; treat it as an initial LM starting point rather
-than a standard WikiText perplexity result.
+selected ``lr=0.0015``, ``fallback_lr=0.00075``, ``row_gamma=0.55``, and
+``soda_lambda_scale=0.01`` after a 213-candidate 1200-step HPO and 1600-step
+family replay. It narrowly beat plain Muon on validation loss while running
+faster per step. This is real text data but byte-level and single-seed; treat it
+as an initial LM starting point rather than a standard WikiText perplexity
+result.
 
 The aspect-scaled variant was close and sometimes won on other CIFAR proxies,
 but no-aspect won the cleanest official-test protocol. This root file keeps
@@ -150,13 +151,13 @@ Do not tune everything at once. Treat the knobs in three tiers:
     Tier 1, tune first:
         lr
             Main quality/speed knob for matrix weights. Try
-            {0.0015, 0.00175, 0.002, 0.0025} for 50M-class byte-level
+            {0.0012, 0.0015, 0.00165, 0.00175} for 50M-class byte-level
             language models, or {0.004, 0.006, 0.008} for smaller ViTs.
 
         row_gamma
             Strength of row-wise PMuonEq reliability scaling before GramNS.
             Default 0.35 was the best clean CIFAR setting. Try
-            {0.25, 0.35, 0.45}; lower it if training is noisy or unstable.
+            {0.35, 0.45, 0.55}; lower it if training is noisy or unstable.
 
     Tier 2, tune only after Tier 1:
         fallback_lr
@@ -211,11 +212,13 @@ Language-modeling tuning order:
     1. Verify shape-based parameter grouping with ``optimizer.group_summary()``.
     2. Compare against the actual LM baseline optimizer, not only AdamW.
     3. Tune lr around the scale above; the WikiText-103 byte-level 49.4M GPT
-       check selected 0.00175.
-    4. Tune row_gamma in {0.25, 0.35, 0.45}.
+       harder HPO selected 0.0015.
+    4. Tune row_gamma in {0.35, 0.45, 0.55}.
     5. Tune normuon_beta2 in {0.90, 0.93, 0.95}.
     6. Tune pmuoneq_beta in {0.90, 0.95}.
-    7. Only then revisit fallback LR/weight decay.
+    7. Tune soda_lambda_scale in {0.01, 0.03, 0.07, 0.1}; the LM check
+       preferred much weaker SODA than CIFAR.
+    8. Only then revisit fallback LR/weight decay.
 
 DDP and batching
 ================
