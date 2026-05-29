@@ -15,6 +15,13 @@ selected recipe fixed and exposes only tuning hyperparameters.
 - `equimuse_normuon.py`: standalone optimizer, no project-local imports.
 - `test_equimuse_normuon.py`: lightweight unit tests for the standalone file.
 - `VALIDATION.md`: validation result from the source workstation.
+- `RESULTS.md`: compact final readout with figure links.
+- `results/tables/equimuse_best_vs_adamw_results.csv`: final 1000-step
+  CIFAR-10 result summary.
+- `results/tables/equimuse_best_vs_adamw_curves.csv`: 8-bin loss/accuracy
+  curves for the final comparison.
+- `results/figures/*.png`: validation-loss, train-loss, accuracy, and
+  iteration-speed plots.
 
 ## Minimal Usage
 
@@ -91,6 +98,7 @@ pmuoneq_beta = 0.95
 pmuoneq_row_gamma = 0.15
 pmuoneq_col_gamma = 0.15
 normuon_beta2 = 0.9
+normuon_orientation = "row"
 ns_steps = 5
 ns_dtype = "float16"
 ```
@@ -107,8 +115,34 @@ Tune in this order:
 1. Matrix learning rate: `{3e-3, 1e-2, 3e-2}`.
 2. PMuonEq row/column gamma: `{(0.15, 0.15), (0.30, 0.10), (0.10, 0.30)}`.
 3. NorMuon beta2: `{0.90, 0.95, 0.98}`.
-4. Warmup steps.
-5. Weight decay.
+4. NorMuon orientation: keep `"row"` for the selected recipe, or test `"auto"`
+   as a controlled ablation that uses column statistics for wide matrices.
+5. Warmup steps.
+6. Weight decay.
+
+## Latest Result
+
+On the source workstation, the fixed ViT-5-Small/CIFAR-10 img224 harness used
+all 4 visible GPUs with DDP, seed `67890`, 1000 optimizer steps, and 8
+validation bins.
+
+| method | acc@1 | val loss | train loss | samples/s |
+| --- | ---: | ---: | ---: | ---: |
+| EquiMuse-NorMuon row | 65.96 | 1.0145 | 1.4699 | 3918 |
+| EquiMuse-NorMuon auto | 64.57 | 1.0387 | 1.4817 | 4214 |
+| AdamW baseline | 63.06 | 1.0891 | 1.5270 | 4167 |
+
+The row-wise selected recipe is the current quality winner in this single-seed
+run: +2.90 accuracy points and -0.0746 validation loss versus AdamW. The
+orientation-aware `"auto"` ablation is faster than row-wise NorMuon on this
+run, but gave up quality.
+
+Artifacts:
+
+- `results/figures/equimuse_best_vs_adamw_val_loss_curve.png`
+- `results/figures/equimuse_best_vs_adamw_train_loss_curve.png`
+- `results/figures/equimuse_best_vs_adamw_accuracy_curve.png`
+- `results/figures/equimuse_best_vs_adamw_iteration_speed.png`
 
 ## DDP Notes
 

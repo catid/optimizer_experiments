@@ -239,13 +239,30 @@ def normuon_precondition(
     *,
     beta2: float = 0.9,
     eps: float = 1e-10,
+    orientation: str = "row",
 ) -> Tensor:
-    """Apply NorMuon row-wise second-moment normalization after GramNS."""
+    """Apply NorMuon second-moment normalization after GramNS.
+
+    ``orientation="row"`` preserves the original EquiMuse-NorMuon recipe.
+    ``orientation="auto"`` tracks rows for tall/square matrices and columns for
+    wide matrices, matching the peer implementation's orientation-aware variant.
+    """
 
     original_dtype = update.dtype
     work = update.float()
-    row_second = work.square().mean(dim=-1, keepdim=True)
-    second_momentum.mul_(float(beta2)).add_(row_second, alpha=1.0 - float(beta2))
+    if orientation == "auto":
+        orientation = "row" if work.shape[-2] >= work.shape[-1] else "column"
+    if orientation == "row":
+        expected = (*work.shape[:-2], work.shape[-2], 1)
+        second = work.square().mean(dim=-1, keepdim=True)
+    elif orientation == "column":
+        expected = (*work.shape[:-2], 1, work.shape[-1])
+        second = work.square().mean(dim=-2, keepdim=True)
+    else:
+        raise ValueError(f"unknown NorMuon orientation: {orientation}")
+    if tuple(second_momentum.shape) != tuple(expected):
+        raise ValueError(f"second_momentum shape {tuple(second_momentum.shape)} does not match {tuple(expected)}")
+    second_momentum.mul_(float(beta2)).add_(second, alpha=1.0 - float(beta2))
 
     old_norm = work.norm(dim=(-2, -1), keepdim=True)
     scaled = work * torch.rsqrt(second_momentum.clamp_min(float(eps)).to(work.dtype))
@@ -306,6 +323,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         pmuoneq_eps: float = 1e-6,
         normuon_beta2: float = 0.9,
         normuon_eps: float = 1e-10,
+        normuon_orientation: str = "row",
         sort_muon_params: bool = True,
     ) -> None:
         if not 0.0 < float(beta1) < 1.0:
@@ -342,6 +360,9 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         self.pmuoneq_eps = float(pmuoneq_eps)
         self.normuon_beta2 = float(normuon_beta2)
         self.normuon_eps = float(normuon_eps)
+        if normuon_orientation not in {"row", "auto", "column"}:
+            raise ValueError("normuon_orientation must be 'row', 'auto', or 'column'")
+        self.normuon_orientation = normuon_orientation
         self.train_mode = False
         self._last_stats: dict[str, float] = {}
 
@@ -366,6 +387,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
             pmuoneq_eps=self.pmuoneq_eps,
             normuon_beta2=self.normuon_beta2,
             normuon_eps=self.normuon_eps,
+            normuon_orientation=self.normuon_orientation,
         )
 
         groups = list(param_groups)
@@ -746,28 +768,49 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         )
 
     @staticmethod
-    def _get_row_second_state(state: dict[str, Any], rows: int, device: torch.device) -> Tensor:
-        key = "normuon_row_second_moment"
+    @staticmethod
+    def _normuon_effective_orientation(rows: int, cols: int, orientation: str) -> str:
+        if orientation == "auto":
+            return "row" if rows >= cols else "column"
+        if orientation not in {"row", "column"}:
+            raise ValueError("normuon_orientation must be 'row', 'auto', or 'column'")
+        return orientation
+
+    @staticmethod
+    def _get_normuon_second_state(
+        state: dict[str, Any],
+        rows: int,
+        cols: int,
+        device: torch.device,
+        orientation: str,
+    ) -> Tensor:
+        effective = EquiMuseNorMuon._normuon_effective_orientation(rows, cols, orientation)
+        shape = (rows, 1) if effective == "row" else (1, cols)
+        key = f"normuon_{effective}_second_moment"
         value = state.get(key)
-        if value is None or value.shape != (rows, 1) or value.device != device:
-            value = torch.zeros((rows, 1), device=device, dtype=torch.float32)
+        if value is None or tuple(value.shape) != shape or value.device != device:
+            value = torch.zeros(shape, device=device, dtype=torch.float32)
             state[key] = value
         return value
 
     def _normuon_matrix(self, item: dict[str, Any], update: Tensor, group: dict[str, Any]) -> Tensor:
-        rows = update.shape[-2]
-        moment = self._get_row_second_state(item["state"], rows, update.device)
+        rows, cols = update.shape[-2], update.shape[-1]
+        orientation = str(group.get("normuon_orientation", self.normuon_orientation))
+        moment = self._get_normuon_second_state(item["state"], rows, cols, update.device, orientation)
         return normuon_precondition(
             update,
             moment,
             beta2=float(group.get("normuon_beta2", self.normuon_beta2)),
             eps=float(group.get("normuon_eps", self.normuon_eps)),
+            orientation=orientation,
         )
 
     def _normuon_bucket(self, bucket: list[dict[str, Any]], updates: Tensor, group: dict[str, Any]) -> Tensor:
-        rows = updates.shape[-2]
+        rows, cols = updates.shape[-2], updates.shape[-1]
+        orientation = str(group.get("normuon_orientation", self.normuon_orientation))
+        effective = self._normuon_effective_orientation(rows, cols, orientation)
         moments = torch.stack(
-            [self._get_row_second_state(item["state"], rows, updates.device) for item in bucket],
+            [self._get_normuon_second_state(item["state"], rows, cols, updates.device, orientation) for item in bucket],
             dim=0,
         )
         out = normuon_precondition(
@@ -775,9 +818,10 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
             moments,
             beta2=float(group.get("normuon_beta2", self.normuon_beta2)),
             eps=float(group.get("normuon_eps", self.normuon_eps)),
+            orientation=orientation,
         )
         for i, item in enumerate(bucket):
-            item["state"]["normuon_row_second_moment"].copy_(moments[i])
+            item["state"][f"normuon_{effective}_second_moment"].copy_(moments[i])
         return out
 
     def _apply_muon_update(
@@ -820,6 +864,7 @@ def build_equimuse_normuon_param_groups(
     pmuoneq_eps: float = 1e-6,
     normuon_beta2: float = 0.9,
     normuon_eps: float = 1e-10,
+    normuon_orientation: str = "row",
 ) -> list[dict[str, Any]]:
     """Split model parameters into fallback and EquiMuse-NorMuon matrix groups."""
 
@@ -875,6 +920,7 @@ def build_equimuse_normuon_param_groups(
                 "pmuoneq_eps": float(pmuoneq_eps),
                 "normuon_beta2": float(normuon_beta2),
                 "normuon_eps": float(normuon_eps),
+                "normuon_orientation": normuon_orientation,
             }
         )
     return groups
