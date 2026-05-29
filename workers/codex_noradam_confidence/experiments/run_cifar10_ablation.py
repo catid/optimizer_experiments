@@ -88,6 +88,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-max-steps", type=int, default=0)
     parser.add_argument("--train-subset", type=int, default=10000)
     parser.add_argument("--val-subset", type=int, default=2000)
+    parser.add_argument(
+        "--val-source",
+        choices=["test", "train_split"],
+        default="test",
+        help=(
+            "Validation source. Historical runs use CIFAR-10 train=False as validation. "
+            "Use train_split for HPO and reserve train=False for final test evaluation."
+        ),
+    )
+    parser.add_argument(
+        "--train-val-size",
+        type=int,
+        default=5000,
+        help="Number of CIFAR-10 train examples held out for validation when --val-source=train_split.",
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=12345,
+        help="Seed for deterministic train/validation split. Kept separate from trial seed.",
+    )
+    parser.add_argument(
+        "--eval-test",
+        action="store_true",
+        help="Evaluate the official CIFAR-10 test split once at the end of each selected final run.",
+    )
+    parser.add_argument(
+        "--test-subset",
+        type=int,
+        default=0,
+        help="Optional official test subset size for debugging. 0 means full test split.",
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=max(2, (os.cpu_count() or 8) // 4))
     parser.add_argument("--seed", type=int, default=123)
@@ -321,7 +353,7 @@ def trial_family(cfg: TrialConfig) -> str:
     return "anchormuon_full"
 
 
-def cifar10_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
+def cifar10_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, DataLoader | None, dict[str, int | str]]:
     mean = (0.4914, 0.4822, 0.4465)
     std = (0.2470, 0.2435, 0.2616)
     train_tf = transforms.Compose([
@@ -334,13 +366,51 @@ def cifar10_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ])
-    train_ds = datasets.CIFAR10(args.data_path, train=True, transform=train_tf, download=True)
-    val_ds = datasets.CIFAR10(args.data_path, train=False, transform=val_tf, download=True)
-    if 0 < args.train_subset < len(train_ds):
-        gen = torch.Generator().manual_seed(args.seed)
-        train_ds = Subset(train_ds, torch.randperm(len(train_ds), generator=gen)[:args.train_subset].tolist())
-    if 0 < args.val_subset < len(val_ds):
-        val_ds = Subset(val_ds, list(range(args.val_subset)))
+    train_full = datasets.CIFAR10(args.data_path, train=True, transform=train_tf, download=True)
+    train_eval_full = datasets.CIFAR10(args.data_path, train=True, transform=val_tf, download=True)
+    test_full = datasets.CIFAR10(args.data_path, train=False, transform=val_tf, download=True)
+    split_gen = torch.Generator().manual_seed(int(args.split_seed))
+    if args.val_source == "train_split":
+        if not 0 < int(args.train_val_size) < len(train_full):
+            raise ValueError(f"--train-val-size must be in [1, {len(train_full) - 1}] for train_split")
+        perm = torch.randperm(len(train_full), generator=split_gen).tolist()
+        val_indices = perm[: int(args.train_val_size)]
+        train_indices = perm[int(args.train_val_size):]
+        if 0 < args.train_subset < len(train_indices):
+            train_indices = train_indices[: args.train_subset]
+        if 0 < args.val_subset < len(val_indices):
+            val_indices = val_indices[: args.val_subset]
+        train_ds = Subset(train_full, train_indices)
+        val_ds = Subset(train_eval_full, val_indices)
+        dataset_info: dict[str, int | str] = {
+            "val_source": "train_split",
+            "split_seed": int(args.split_seed),
+            "train_val_size": int(args.train_val_size),
+            "train_examples": len(train_ds),
+            "val_examples": len(val_ds),
+            "test_examples": len(test_full),
+        }
+    else:
+        train_ds = train_full
+        val_ds = test_full
+        if 0 < args.train_subset < len(train_ds):
+            subset_gen = torch.Generator().manual_seed(int(args.seed))
+            train_indices = torch.randperm(len(train_ds), generator=subset_gen)[: args.train_subset].tolist()
+            train_ds = Subset(train_ds, train_indices)
+        if 0 < args.val_subset < len(val_ds):
+            val_ds = Subset(val_ds, list(range(args.val_subset)))
+        dataset_info = {
+            "val_source": "test",
+            "split_seed": int(args.seed),
+            "train_val_size": 0,
+            "train_examples": len(train_ds),
+            "val_examples": len(val_ds),
+            "test_examples": len(test_full),
+        }
+    test_ds = test_full
+    if 0 < args.test_subset < len(test_ds):
+        test_ds = Subset(test_ds, list(range(args.test_subset)))
+        dataset_info["test_examples"] = len(test_ds)
     loader_kwargs = dict(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -349,7 +419,8 @@ def cifar10_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
     )
     train_loader = DataLoader(train_ds, shuffle=True, drop_last=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, drop_last=False, **loader_kwargs)
-    return train_loader, val_loader
+    test_loader = DataLoader(test_ds, shuffle=False, drop_last=False, **loader_kwargs) if args.eval_test else None
+    return train_loader, val_loader, test_loader, dataset_info
 
 
 def set_seed(seed: int) -> None:
@@ -462,7 +533,7 @@ def run_worker(args: argparse.Namespace) -> None:
     torch.set_float32_matmul_precision("high")
     device = torch.device("cuda:0")
 
-    train_loader, val_loader = cifar10_loaders(args)
+    train_loader, val_loader, test_loader, dataset_info = cifar10_loaders(args)
     model = create_model(args.model, pretrained=False, num_classes=10, img_size=32, drop_path_rate=0.05)
     model.to(device=device, memory_format=torch.channels_last)
     optimizer = make_optimizer(model, cfg, args)
@@ -607,6 +678,14 @@ def run_worker(args: argparse.Namespace) -> None:
                 break
 
     final = dict(epoch_rows[-1])
+    if args.eval_test:
+        if test_loader is None:
+            raise RuntimeError("--eval-test was requested but no test loader was constructed")
+        test_loss, test_acc = evaluate(model, optimizer, test_loader, device)
+        final.update({
+            "test_loss": test_loss,
+            "test_acc": test_acc,
+        })
     final.update({
         "trial": cfg.name,
         "optimizer": cfg.optimizer,
@@ -633,6 +712,7 @@ def run_worker(args: argparse.Namespace) -> None:
         "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name(0),
     })
+    final.update(dataset_info)
     (trial_dir / "summary.json").write_text(json.dumps(final, indent=2) + "\n")
 
 
@@ -666,12 +746,18 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> None:
                 "--eval-bins", str(args.eval_bins),
                 "--train-subset", str(args.train_subset),
                 "--val-subset", str(args.val_subset),
+                "--val-source", str(args.val_source),
+                "--train-val-size", str(args.train_val_size),
+                "--split-seed", str(args.split_seed),
+                "--test-subset", str(args.test_subset),
                 "--batch-size", str(args.batch_size),
                 "--num-workers", str(args.num_workers),
                 "--seed", str(int(cfg.seed if cfg.seed is not None else args.seed)),
                 "--warmup-steps", str(args.warmup_steps),
                 "--log-every", str(args.log_every),
             ]
+            if args.eval_test:
+                cmd.append("--eval-test")
             if not args.sync_step_timing:
                 cmd.append("--no-sync-step-timing")
             env = os.environ.copy()
@@ -921,6 +1007,7 @@ def main() -> None:
         hpo_args.output_dir = base_output / "hpo"
         hpo_args.epochs = args.hpo_epochs
         hpo_args.max_steps = args.hpo_max_steps
+        hpo_args.eval_test = False
         hpo_trials = filtered_trials(hpo_args)
         launch_trials(hpo_args, hpo_trials)
         summarize(hpo_args.output_dir, make_plots=not args.no_plots)
