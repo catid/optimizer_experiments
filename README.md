@@ -9,23 +9,21 @@ implementation:
 
 **Algorithm:** SODA anchor updates on all parameter groups, row-only PMuonEq,
 five-step Gram Newton-Schulz, and NorMuon. Matrix weights use SODA instead of
-ordinary weight decay. Fallback tensors also receive the SODA anchor update, and
-the current root implementation additionally applies `fallback_weight_decay`
-unless it is set to `0.0`. AMUSE, MiMuon, full PMuon, column PMuonEq, and
-post-NorMuon aspect scaling are disabled.
+ordinary weight decay. Fallback tensors also receive the SODA anchor update and
+do not have a separate decay knob. AMUSE, MiMuon, full PMuon, column PMuonEq,
+and post-NorMuon aspect scaling are disabled.
 
 **Direct root validation:** ViT-5 micro on CIFAR-10, 45k train / 5k validation
 split from the official training set, official 10k test split evaluated only at
-the end, batch size 512, 50 epochs, seed `123`, BF16 autocast, channels-last
-tensors, 16 dataloader workers. The trainer called the root optimizer directly
-as `AnchorMuon(model.named_parameters(), ...)`. No trainer-side custom
+the end, batch size 512, 50 epochs, seeds `123,456,789`, BF16 autocast,
+channels-last tensors, 16 dataloader workers. The trainer called the root
+optimizer directly as `AnchorMuon(model.named_parameters(), ...)`. No trainer-side custom
 parameter groups, matrix filters, root subclasses, column-gamma adapters, or
 aspect-scaling adapters were used.
 
 | Recipe | Official test acc | Official test loss | Final val acc | Final val loss | Best val acc | Best val loss | Step time | Examples/sec |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Root `optimizer.py` SODA + PMuonEq + GramNS + NorMuon | 85.31% | 0.4527 | 85.70% | 0.4260 | 85.72% | 0.4157 | 16.72 ms | 30.6k |
-| AdamW cosine baseline | 79.69% | 0.6265 | 79.84% | 0.6133 | 80.56% | 0.6000 | 11.99 ms | 42.7k |
+| Root `optimizer.py` default | 84.94% | 0.4501 | 85.72% | 0.4286 | 86.03% | 0.4129 | 16.57 ms | 30.9k |
 
 The strongest multi-seed evidence lives in `workers/codex_noradam_confidence`
 and used the same core recipe in the research runner. That package is useful
@@ -94,7 +92,6 @@ experiments:
 | `row_gamma` | `0.35` | Yes | PMuonEq row scaling strength. Try `0.25`, `0.35`, `0.45`. |
 | `fallback_lr` | same as `matrix_lr` | Later | LR for embeddings, heads, norms, biases, scalars, vectors. |
 | `normuon_beta2` | `0.93` | Later | Row second-moment smoothing after GramNS. Try `0.90`, `0.93`, `0.95`. |
-| `fallback_weight_decay` | `0.05` | Later | Applies only to fallback parameters, in addition to the SODA anchor pull. Matrix params use SODA instead of ordinary weight decay. Set this to `0.0` for SODA-only fallback regularization. |
 | `warmup_steps` | `80` | Rarely | Increase if early steps are unstable; shorten only by ablation. |
 | `min_matrix_dim` | `2` | Rarely | Keeps tiny 2D tensors out of the spectral path unless a custom filter routes them. |
 | `momentum` | `0.95` | Usually no | Momentum for the matrix source update. |

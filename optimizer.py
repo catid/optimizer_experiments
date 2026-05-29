@@ -79,17 +79,16 @@ Fallback parameters
 ===================
 
 Biases, norms, scalar/vector tensors, and any parameters routed to the fallback
-group use the same SODA anchor plus RMS/AdamW-style second-moment update used by
-the winning research path. Matrix eligibility is based on effective shape after
+group use the same SODA anchor plus RMS-style second-moment update used by the
+winning research path. Matrix eligibility is based on effective shape after
 ignoring singleton dimensions: for example ``[1, 1, width]`` is a vector, while
 ``[1, tokens, width]`` is a matrix.
 
        v_t = beta_2 v_{t-1} + (1 - beta_2) g_t^2
        update = g_t / sqrt(v_t / (1 - beta_2^t) + eps)
 
-Decoupled fallback weight decay is implemented as an additive term in the
-fallback update. Matrix parameters do not use ordinary weight decay; SODA is the
-matrix regularization path.
+There is no ordinary weight decay path in this standalone optimizer. SODA is the
+only regularization mechanism applied by AnchorMuon.
 
 Recommended starting defaults
 =============================
@@ -105,7 +104,6 @@ nearby aspect/column/MiMuon ablations. New projects should start with:
     row_gamma       = 0.35
     normuon_beta2   = 0.93
     warmup_steps    = 80
-    fallback_weight_decay = 0.05
 
 Do not tune everything at once. Treat the knobs in three tiers:
 
@@ -130,10 +128,6 @@ Do not tune everything at once. Treat the knobs in three tiers:
         normuon_beta2
             Row second-moment smoothing after GramNS. Default 0.93. Try
             {0.90, 0.93, 0.95}; higher is smoother, lower adapts faster.
-
-        fallback_weight_decay
-            Decoupled-style decay term only for fallback parameters. Matrix
-            parameters use SODA instead of ordinary weight decay.
 
         warmup_steps
             Optimizer-local linear warmup. Default 80 matches the strongest
@@ -198,7 +192,7 @@ from typing import Any, TypeAlias
 import torch
 
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 
 try:
     from torch.optim.optimizer import ParamsT
@@ -432,7 +426,6 @@ class AnchorMuon(torch.optim.Optimizer):
         momentum: float = 0.95,
         fallback_betas: tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
-        fallback_weight_decay: float = 0.05,
         warmup_steps: int = 80,
         soda_lambda_scale: float = 1.0,
         soda_lambda_power: float = 1.0,
@@ -466,8 +459,6 @@ class AnchorMuon(torch.optim.Optimizer):
             raise ValueError("fallback_betas must contain two values in [0, 1)")
         if eps <= 0.0 or pmuoneq_eps <= 0.0 or normuon_eps <= 0.0 or ns_epsilon <= 0.0:
             raise ValueError("epsilon values must be positive")
-        if fallback_weight_decay < 0.0:
-            raise ValueError("fallback_weight_decay must be non-negative")
         if min_matrix_dim < 1:
             raise ValueError("min_matrix_dim must be >= 1")
         if soda_lambda_scale <= 0.0:
@@ -478,7 +469,6 @@ class AnchorMuon(torch.optim.Optimizer):
             params,
             matrix_lr=matrix_lr,
             fallback_lr=fallback_lr,
-            fallback_weight_decay=fallback_weight_decay,
             momentum=momentum,
             fallback_betas=fallback_betas,
             eps=eps,
@@ -519,7 +509,6 @@ class AnchorMuon(torch.optim.Optimizer):
         *,
         matrix_lr: float,
         fallback_lr: float,
-        fallback_weight_decay: float,
         momentum: float,
         fallback_betas: tuple[float, float],
         eps: float,
@@ -545,7 +534,6 @@ class AnchorMuon(torch.optim.Optimizer):
                 items,  # type: ignore[arg-type]
                 matrix_lr=matrix_lr,
                 fallback_lr=fallback_lr,
-                fallback_weight_decay=fallback_weight_decay,
                 momentum=momentum,
                 fallback_betas=fallback_betas,
                 eps=eps,
@@ -566,8 +554,8 @@ class AnchorMuon(torch.optim.Optimizer):
                 group.setdefault("lr", matrix_lr if is_matrix else fallback_lr)
                 group.setdefault("base_lr", group["lr"])
                 group.setdefault("use_external_lr", use_external_lr)
+                group.pop("weight_decay", None)
                 if is_matrix:
-                    group.setdefault("weight_decay", 0.0)
                     group.setdefault("momentum", momentum)
                     group.setdefault("pmuoneq_beta", pmuoneq_beta)
                     group.setdefault("row_gamma", row_gamma)
@@ -576,7 +564,6 @@ class AnchorMuon(torch.optim.Optimizer):
                     group.setdefault("normuon_eps", normuon_eps)
                     group.setdefault("min_matrix_dim", min_matrix_dim)
                 else:
-                    group.setdefault("weight_decay", fallback_weight_decay)
                     group.setdefault("betas", fallback_betas)
                     group.setdefault("eps", eps)
             return groups
@@ -611,7 +598,6 @@ class AnchorMuon(torch.optim.Optimizer):
                     "use_matrix_update": True,
                     "lr": matrix_lr,
                     "base_lr": matrix_lr,
-                    "weight_decay": 0.0,
                     "momentum": momentum,
                     "pmuoneq_beta": pmuoneq_beta,
                     "row_gamma": row_gamma,
@@ -629,7 +615,6 @@ class AnchorMuon(torch.optim.Optimizer):
                     "use_matrix_update": False,
                     "lr": fallback_lr,
                     "base_lr": fallback_lr,
-                    "weight_decay": fallback_weight_decay,
                     "betas": fallback_betas,
                     "eps": eps,
                     "use_external_lr": use_external_lr,
@@ -819,9 +804,6 @@ class AnchorMuon(torch.optim.Optimizer):
         step = int(state["step"])
         denom = (exp_avg_sq / max(1.0 - float(beta2) ** step, 1e-16)).sqrt().add_(eps)
         update = g / denom
-        weight_decay = float(group.get("weight_decay", 0.0))
-        if weight_decay:
-            update = update + p.detach().to(torch.float32) * weight_decay
         p.lerp_(end=self._soda_anchor(p), weight=self._soda_weight(t))
         p.add_(update.to(p.dtype), alpha=-lr)
         return 1
@@ -880,7 +862,6 @@ def build_param_groups(
     *,
     matrix_lr: float = 8e-3,
     fallback_lr: float | None = None,
-    fallback_weight_decay: float = 0.05,
     momentum: float = 0.95,
     fallback_betas: tuple[float, float] = (0.9, 0.95),
     eps: float = 1e-8,
@@ -953,7 +934,6 @@ def build_param_groups(
                 "use_matrix_update": True,
                 "lr": matrix_lr,
                 "base_lr": matrix_lr,
-                "weight_decay": 0.0,
                 "momentum": momentum,
                 "pmuoneq_beta": pmuoneq_beta,
                 "row_gamma": row_gamma,
@@ -973,7 +953,6 @@ def build_param_groups(
                 "use_matrix_update": False,
                 "lr": fallback_lr,
                 "base_lr": fallback_lr,
-                "weight_decay": fallback_weight_decay,
                 "betas": fallback_betas,
                 "eps": eps,
                 "use_external_lr": use_external_lr,
