@@ -37,13 +37,16 @@ Protocol and key settings:
 | optimizer steps | 1000 |
 | matrix LR | `8e-3` |
 | fallback LR | `8e-4` |
+| momentum | `0.90` |
 | PMuonEq beta | `0.90` |
 | PMuonEq row/col gamma | `0.35 / 0.05` |
 | NorMuon beta2 | `0.93` |
 | NorMuon orientation | `row` |
 | aspect multiplier | enabled |
+| fallback epsilon / weight decay | `1e-8 / 0.05` |
 
 Full reproduction command and caveats are in `ALGORITHM_RESULTS.md`.
+The golden standalone optimizer reproduction is in `GOLDEN_VALIDATION.md`.
 
 ## Peer-Feedback Comparison
 

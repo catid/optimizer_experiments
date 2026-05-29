@@ -24,6 +24,7 @@ exact hyperparameters were:
 optimizer = soda_pmuoneq_normuon
 matrix_lr = 8e-3
 fallback_adam_lr = 8e-4
+momentum = 0.90
 pmuoneq_beta = 0.90
 row_gamma = 0.35
 col_gamma = 0.05
@@ -33,14 +34,17 @@ normuon_aspect_scale = true
 warmup_steps = 10
 matrix_weight_decay = 0.0
 fallback_weight_decay = 0.05
+fallback_eps = 1e-8
 per_gpu_batch = 128
 gradient_accumulation = 1
 effective_global_batch = 512
 ```
 
 Final readout for that run: `76.69%` CIFAR-10 acc@1, `0.7269` validation loss,
-`1.2382` train loss, and `4009` samples/s. See `ALGORITHM_RESULTS.md` for the
-full command, comparison table, artifacts, and caveats.
+`1.2382` train loss, and `4009` samples/s. The golden optimizer reproduced this
+with `76.69000268554687` acc@1, `0.7268316862838609` loss, and identical
+`1.2382302932739258` train loss. See `ALGORITHM_RESULTS.md` for the original
+comparison and `GOLDEN_VALIDATION.md` for the golden reproduction.
 
 ## Algorithm Summary
 
@@ -74,7 +78,14 @@ replicate next.
   imports.
 - `direct_soda_pmuoneq_normuon.py`: direct SODA-PMuonEq-NorMuon standalone
   optimizer with row+aspect defaults.
+- `golden_soda_pmuoneq_normuon.py`: final standalone library containing only
+  the best-result algorithm path, with no AMUSE/SF/MiMuon/aspect-toggle
+  ablations.
+- `GOLDEN_VALIDATION.md`: unit, parity, and full 1000-step ViT-5/CIFAR-10
+  reproduction of the stored best result using the golden optimizer.
 - `test_equimuse_normuon.py`: lightweight unit tests for the standalone file.
+- `test_golden_soda_pmuoneq_normuon.py`: parity and checkpoint tests for the
+  golden optimizer.
 - `ALGORITHM_RESULTS.md`: exact winning CIFAR-10 recipe, command, protocol, and
   comparison table.
 - `VALIDATION.md`: validation result from the source workstation.
@@ -143,6 +154,20 @@ optimizer = SodaPmuonEqNorMuon(groups, warmup_steps=10)
 
 This direct optimizer has no schedule-free mode swap; `train()` and `eval()` are
 no-op compatibility methods.
+
+## Minimal Golden Usage
+
+```python
+from golden_soda_pmuoneq_normuon import GoldenOptimizer, build_param_groups
+
+groups = build_param_groups(model.named_parameters())
+optimizer = GoldenOptimizer(groups)
+```
+
+The golden file fixes the algorithm to the measured best-result path:
+row+column PMuonEq, GramNS, row-wise NorMuon, and the post-NorMuon aspect
+multiplier. It keeps only numeric hyperparameters such as LR, momentum, and
+PMuonEq/NorMuon EMA strengths.
 
 ## Checkpoint And Mode Semantics
 

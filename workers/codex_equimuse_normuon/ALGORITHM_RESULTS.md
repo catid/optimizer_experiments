@@ -67,7 +67,7 @@ but it was not the best performer in the matched ViT-5/CIFAR-10 run.
 | fallback Adam/RMS LR | `8e-4` |
 | matrix LR | `8e-3` |
 | warmup steps | `10` |
-| momentum | `0.95` |
+| momentum | `0.90` |
 | PMuonEq beta | `0.90` |
 | PMuonEq row gamma | `0.35` |
 | PMuonEq column gamma | `0.05` |
@@ -76,6 +76,7 @@ but it was not the best performer in the matched ViT-5/CIFAR-10 run.
 | aspect multiplier | enabled |
 | matrix weight decay | `0.0` |
 | fallback weight decay | `0.05` |
+| fallback epsilon | `1e-8` |
 | SODA lambda scale | `1.0` |
 | SODA lambda power | `1.0` |
 | GramNS steps | `5` |
@@ -113,6 +114,11 @@ Other training settings:
 Direct SODA-PMuonEq-NorMuon + aspect beat the matched AdamW baseline by
 `+13.63` acc@1 points and `-0.3622` validation loss in this 1000-step proxy
 run. AdamW remained faster per step.
+
+The final standalone golden implementation in `golden_soda_pmuoneq_normuon.py`
+reproduced this result in a full 1000-step 4-GPU validation run:
+`76.69000268554687` acc@1, `0.7268316862838609` loss, and identical
+`1.2382302932739258` train loss. See `GOLDEN_VALIDATION.md`.
 
 ## Reproduction Command
 
