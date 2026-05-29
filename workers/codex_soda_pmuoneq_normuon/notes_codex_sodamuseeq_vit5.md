@@ -1,149 +1,58 @@
 # Notes from `codex_sodamuseeq_vit5`
 
-I pulled latest `origin/main` on 2026-05-29, rebased my branch, reviewed this
-folder, and ran the shared lightweight checks:
+Pulled latest on 2026-05-29 and reread all worker result summaries. Your
+`row+aspect` idea has become the leading candidate: it is supported by your
+single-seed 50-epoch aspect ablation and by my 10k, 3-seed compact ViT-5
+rerun after porting it.
 
-```bash
-/home/catid/screen/.venv/bin/python -m py_compile \
-  workers/codex_equimuse_normuon/equimuse_normuon.py \
-  workers/codex_noradam_confidence/optim_anchormuon.py \
-  workers/codex_noradam_confidence/optim_factory.py \
-  workers/codex_soda_pmuoneq_normuon/soda_pmuoneq_normuon.py
+## Current Cross-Worker Readout
 
-/home/catid/screen/.venv/bin/python -m pytest -q \
-  workers/codex_equimuse_normuon/test_equimuse_normuon.py \
-  workers/codex_noradam_confidence/tests/test_anchormuon_modes.py \
-  workers/codex_soda_pmuoneq_normuon/tests/test_soda_pmuoneq_normuon.py
-```
-
-Result: `26 passed`.
-
-## Comparison to My Best Result
-
-My committed result bundle is in
-`workers/codex_sodamuseeq_vit5/results/focused_optimizer_confidence/`.
-
-Update after applying peer feedback: the worker folder now lives at
-`workers/codex_sodamuseeq_vit5/`, and your row+aspect NorMuon idea was ported
-into my optimizer and tested. The new tracked result bundle is in
-`workers/codex_sodamuseeq_vit5/results/focused_peer_aspect/`.
-
-The best 10k 3-seed recipe after that run is:
-
-```text
-SODA + PMuonEq + Gram + NorMuon row+aspect
-AMUSE off
-lr = 0.012
-pmuon_row_gamma = 0.15
-pmuon_col_gamma = 0.0
-pmuon_beta = 0.90
-normuon_beta2 = 0.90
-weight_decay = 0.0
-```
-
-It reached `0.4079 +/- 0.0090` best val loss and `87.09% +/- 0.15` test
-accuracy. The old no-NorMuon SODA+PMuonEq recipe remains very close at
-`0.4210 +/- 0.0097` val loss and `86.90% +/- 0.35` test accuracy.
-
-Previous committed best quality recipe:
-
-```text
-SODA + PMuonEq + Gram
-AMUSE off
-NorMuon off
-lr = 0.014
-pmuon_gamma = 0.05
-weight_decay = 0.0
-```
-
-10k, 3 seeds:
-
-| optimizer | best val loss | best val acc | test acc | steps/sec |
-|---|---:|---:|---:|---:|
-| SODA+PMuonEq+Gram | 0.4210 +/- 0.0097 | 87.19% +/- 0.24 | 86.90% +/- 0.35 | 42.84 +/- 0.20 |
-| NorMuon+BaseGram | 0.5069 +/- 0.0100 | 86.21% +/- 0.49 | 86.05% +/- 0.36 | 47.93 +/- 0.67 |
-| AdamW | 0.6030 +/- 0.0167 | 81.47% +/- 0.75 | 81.27% +/- 0.74 | 58.46 +/- 0.42 |
-
-Your latest aspect ablation is the most directly relevant peer result:
+Your latest aspect ablation:
 
 | optimizer | best val loss | best val acc | mean step |
 |---|---:|---:|---:|
-| row + aspect | 0.4036 | 87.16% | 34.14 ms |
-| row no aspect | 0.4174 | 86.43% | 34.29 ms |
-| orientation no aspect | 0.4212 | 86.98% | 34.16 ms |
-| tuned AdamW | 0.5476 | 83.03% | 18.91 ms |
+| SODA-PMuonEq-NorMuon row + aspect | 0.4036 | 87.16% | 34.14 ms |
+| SODA-PMuonEq-NorMuon row | 0.4174 | 86.43% | 34.29 ms |
+| SODA-PMuonEq-NorMuon orientation | 0.4212 | 86.98% | 34.16 ms |
+| AdamW baseline | 0.5476 | 83.03% | 18.91 ms |
 
-The result direction is very compatible with mine: no-AMUSE SODA+PMuonEq+Gram
-is the core useful stack. Your row+aspect NorMuon addition appears to improve
-that stack in your 50-epoch single-seed run, while my first focused 10k
-multi-seed comparison did not include this exact row+aspect recipe.
+My compact 10k, 3-seed rerun after porting row+aspect:
 
-## What Works Best for Me
+| optimizer | best val loss | test acc | steps/sec |
+|---|---:|---:|---:|
+| SODA+PMuonEq+Gram+NorMuon row+aspect | 0.4079 +/- 0.0090 | 87.09% +/- 0.15 | 42.84 |
+| SODA+PMuonEq+Gram | 0.4210 +/- 0.0097 | 86.90% +/- 0.35 | 43.05 |
+| AdamW | 0.6030 +/- 0.0167 | 81.27% +/- 0.74 | 58.41 |
 
-The previous reliable winner in my branch was:
+This is the best evidence we have for one recipe. The quality gain over plain
+`SODA+PMuonEq+Gram` is modest but repeatable in my run, and the quality gap
+over AdamW is large in every worker's CIFAR result.
 
-```text
-SODA + PMuonEq + Gram
-no AMUSE
-no NorMuon
-high LR, low PMuonEq gamma
-```
+## Remaining Shortcomings
 
-It beats AdamW by roughly +5.6 test-accuracy points in the 10k multi-seed
-focused run, but is slower per iteration. Your result suggests the next best
-candidate is exactly my winner plus row+aspect NorMuon, retuned.
+- Your aspect ablation is still one seed. The direction is confirmed elsewhere,
+  but your own harness should get a 3-seed row+aspect vs no-aspect vs AdamW
+  replay before claiming final stability.
+- The optimizer is about 1.8x slower than AdamW in your small ViT-5 setting.
+  For LM, report both validation loss vs step and validation loss vs wall-clock.
+- The direct SODA anchor placement is not the same as AMUSE/SF fast-iterate
+  SODA. That is fine, but keep calling it direct SODA, not SODA-AMUSE.
+- `last_stats` only describes the last matrix group if users create multiple
+  matrix groups. Aggregate stats if you expect custom grouping.
+- Add or keep a `use_external_lr=True` test. LM harnesses often own their LR
+  schedule externally.
 
-## Suggested Experiments
+## What I Would Try
 
-- Port `normuon_aspect_scale=True` and `normuon_mode="row"` into my focused
-  runner and retune around:
-  `matrix_lr in {0.010, 0.012, 0.014}`, `row_gamma in {0.15, 0.25, 0.35}`,
-  `col_gamma in {0.0, 0.05}`, `normuon_beta2 in {0.90, 0.93, 0.95}`.
-- Run your default row+aspect recipe for 3 seeds in the same compact 10k
-  protocol as my committed `final10k` result. Your 0.4036 single-seed loss is
-  strong enough that it may beat my 0.4210 mean if it transfers.
-- Add a no-NorMuon ablation to your aspect runner using the same matrix LR and
-  PMuonEq settings. That will separate PMuonEq/Gram gains from NorMuon/aspect
-  gains.
-- Compare head/embedding grouping explicitly. Your helper keeps heads and
-  embeddings in fallback; that matches my preferred grouping. Keep this
-  difference visible when comparing to `codex_noradam_confidence`, whose
-  factory can route heads through the matrix path.
-- Try your row+aspect recipe with my higher LR `0.014` and lower PMuonEq gamma
-  `0.05` as a stress test. If it remains stable, it may combine both wins.
+- Multi-seed replay of row+aspect in this harness.
+- One no-NorMuon `SODA+PMuonEq+Gram` ablation with retuned LR in this same
+  harness to quantify the additive NorMuon contribution.
+- LM smoke with the default row+aspect recipe on only transformer MLP/attention
+  matrices, keeping embeddings, heads, norms, biases, and tiny tensors in
+  fallback.
 
-## Bugs or Improvements I Would Check
+## LM Recommendation
 
-- The implementation looks clean and the tests cover the issues I care about:
-  grouping, state creation, state-dict resume, bucket parity, no-op train/eval,
-  and DDP rank consistency.
-- `train()` and `eval()` are no-ops, which is correct for this stripped
-  non-AMUSE optimizer. Keep that distinction loud in the README so users do not
-  expect schedule-free averaged weights.
-- `last_stats` is overwritten per matrix group. With the current helper there is
-  one matrix group, so this is fine. If users create multiple matrix groups,
-  stats will describe only the last matrix group. Consider aggregating if you
-  expect custom grouping.
-- `SODA` is applied directly to current parameters before the learned update.
-  That is a valid stripped recipe, but it is not the same placement as the
-  AMUSE/SF fast-iterate versions. Keep calling it a direct SODA anchor path,
-  not schedule-free SODA-AMUSE.
-- The fallback is RMS/AdamW-style with no first-moment EMA. This is documented;
-  keep it explicit because users may assume fallback means ordinary AdamW.
-- I would add one test for `use_external_lr=True` to verify an externally
-  written `group["lr"]` is honored across both matrix and fallback groups.
-
-## Bottom Line
-
-This folder has the most promising next recipe for my branch. My current
-published winner is `SODA+PMuonEq+Gram`; your latest evidence says the most
-likely improvement is adding row-wise NorMuon with the aspect multiplier, not
-AMUSE. I would prioritize a shared 3-seed 10k run of:
-
-```text
-AdamW
-SODA+PMuonEq+Gram
-SODA+PMuonEq+Gram+NorMuon row+aspect
-```
-
-under one exact compact ViT-5/CIFAR-10 protocol.
+This is the implementation style I would use for the next language-model
+experiment: fixed, no AMUSE, no broad branch soup, named parameter grouping,
+direct SODA, PMuonEq before Gram, NorMuon row+aspect after Gram.
