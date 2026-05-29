@@ -82,6 +82,7 @@ class TrialConfig:
     sfplus_c_warmup: int = 0
     sfplus_r: float = 0.0
     sfplus_weight_lr_power: float = 2.0
+    external_lr: bool = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -108,6 +109,7 @@ def parse_args() -> argparse.Namespace:
             "root_soda_ablation",
             "root_lr_schedule_sweep",
             "root_fallback_modes",
+            "cifar5_compare",
             "sfplus_combo20",
             "component_ablation",
         ],
@@ -506,6 +508,75 @@ def trial_grid(preset: str) -> list[TrialConfig]:
                 fallback_weight_decay=wd,
             ))
         return trials
+    if preset == "cifar5_compare":
+        trials = [
+            TrialConfig(
+                "adamw_cosine_lr0.004_wd0.001",
+                "adamw",
+                4e-3,
+                lr_schedule="cosine",
+                weight_decay=0.001,
+            ),
+            TrialConfig(
+                "previous_best_rms_wsd_lr0.012_flr1_b2_0.95",
+                "root",
+                1.2e-2,
+                lr_schedule="wsd",
+                soda="all",
+                row_gamma=0.35,
+                pmuon_beta=0.90,
+                momentum=0.95,
+                normuon=True,
+                normuon_beta=0.93,
+                amuse=False,
+                root_grouping="named",
+                root_normuon_mode="row",
+                fallback_mode="rms",
+                fallback_lr_mult=1.0,
+                fallback_beta1=0.90,
+                fallback_beta2=0.95,
+            ),
+            TrialConfig(
+                "atan2_best_wsd_lr0.014_flr0.5_b2_0.95",
+                "root",
+                1.4e-2,
+                lr_schedule="wsd",
+                soda="all",
+                row_gamma=0.35,
+                pmuon_beta=0.90,
+                momentum=0.95,
+                normuon=True,
+                normuon_beta=0.93,
+                amuse=False,
+                root_grouping="named",
+                root_normuon_mode="row",
+                fallback_mode="atan2",
+                fallback_lr_mult=0.5,
+                fallback_beta1=0.90,
+                fallback_beta2=0.95,
+            ),
+        ]
+        for lr in [0.006, 0.008, 0.010, 0.012, 0.014]:
+            for wd in [0.0, 0.001, 0.005]:
+                trials.append(TrialConfig(
+                    f"plain_muon_wsd_lr{lr:g}_wd{wd:g}",
+                    "anchormuon",
+                    lr,
+                    lr_schedule="wsd",
+                    weight_decay=wd,
+                    soda="none",
+                    pmuon_eq=False,
+                    use_gram=True,
+                    row_gamma=0.0,
+                    col_gamma=0.0,
+                    pmuon_beta=0.90,
+                    momentum=0.95,
+                    amuse=False,
+                    mimuon=False,
+                    normuon=False,
+                    external_lr=True,
+                ))
+        return trials
     if preset == "sfplus_combo20":
         trials = [
             TrialConfig(
@@ -815,6 +886,13 @@ def trial_family(cfg: TrialConfig) -> str:
     if cfg.optimizer == "root":
         if cfg.name.startswith("fallback_") or "fallback_rms" in cfg.name or cfg.fallback_mode != "rms":
             return f"root_fallback_{cfg.fallback_mode}"
+    if cfg.name.startswith("plain_muon_") or "_plain_muon_" in cfg.name:
+        return "plain_muon"
+    if cfg.name.startswith("previous_best_rms_") or "_previous_best_rms_" in cfg.name:
+        return "previous_best_rms"
+    if cfg.name.startswith("atan2_best_") or "_atan2_best_" in cfg.name:
+        return "atan2_best"
+    if cfg.optimizer == "root":
         return f"root_{cfg.root_grouping}_{cfg.root_normuon_mode}_{cfg.soda}"
     if cfg.optimizer == "golden":
         return "golden_normuon"
@@ -1082,7 +1160,7 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             _anchor_param_groups(model, cfg.weight_decay),
             lr=cfg.lr,
             warmup_steps=args.warmup_steps,
-            use_external_lr=False,
+            use_external_lr=cfg.external_lr,
             weight_decay=cfg.weight_decay,
             soda=cfg.soda,
             pmuon_eq=cfg.pmuon_eq,
@@ -1277,7 +1355,7 @@ def run_worker(args: argparse.Namespace) -> None:
             for batch_idx, (images, targets) in enumerate(train_loader):
                 if global_step >= total_steps:
                     break
-                if cfg.optimizer in {"adamw", "root"}:
+                if cfg.optimizer in {"adamw", "root"} or cfg.external_lr:
                     lr = scheduled_lr(
                         global_step,
                         total_steps,
@@ -1448,6 +1526,7 @@ def run_worker(args: argparse.Namespace) -> None:
         "sfplus_c_warmup": cfg.sfplus_c_warmup,
         "sfplus_r": cfg.sfplus_r,
         "sfplus_weight_lr_power": cfg.sfplus_weight_lr_power,
+        "external_lr": cfg.external_lr,
         "avg_step_ms": 1000.0 * total_train_seconds / max(global_step, 1),
         "overall_examples_per_sec": total_examples_seen / max(total_train_seconds, 1e-9),
         "elapsed_sec": time.perf_counter() - started,
@@ -1625,6 +1704,7 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
             sfplus_c_warmup=int(float(row.get("sfplus_c_warmup", 0))),
             sfplus_r=float(row.get("sfplus_r", 0.0)),
             sfplus_weight_lr_power=float(row.get("sfplus_weight_lr_power", 2.0)),
+            external_lr=parse_bool(row.get("external_lr", False)),
         )
         fam = trial_family(cfg)
         current = by_family.get(fam)
@@ -1661,6 +1741,12 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
                     parts = trial.split("_")
                     mode = parts[1].upper() if len(parts) > 1 else "fallback"
                     return f"AnchorMuon {mode} fallback{seed_suffix}"
+                if trial.startswith("plain_muon_"):
+                    return f"Plain Muon{seed_suffix}"
+                if trial.startswith("previous_best_rms_"):
+                    return f"Previous best RMS{seed_suffix}"
+                if trial.startswith("atan2_best_"):
+                    return f"AnchorMuon AdamATan2{seed_suffix}"
                 component = re.match(r"(?:final_)?component_(full|no_soda|no_pmuoneq|no_gram|no_normuon|adamw)", trial)
                 if component:
                     labels = {
@@ -1813,6 +1899,7 @@ def summaries_to_trials(rows: Iterable[dict]) -> list[TrialConfig]:
             sfplus_c_warmup=int(float(row.get("sfplus_c_warmup", 0))),
             sfplus_r=float(row.get("sfplus_r", 0.0)),
             sfplus_weight_lr_power=float(row.get("sfplus_weight_lr_power", 2.0)),
+            external_lr=parse_bool(row.get("external_lr", False)),
         ))
     return trials
 

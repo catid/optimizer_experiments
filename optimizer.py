@@ -21,25 +21,27 @@ tensors. The default remains the RMS fallback used by the original winning
 recipe; ``"atan2"`` and ``"adamc"`` are available for narrow fallback-path
 experiments and do not alter the matrix direction.
 
-The current best-supported recipe comes from the cleanest cross-worker evidence:
-a proper CIFAR-10 train/validation/test split with the official test split
-evaluated only once at the end:
+The current best-supported recipe comes from a CIFAR-10 train/validation/test
+split with the official test split evaluated only once at the end:
 
-    trial id: normuon_mlr0.008_rg0.35_cg0_mom0.95_pb0.9_nb0.93
     model:    vit5_micro, 458,858 trainable parameters
     data:     CIFAR-10 45k train / 5k validation / official 10k test
     training: 50 epochs, 4,350 steps, batch size 512
-    seeds:    123, 456, 789
+    seeds:    123, 456, 789, 101112, 131415
+    schedule: trainer-side WSD with 80-step warmup
 
-    official test loss: 0.4607 +/- 0.0196
-    official test acc:  84.77% +/- 0.65
-    step time:          19.95 ms
+    lr=0.012, fallback_mode="rms", row_gamma=0.35,
+    pmuoneq_beta=0.90, normuon_beta2=0.93
 
-A later single-seed CIFAR-10 follow-up found that
-``fallback_mode="atan2"``, ``lr=0.014``, and ``fallback_lr=0.007`` improved the
-50-epoch official test result on the ViT-5 micro harness. That result is
-promising but not yet the constructor default because it has not had the same
-multi-seed replay.
+    official test loss: 0.4203 +/- 0.0239
+    official test acc:  87.61% +/- 0.48
+    step time:          17.27 +/- 0.07 ms
+
+A 5-seed CIFAR-10 follow-up found that ``fallback_mode="atan2"``,
+``lr=0.014``, and ``fallback_lr=0.007`` slightly improved final validation
+accuracy/loss but was essentially tied with RMS on official test accuracy
+within seed variance. RMS remains the constructor default because it was the
+slightly better mean official-test recipe in that replay.
 
 The aspect-scaled variant was close and sometimes won on other CIFAR proxies,
 but no-aspect won the cleanest official-test protocol. This root file keeps
@@ -233,6 +235,12 @@ not a verbatim copy of any one paper:
   especially ``HTMuon: Improving Muon via Heavy-Tailed Spectral Correction``
   (arXiv:2603.10067). AnchorMuon applies it after GramNS and preserves the
   whole-matrix Frobenius norm.
+* The optional AdamATan2 fallback follows Appendix C.5 of
+  ``Scaling Exponents Across Parameterizations and Optimizers``
+  (Everett et al., arXiv:2407.05872), which replaces Adam's
+  ``m / sqrt(v)`` update with ``atan2(m, sqrt(v))`` to remove the additive
+  epsilon sensitivity and make the update scale-invariant up to precision
+  limits.
 * Learning-rate schedules such as warmup+constant, WSD, linear decay, and
   cosine decay are intentionally trainer-side policies. AnchorMuon consumes the
   current param-group ``lr`` and does not implement a scheduler internally.
