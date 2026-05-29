@@ -70,7 +70,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preset",
         default="quick",
-        choices=["smoke", "quick", "full", "sweep", "focused20", "confidence", "feedback"],
+        choices=[
+            "smoke",
+            "quick",
+            "full",
+            "sweep",
+            "focused20",
+            "confidence",
+            "feedback",
+            "best_cifar10",
+        ],
     )
     parser.add_argument("--only", default="", help="Regex filter for trial names")
     parser.add_argument("--max-trials", type=int, default=0)
@@ -229,6 +238,45 @@ def trial_grid(preset: str) -> list[TrialConfig]:
     ]
     if preset == "focused20":
         return focused20
+    best_cifar10 = [
+        TrialConfig(
+            "adamw_cosine_lr0.004_wd0.001",
+            "adamw",
+            4e-3,
+            lr_schedule="cosine",
+            weight_decay=0.001,
+        ),
+        TrialConfig(
+            "normuon_mlr0.008_rg0.35_cg0_mom0.95_pb0.9_nb0.93",
+            "anchormuon",
+            8e-3,
+            soda="all",
+            row_gamma=0.35,
+            col_gamma=0.0,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.93,
+            normuon_aspect_scale=False,
+            amuse=False,
+        ),
+        TrialConfig(
+            "normuon_aspect_mlr0.008_rg0.3_cg0.05_mom0.95_pb0.9_nb0.95",
+            "anchormuon",
+            8e-3,
+            soda="all",
+            row_gamma=0.30,
+            col_gamma=0.05,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.95,
+            normuon_aspect_scale=True,
+            amuse=False,
+        ),
+    ]
+    if preset == "best_cifar10":
+        return best_cifar10
     feedback = [
         TrialConfig("adamw_cosine_lr0.004_wd0.001", "adamw", 4e-3, lr_schedule="cosine", weight_decay=0.001),
     ]

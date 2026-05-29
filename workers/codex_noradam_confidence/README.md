@@ -37,6 +37,20 @@ commit b009f03 Compare NorMuon base against AdamW
 Latest result summary:
 `ALGORITHM_RESULTS.md` and `results/cifar10_proper_split_20260529/summary.md`.
 
+Current best version to cite:
+
+```text
+normuon_mlr0.008_rg0.35_cg0_mom0.95_pb0.9_nb0.93
+```
+
+This is the no-aspect AnchorMuon + SODA + row-only PMuonEq + five-step GramNS +
+NorMuon recipe. It was evaluated on `vit5_micro` with CIFAR-10 45k/5k
+train/validation split, official 10k test evaluated at the end, batch size 512,
+50 epochs, seeds `123,456,789`, BF16 autocast, channels-last tensors, and 16
+dataloader workers. It is currently best by official test accuracy:
+`84.77% +/- 0.65`, compared with `79.28% +/- 0.23` for the tuned AdamW cosine
+baseline.
+
 Latest diagrams:
 
 - Loss curves: `results/cifar10_proper_split_20260529/final50/val_loss.png`

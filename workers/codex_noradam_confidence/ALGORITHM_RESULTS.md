@@ -12,6 +12,59 @@ The best measured recipe in this folder disables AMUSE/SF iterate averaging and
 uses AnchorMuon as a SODA-regularized Muon-family optimizer with row-wise
 PMuonEq and NorMuon normalization.
 
+## Current Monorepo Winner
+
+The specific version to cite is:
+
+```text
+normuon_mlr0.008_rg0.35_cg0_mom0.95_pb0.9_nb0.93
+```
+
+It is **not** the aspect-scaled variant. The aspect run had slightly better
+best-validation checkpoint metrics, but the no-aspect version is the current
+best by held-out official CIFAR-10 test accuracy.
+
+Exact scope of the claim:
+
+- model: `vit5_micro`
+- parameters: 458,858 trainable parameters
+- dataset: CIFAR-10, 32x32 images
+- split: 45,000 train examples and 5,000 validation examples from
+  CIFAR-10 `train=True`
+- final test: official CIFAR-10 `train=False` 10,000-example test split,
+  evaluated only at the end of selected final runs
+- final training: 50 epochs, 4,350 optimizer steps, seeds `123,456,789`
+- batch size: 512
+- dataloader workers: 16
+- precision/layout: BF16 autocast with channels-last tensors
+- hardware used: two NVIDIA RTX PRO 6000 Blackwell Workstation Edition GPUs,
+  scheduled as one trial per visible GPU
+- software used: PyTorch `2.13.0.dev20260506+cu130`
+- selection protocol: 17-trial HPO over AdamW, no-aspect NorMuon, and
+  aspect-scaled NorMuon for 12 epochs on the train/validation split, followed
+  by a three-seed 50-epoch replay of selected configurations
+
+The exact optimizer settings for the winner are:
+
+```text
+optimizer = AnchorMuon
+lr = 8e-3
+weight_decay = 0.05
+amuse = False
+soda = "all"
+pmuon_eq = True
+pmuon_beta = 0.90
+row_gamma = 0.35
+col_gamma = 0.0
+momentum = 0.95
+normuon = True
+normuon_beta = 0.93
+normuon_aspect_scale = False
+mimuon = False
+ns_steps = 5
+sync_diagnostics = False
+```
+
 ## Algorithm
 
 For each matrix-like parameter, flatten tensors to a matrix
@@ -110,6 +163,11 @@ official test accuracy. The aspect-scaled variant is close and has better
 best-validation checkpoint metrics, but it did not improve mean official test
 accuracy in this three-seed replay. AdamW remains much faster per step but
 substantially worse on loss and accuracy.
+
+To reproduce or rerun the directly comparable set without reconstructing the HPO
+grid, use the runner's `--preset best_cifar10`. That preset contains the exact
+winner above, the closest aspect-scaled near miss, and the tuned AdamW cosine
+baseline.
 
 Primary result bundle:
 
