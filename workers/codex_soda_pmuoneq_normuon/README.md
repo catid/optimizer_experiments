@@ -7,6 +7,9 @@ This folder contains my standalone optimizer contribution to the shared
 
 - `ALGORITHM_RESULTS.md` - compact algorithm, tuned recipe, final comparison
   table, artifact list, and validation commands.
+- `golden_soda_pmuoneq_normuon.py` - final golden library file for the
+  repo-wide winning no-aspect recipe selected for the next LM round.
+- `GOLDEN_VALIDATION.md` - validation record for the golden library.
 - `soda_pmuoneq_normuon.py` - a focused, copyable PyTorch optimizer file.
 - `tests/test_soda_pmuoneq_normuon.py` - self-contained CPU tests for grouping,
   finite updates, state creation, no-op train/eval compatibility, state-dict
@@ -35,6 +38,17 @@ This folder contains my standalone optimizer contribution to the shared
 For the compact handoff version of the algorithm and final table, start with
 `ALGORITHM_RESULTS.md`. The rest of this README keeps the longer experiment
 history and reproduction commands.
+
+For the final no-ablation library intended for the next language-modeling
+round, use `golden_soda_pmuoneq_normuon.py`. It implements only:
+
+```text
+SODA + row-only PMuonEq + GramNS + NorMuon
+AMUSE off, MiMuon off, column PMuonEq off, aspect scaling off
+```
+
+The older `soda_pmuoneq_normuon.py` remains available to reproduce the local
+row+aspect CIFAR proxy and other ablations.
 
 Best confirmed version:
 
