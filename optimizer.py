@@ -137,6 +137,12 @@ Do not tune everything at once. Treat the knobs in three tiers:
             reproduced proper-split CIFAR recipe. Increase it if early steps
             are unstable; shorten it only after a controlled ablation.
 
+        min_matrix_dim
+            Safety threshold for the spectral path. A 2D parameter must have
+            both flattened matrix dimensions at least this large unless a custom
+            matrix_filter explicitly routes it. This keeps tiny projections out
+            of GramNS by default.
+
     Tier 3, normally leave fixed:
         momentum = 0.95
             Momentum feeding the Nesterov-style matrix source.
@@ -188,7 +194,7 @@ from typing import Any, TypeAlias
 import torch
 
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 try:
     from torch.optim.optimizer import ParamsT
@@ -302,6 +308,16 @@ def _is_default_fallback_name(name: str) -> bool:
     if any(token in lower for token in known_head_tokens):
         return True
     return lower == "head.weight" or lower.endswith(".head.weight")
+
+
+def _is_matrix_like_parameter(param: torch.Tensor, *, min_matrix_dim: int) -> bool:
+    """Return whether ``param`` is large enough for the spectral matrix path."""
+
+    if param.ndim < 2 or not param.is_floating_point():
+        return False
+    rows = int(param.shape[0])
+    cols = int(param.numel() // max(rows, 1))
+    return min(rows, cols) >= int(min_matrix_dim)
 
 
 class GramNewtonSchulz:
@@ -431,6 +447,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         ns_epsilon: float = 1e-7,
         ns_compute_dtype: torch.dtype | None = None,
         use_external_lr: bool = False,
+        min_matrix_dim: int = 2,
         matrix_filter: Callable[[str, torch.nn.Parameter], bool] | None = None,
     ) -> None:
         if isinstance(params, torch.nn.Module):
@@ -454,6 +471,8 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             raise ValueError("epsilon values must be positive")
         if fallback_weight_decay < 0.0:
             raise ValueError("fallback_weight_decay must be non-negative")
+        if min_matrix_dim < 1:
+            raise ValueError("min_matrix_dim must be >= 1")
         if soda_lambda_scale < 0.0:
             raise ValueError("soda_lambda_scale must be non-negative")
         if soda_lambda_power <= 0.0:
@@ -472,6 +491,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             normuon_beta2=normuon_beta2,
             normuon_eps=normuon_eps,
             use_external_lr=use_external_lr,
+            min_matrix_dim=min_matrix_dim,
             matrix_filter=matrix_filter,
         )
         super().__init__(prepared, defaults={})
@@ -512,6 +532,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         normuon_beta2: float,
         normuon_eps: float,
         use_external_lr: bool,
+        min_matrix_dim: int,
         matrix_filter: Callable[[str, torch.nn.Parameter], bool] | None,
     ) -> list[dict[str, Any]]:
         items = list(params)
@@ -536,6 +557,8 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                 pmuoneq_eps=pmuoneq_eps,
                 normuon_beta2=normuon_beta2,
                 normuon_eps=normuon_eps,
+                use_external_lr=use_external_lr,
+                min_matrix_dim=min_matrix_dim,
                 matrix_filter=matrix_filter,
             )
         if isinstance(items[0], dict):
@@ -562,10 +585,15 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
 
         matrix_params: list[torch.Tensor] = []
         fallback_params: list[torch.Tensor] = []
+        seen_params: set[int] = set()
         for p in items:  # type: ignore[assignment]
             if not isinstance(p, torch.Tensor):
                 raise TypeError("params must be tensors or optimizer param-group dictionaries")
-            if p.requires_grad and p.ndim >= 2:
+            ident = id(p)
+            if ident in seen_params:
+                continue
+            seen_params.add(ident)
+            if p.requires_grad and _is_matrix_like_parameter(p, min_matrix_dim=min_matrix_dim):
                 matrix_params.append(p)
             else:
                 fallback_params.append(p)
@@ -813,6 +841,8 @@ def build_soda_pmuoneq_normuon_param_groups(
     pmuoneq_eps: float = 1e-6,
     normuon_beta2: float = 0.93,
     normuon_eps: float = 1e-10,
+    use_external_lr: bool = False,
+    min_matrix_dim: int = 2,
     matrix_filter: Callable[[str, torch.nn.Parameter], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Split named parameters into matrix and fallback groups.
@@ -826,6 +856,8 @@ def build_soda_pmuoneq_normuon_param_groups(
     conservatively routed to the fallback group.
     """
 
+    if min_matrix_dim < 1:
+        raise ValueError("min_matrix_dim must be >= 1")
     fallback_lr = matrix_lr if fallback_lr is None else fallback_lr
 
     matrix_params: list[torch.nn.Parameter] = []
@@ -849,7 +881,9 @@ def build_soda_pmuoneq_normuon_param_groups(
         if matrix_filter is not None:
             use_matrix = any(bool(matrix_filter(name, p)) for name in names)
         else:
-            use_matrix = p.ndim >= 2 and not any(_is_default_fallback_name(name) for name in names)
+            use_matrix = _is_matrix_like_parameter(p, min_matrix_dim=min_matrix_dim) and not any(
+                _is_default_fallback_name(name) for name in names
+            )
         display_name = "|".join(names)
         if use_matrix:
             matrix_params.append(p)
@@ -877,6 +911,7 @@ def build_soda_pmuoneq_normuon_param_groups(
                 "pmuoneq_eps": pmuoneq_eps,
                 "normuon_beta2": normuon_beta2,
                 "normuon_eps": normuon_eps,
+                "use_external_lr": use_external_lr,
             }
         )
     if fallback_params:
@@ -891,6 +926,7 @@ def build_soda_pmuoneq_normuon_param_groups(
                 "weight_decay": fallback_weight_decay,
                 "betas": fallback_betas,
                 "eps": eps,
+                "use_external_lr": use_external_lr,
             }
         )
     return groups

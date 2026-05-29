@@ -116,6 +116,42 @@ def test_named_parameters_constructor_hides_grouping_from_training_code() -> Non
     assert "norm.weight" in fallback_names
 
 
+def test_named_constructor_preserves_external_lr_flag() -> None:
+    model = TinyClassifier()
+    opt = SodaPmuonEqNorMuon(
+        model,
+        matrix_lr=1e-3,
+        fallback_lr=1e-4,
+        warmup_steps=100,
+        use_external_lr=True,
+    )
+    for group in opt.param_groups:
+        group["lr"] = 7e-4
+
+    _run_step(model, opt, 0)
+
+    assert {group["lr"] for group in opt.param_groups} == {7e-4}
+    assert all(group["use_external_lr"] is True for group in opt.param_groups)
+
+
+def test_min_matrix_dim_keeps_tiny_matrices_in_fallback() -> None:
+    params = [
+        ("blocks.0.mlp.fc1.weight", nn.Parameter(torch.zeros(8, 8))),
+        ("blocks.0.router.weight", nn.Parameter(torch.zeros(1, 8))),
+    ]
+    groups = build_soda_pmuoneq_normuon_param_groups(params, min_matrix_dim=2)
+    assert len(groups) == 2
+    assert groups[0]["param_names"] == ["blocks.0.mlp.fc1.weight"]
+    assert groups[1]["param_names"] == ["blocks.0.router.weight"]
+
+
+def test_unnamed_parameter_constructor_deduplicates_shared_tensors() -> None:
+    shared = nn.Parameter(torch.zeros(8, 8))
+    opt = SodaPmuonEqNorMuon([shared, shared], warmup_steps=2)
+    assert len(opt.param_groups) == 1
+    assert len(opt.param_groups[0]["params"]) == 1
+
+
 def test_default_recipe_matches_root_documented_winner() -> None:
     model = TinyClassifier()
     opt = SodaPmuonEqNorMuon(model)

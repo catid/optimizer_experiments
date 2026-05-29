@@ -57,6 +57,7 @@ experiments:
 | `normuon_beta2` | `0.93` | Later | Row second-moment smoothing after GramNS. Try `0.90`, `0.93`, `0.95`. |
 | `fallback_weight_decay` | `0.05` | Later | Applies only to fallback parameters; matrix params use SODA instead. |
 | `warmup_steps` | `80` | Rarely | Increase if early steps are unstable; shorten only by ablation. |
+| `min_matrix_dim` | `2` | Rarely | Keeps tiny 2D tensors out of the spectral path unless a custom filter routes them. |
 | `momentum` | `0.95` | Usually no | Momentum for the matrix source update. |
 | `pmuoneq_beta` | `0.90` | Usually no | EMA for row gradient-power estimates. |
 | `fallback_betas` | `(0.9, 0.95)` | Usually no | RMS/AdamW-style fallback moments. |
