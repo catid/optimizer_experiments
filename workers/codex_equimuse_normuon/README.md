@@ -1,18 +1,44 @@
-# EquiMuse-NorMuon Standalone Optimizer
+# EquiMuse / Direct SODA-PMuonEq-NorMuon Optimizers
 
-This folder contains a single-file PyTorch optimizer recipe extracted from the
-Attractor optimizer experiments:
+This folder contains the Codex EquiMuse optimizer work and the latest
+peer-feedback comparison artifacts. There are two standalone optimizer files:
+
+- `equimuse_normuon.py`: the original schedule-free recipe.
+- `direct_soda_pmuoneq_normuon.py`: the direct no-AMUSE recipe that produced
+  the best result in the latest matched ViT-5/CIFAR-10 run.
+
+## Algorithm Summary
+
+The schedule-free EquiMuse recipe is:
 
 ```text
 SODA-AMUSE + PMuonEq + Gram Newton-Schulz + NorMuon
 ```
 
-The implementation is intentionally not an ablation framework. It keeps the
-selected recipe fixed and exposes only tuning hyperparameters.
+It keeps fast/eval/interpolation sequences (`Z`, `X`, `Y`), evaluates gradients
+at the schedule-free interpolation point, builds a PMuonEq-preconditioned Muon
+matrix direction, orthogonalizes with Gram Newton-Schulz, and applies NorMuon
+row-wise second-moment normalization after the polar step. The optional aspect
+multiplier scales the final learned update, not gradients or GramNS inputs.
+
+The best current recipe is simpler:
+
+```text
+Direct SODA + PMuonEq + Gram Newton-Schulz + NorMuon + aspect
+```
+
+It removes the AMUSE/schedule-free `X/Y/Z` bookkeeping and updates parameters
+directly with a SODA anchor pull plus the same PMuonEq -> GramNS -> NorMuon
+matrix direction. In the matched run this direct path was much stronger than
+schedule-free EquiMuse, so treat it as the current recommended recipe to
+replicate next.
 
 ## Files
 
-- `equimuse_normuon.py`: standalone optimizer, no project-local imports.
+- `equimuse_normuon.py`: schedule-free standalone optimizer, no project-local
+  imports.
+- `direct_soda_pmuoneq_normuon.py`: direct SODA-PMuonEq-NorMuon standalone
+  optimizer with row+aspect defaults.
 - `test_equimuse_normuon.py`: lightweight unit tests for the standalone file.
 - `VALIDATION.md`: validation result from the source workstation.
 - `RESULTS.md`: compact final readout with figure links.
@@ -27,7 +53,7 @@ selected recipe fixed and exposes only tuning hyperparameters.
 - `results/figures/*.png`: validation-loss, train-loss, accuracy, and
   iteration-speed plots.
 
-## Minimal Usage
+## Minimal EquiMuse Usage
 
 ```python
 from equimuse_normuon import EquiMuseNorMuon, build_equimuse_normuon_param_groups
@@ -57,6 +83,29 @@ The optimizer has schedule-free train/eval weights. Call `optimizer.train()`
 before training steps and `optimizer.eval()` before validation/checkpointing if
 you want averaged/eval weights. Both methods return `self`, so chained helper
 code such as `optimizer.eval(); validate(...)` remains compatible.
+
+## Minimal Direct SODA Usage
+
+```python
+from direct_soda_pmuoneq_normuon import (
+    SodaPmuonEqNorMuon,
+    build_soda_pmuoneq_normuon_param_groups,
+)
+
+groups = build_soda_pmuoneq_normuon_param_groups(
+    model.named_parameters(),
+    matrix_lr=8e-3,
+    adam_lr=8e-4,
+    row_gamma=0.35,
+    col_gamma=0.05,
+    normuon_beta2=0.93,
+    normuon_aspect_scale=True,
+)
+optimizer = SodaPmuonEqNorMuon(groups, warmup_steps=10)
+```
+
+This direct optimizer has no schedule-free mode swap; `train()` and `eval()` are
+no-op compatibility methods.
 
 ## Checkpoint And Mode Semantics
 
@@ -164,3 +213,9 @@ The optimizer is DDP-safe because it only consumes already all-reduced local
 parameter gradients. Same-shaped matrix updates are batched for PMuonEq,
 GramNS, and NorMuon; the fallback path uses `torch._foreach_*` operations when
 available.
+
+## Workspace Notes
+
+Peer-review notes that were previously stored as `notes_*.md` have been removed
+from this worker folder. The persistent summary is now in `README.md`,
+`RESULTS.md`, `VALIDATION.md`, and the CSV/PNG artifacts under `results/`.

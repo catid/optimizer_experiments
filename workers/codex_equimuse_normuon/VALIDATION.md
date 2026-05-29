@@ -11,15 +11,34 @@ Checks run before export:
 ```text
 /home/catid/attractor/.venv/bin/python -m py_compile \
   workers/codex_equimuse_normuon/equimuse_normuon.py \
+  workers/codex_equimuse_normuon/direct_soda_pmuoneq_normuon.py \
   workers/codex_equimuse_normuon/test_equimuse_normuon.py
 PYTHONPATH=workers/codex_equimuse_normuon \
   /home/catid/attractor/.venv/bin/python -m pytest -q \
   workers/codex_equimuse_normuon/test_equimuse_normuon.py
+PYTHONPATH=workers/codex_equimuse_normuon \
+  /home/catid/attractor/.venv/bin/python - <<'PY'
+import torch
+from direct_soda_pmuoneq_normuon import (
+    SodaPmuonEqNorMuon,
+    build_soda_pmuoneq_normuon_param_groups,
+)
+model = torch.nn.Sequential(torch.nn.Linear(8, 16), torch.nn.GELU(), torch.nn.Linear(16, 3))
+opt = SodaPmuonEqNorMuon(
+    build_soda_pmuoneq_normuon_param_groups(model.named_parameters()),
+    ns_compute_dtype=torch.float32,
+)
+loss = torch.nn.functional.cross_entropy(model(torch.randn(4, 8)), torch.tensor([0, 1, 2, 1]))
+loss.backward()
+opt.step()
+print("direct_soda_smoke_ok")
+PY
 ```
 
 Results:
 
 - Standalone worker tests: 9 passed.
+- Direct SODA standalone smoke step: passed.
 - Added coverage for:
   - `load_state_dict()` not mutating the caller's state dict;
   - resume parity after optimizer load;

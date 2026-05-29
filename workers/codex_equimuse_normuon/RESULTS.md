@@ -30,7 +30,9 @@ bins, seed 67890, all 4 visible GPUs with DDP.
   -0.0471 validation loss.
 - The direct SODA rows used the peer standalone implementation from
   `workers/codex_soda_pmuoneq_normuon/soda_pmuoneq_normuon.py`, wired into the
-  same ViT-5 harness for an apples-to-apples run.
+  same ViT-5 harness for an apples-to-apples run. That implementation is now
+  mirrored here as `direct_soda_pmuoneq_normuon.py` so this folder contains the
+  code path that produced the best result.
 - This is still single-seed evidence. The next confidence step is a 3-seed
   confirmation of direct SODA-PMuonEq-NorMuon + aspect against AdamW and
   EquiMuse row.
