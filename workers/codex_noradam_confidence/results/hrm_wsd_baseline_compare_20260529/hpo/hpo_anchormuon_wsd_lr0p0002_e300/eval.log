@@ -1,0 +1,4 @@
+Starting evaluationStarting evaluation
+
+{'all': {'accuracy': np.float32(0.43122223), 'exact_accuracy': np.float32(0.0), 'lm_loss': np.float32(2.4483182), 'q_halt_accuracy': np.float32(1.0), 'q_halt_loss': np.float32(0.79446447), 'steps': np.float32(16.0)}}
+[rank0]:[W529 16:55:39.837899727 ProcessGroupNCCL.cpp:1648] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

@@ -1,0 +1,6 @@
+=== RUN hpo_anchormuon_wsd_lr0p00005_e300 ===
+optimizer=anchormuon
+lr=0.00005
+epochs=300
+eval_interval=300
+checkpoint=/tmp/hrm_wsd_compare_hpo_anchormuon_wsd_lr0p00005_e300

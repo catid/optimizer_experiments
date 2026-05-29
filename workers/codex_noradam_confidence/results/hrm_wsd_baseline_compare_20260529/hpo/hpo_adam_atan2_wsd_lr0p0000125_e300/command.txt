@@ -1,0 +1,4 @@
+optimizer=adam_atan2
+lr=0.0000125
+epochs=300
+checkpoint=/tmp/hrm_wsd_compare_hpo_adam_atan2_wsd_lr0p0000125_e300

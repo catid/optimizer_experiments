@@ -1,0 +1,2 @@
+Starting evaluation
+{'all': {'accuracy': np.float32(0.42765436), 'exact_accuracy': np.float32(0.0), 'lm_loss': np.float32(2.6036012), 'q_halt_accuracy': np.float32(1.0), 'q_halt_loss': np.float32(0.7651874), 'steps': np.float32(16.0)}}

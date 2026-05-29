@@ -37,12 +37,17 @@ AnchorMuon(
 )
 ```
 
-The existing HRM cosine/warmup trainer schedule still owns learning rates. The
-training loop writes the scheduled LR into every optimizer param group each
-step, with an optional fallback scale for scalar/vector parameters.
+The HRM trainer still owns learning rates. The patch adds a trainer-side
+`lr_schedule` switch with `cosine`, `constant`, and `wsd` options, then writes
+the scheduled LR into every optimizer param group each step. AnchorMuon does
+not contain an LR scheduler.
 
 The `adam_atan2` import is lazy now, so `optimizer=anchormuon` does not require
-the AdamATan2 backend to import cleanly.
+the AdamATan2 backend to import cleanly. If the Python package is installed but
+the fused `adam_atan2_backend` extension is unavailable, the patch uses
+`AdamATan2Reference`, an exact torch implementation of the AdamATan2 update
+equation. That fallback is suitable for quality comparisons, but it is not a
+fused speed baseline.
 
 The patch also adds an explicit local-validation escape hatch for environments
 without FlashAttention:
@@ -62,6 +67,8 @@ need real tuning because its baseline LR is much smaller.
 | Config | Default | Meaning |
 |---|---:|---|
 | `optimizer` | `adam_atan2` | Set to `anchormuon` to use AnchorMuon for model weights. |
+| `lr_schedule` | `cosine` | Trainer LR schedule: `cosine`, `constant`, or `wsd`. |
+| `wsd_decay_frac` | `0.2` | Fraction of total steps used for the final WSD decay phase. |
 | `anchormuon_row_gamma` | `0.35` | Row-only PMuonEq strength before GramNS. |
 | `anchormuon_pmuoneq_beta` | `0.90` | Row gradient-power EMA. |
 | `anchormuon_normuon_beta2` | `0.93` | NorMuon post-Gram row second moment. |
@@ -125,6 +132,57 @@ OMP_NUM_THREADS=16 WANDB_MODE=offline DISABLE_COMPILE=1 HRM_ALLOW_SDPA_FALLBACK=
 That run completed 4 optimizer steps across both visible GPUs. This is only an
 integration check, not a quality comparison.
 
+## WSD Sudoku Comparison
+
+I compared AnchorMuon against the AdamATan2 baseline path on the compact local
+Sudoku-Extreme no-augmentation split:
+
+- Data: `data/sudoku-extreme-1k-noaug-test1k`
+- Model: HRM default `HierarchicalReasoningModel_ACTV1`, 27.3M parameters
+- GPUs: 2 visible CUDA GPUs via `torch.distributed.run`
+- Batch: `global_batch_size=384`
+- Schedule: `lr_schedule=wsd`, `lr_warmup_steps=50`, `lr_min_ratio=0.1`,
+  `wsd_decay_frac=0.2`
+- Decay settings: `weight_decay=1.0`, `puzzle_emb_weight_decay=1.0`
+- HPO selector: 300 epochs; final replay: 1000 epochs
+
+The AdamATan2 package in this venv lacked `adam_atan2_backend`, so the baseline
+used the exact torch `AdamATan2Reference` fallback. The fused package may be
+faster, but the update equation is the same.
+
+### 300-Epoch WSD LR Sweep
+
+| Optimizer | LR | Token Acc | Exact Acc | LM Loss | Notes |
+|---|---:|---:|---:|---:|---|
+| AnchorMuon | `1.25e-5` | 21.20% | 0.00% | 2.1727 | Too small. |
+| AnchorMuon | `2.5e-5` | 40.84% | 0.00% | 1.6619 | Improved but behind. |
+| AnchorMuon | `5e-5` | 43.16% | 0.00% | 1.4845 | Best AnchorMuon by LM loss. |
+| AnchorMuon | `1e-4` | 43.18% | 0.00% | 1.6946 | Similar token acc, worse loss. |
+| AnchorMuon | `2e-4` | 43.12% | 0.00% | 2.4483 | Too high. |
+| AdamATan2Reference | `6.25e-6` | 43.09% | 0.00% | 1.4580 | Lower bracket. |
+| AdamATan2Reference | `1.25e-5` | 44.50% | 0.00% | 1.4088 | Best baseline by LM loss. |
+| AdamATan2Reference | `2.5e-5` | 45.52% | 0.00% | 1.4295 | Best baseline by token acc. |
+| AdamATan2Reference | `5e-5` | 45.03% | 0.00% | 1.8416 | Worse loss. |
+| AdamATan2Reference | `1e-4` | 43.79% | 0.00% | 2.6899 | Halt quality degraded. |
+| AdamATan2Reference | `2e-4` | 44.23% | 0.00% | 2.8339 | Too high. |
+
+### 1000-Epoch Final Replay
+
+| Optimizer | Selected By | LR | Token Acc | Exact Acc | LM Loss | Wall Time | Iter/s |
+|---|---|---:|---:|---:|---:|---:|---:|
+| AdamATan2Reference | 300-epoch loss | `1.25e-5` | 44.67% | 0.00% | 2.0961 | 188s | 13.85 |
+| AnchorMuon | 300-epoch loss | `5e-5` | 42.77% | 0.00% | 2.6036 | 196s | 13.29 |
+| AdamATan2Reference | 300-epoch token acc | `2.5e-5` | 44.50% | 0.00% | 2.8958 | 189s | 13.78 |
+
+Conclusion for this specific setup: tuned AdamATan2Reference + WSD is the better
+baseline. AnchorMuon did not improve HRM Sudoku validation quality here and was
+about 4% slower than the torch AdamATan2 fallback. None of these short local
+no-augmentation runs solved exact puzzles, so this is an optimizer sanity
+comparison, not a reproduction of HRM's reported Sudoku result.
+
+Full logs and commands are under
+`workers/codex_noradam_confidence/results/hrm_wsd_baseline_compare_20260529/`.
+
 ## Example Training Command
 
 Use all visible GPUs with `torchrun`. This leaves HRM's puzzle embedding
@@ -145,8 +203,12 @@ torchrun --nproc-per-node "$NUM_GPUS" pretrain.py \
   epochs=20000 \
   eval_interval=2000 \
   global_batch_size=384 \
-  lr=1e-4 \
+  lr=5e-5 \
   puzzle_emb_lr=1e-4 \
+  lr_schedule=wsd \
+  lr_warmup_steps=50 \
+  lr_min_ratio=0.1 \
+  wsd_decay_frac=0.2 \
   weight_decay=1.0 \
   puzzle_emb_weight_decay=1.0 \
   anchormuon_row_gamma=0.35 \
@@ -156,7 +218,8 @@ torchrun --nproc-per-node "$NUM_GPUS" pretrain.py \
 
 ## Caveats
 
-- This is smoke-tested, not tuned on Sudoku/Maze yet.
+- This is smoke-tested and locally tuned on a no-augmentation Sudoku split, but
+  not validated on the full augmented HRM Sudoku/Maze recipes.
 - AnchorMuon replaces ordinary model weight decay with its SODA anchor path.
   HRM's `weight_decay` is ignored by AnchorMuon for model weights, but
   `puzzle_emb_weight_decay` still applies to sparse puzzle embeddings.
@@ -164,5 +227,6 @@ torchrun --nproc-per-node "$NUM_GPUS" pretrain.py \
   `HRM_ALLOW_SDPA_FALLBACK=1` is only for explicit local validation when
   FlashAttention is unavailable.
 - The baseline AdamATan2 package import currently fails in this venv because
-  `adam_atan2_backend` is missing. The lazy import lets AnchorMuon runs proceed,
-  but AdamATan2 baseline reproduction needs that dependency fixed separately.
+  `adam_atan2_backend` is missing. The patch falls back to a torch reference
+  implementation for quality comparisons, but fused speed should be measured
+  after installing the real backend.

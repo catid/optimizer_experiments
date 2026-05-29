@@ -1,0 +1,3 @@
+[HRM AnchorMuon patch] adam_atan2_backend is unavailable; using exact torch AdamATan2Reference fallback for baseline quality runs.
+Starting evaluation
+{'all': {'accuracy': np.float32(0.44672844), 'exact_accuracy': np.float32(0.0), 'lm_loss': np.float32(2.096142), 'q_halt_accuracy': np.float32(1.0), 'q_halt_loss': np.float32(0.7848729), 'steps': np.float32(16.0)}}

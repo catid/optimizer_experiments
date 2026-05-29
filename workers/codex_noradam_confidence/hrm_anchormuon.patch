@@ -1,8 +1,19 @@
 diff --git a/config/cfg_pretrain.yaml b/config/cfg_pretrain.yaml
-index 51c55a0..25aafcf 100644
+index 51c55a0..70f6dfc 100644
 --- a/config/cfg_pretrain.yaml
 +++ b/config/cfg_pretrain.yaml
-@@ -27,5 +27,17 @@ beta2: 0.95
+@@ -18,8 +18,10 @@ eval_interval: 10000
+ checkpoint_every_eval: True
+ 
+ lr: 1e-4
++lr_schedule: cosine
+ lr_min_ratio: 1.0
+ lr_warmup_steps: 2000
++wsd_decay_frac: 0.2
+ 
+ # Standard hyperparameter settings for LM, as used in Llama
+ beta1: 0.9
+@@ -27,5 +29,17 @@ beta2: 0.95
  weight_decay: 0.1
  puzzle_emb_weight_decay: 0.1
  
@@ -71,10 +82,14 @@ index 0394744..4412400 100644
          attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
          return self.o_proj(attn_output)
 diff --git a/pretrain.py b/pretrain.py
-index 245cb5c..cd9de60 100644
+index 245cb5c..8207824 100644
 --- a/pretrain.py
 +++ b/pretrain.py
-@@ -4,6 +4,8 @@ import os
+@@ -1,13 +1,17 @@
+-from typing import Optional, Any, Sequence, List
++from typing import Optional, Any, Sequence, List, Tuple, Union
+ from dataclasses import dataclass
+ import os
  import math
  import yaml
  import shutil
@@ -83,7 +98,13 @@ index 245cb5c..cd9de60 100644
  
  import torch
  import torch.distributed as dist
-@@ -16,13 +18,40 @@ import coolname
+ from torch import nn
++from torch import Tensor
++from torch.optim.optimizer import Optimizer, ParamsT
+ from torch.utils.data import DataLoader
+ 
+ import tqdm
+@@ -16,13 +20,133 @@ import coolname
  import hydra
  import pydantic
  from omegaconf import DictConfig
@@ -94,9 +115,102 @@ index 245cb5c..cd9de60 100644
  from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
  
  
++class AdamATan2Reference(Optimizer):
++    """Torch reference fallback for the AdamATan2 baseline.
++
++    The official `adam-atan2` package is a thin Python wrapper over a fused CUDA
++    extension. Some local Python 3.12/nightly-CUDA installs expose the wrapper
++    but not `adam_atan2_backend`; this class keeps the same update equation so
++    quality comparisons can still run. It is not a fused speed baseline.
++    """
++
++    def __init__(
++        self,
++        params: ParamsT,
++        lr: Union[float, Tensor] = 1e-3,
++        betas: Tuple[float, float] = (0.9, 0.999),
++        weight_decay: float = 1e-2,
++    ):
++        if not 0.0 <= lr:
++            raise ValueError(f"Invalid learning rate: {lr}")
++        if not 0.0 <= betas[0] < 1.0:
++            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
++        if not 0.0 <= betas[1] < 1.0:
++            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
++        if not 0.0 <= weight_decay:
++            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
++        super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay))
++
++    @torch.no_grad()
++    def step(self):
++        for group in self.param_groups:
++            lr = group["lr"]
++            if isinstance(lr, Tensor):
++                lr = float(lr.item())
++            if lr == 0:
++                continue
++
++            beta1, beta2 = group["betas"]
++            weight_decay = group["weight_decay"]
++
++            for p in group["params"]:
++                if p.grad is None:
++                    continue
++                if p.grad.is_sparse:
++                    raise RuntimeError("AdamATan2Reference does not support sparse gradients")
++
++                state = self.state[p]
++                if len(state) == 0:
++                    state["step"] = torch.zeros((), dtype=torch.float32, device=p.device)
++                    state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
++                    state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
++
++                step_t = state["step"]
++                exp_avg = state["exp_avg"]
++                exp_avg_sq = state["exp_avg_sq"]
++
++                step_t.add_(1)
++                step = int(step_t.item())
++                step_size = lr / (1 - beta1 ** step)
++                wd_step_size = lr * weight_decay
++                bias_correction2_sqrt = math.sqrt(1 - beta2 ** step)
++
++                orig_dtype = p.dtype
++                if orig_dtype == torch.float64:
++                    p_math = p
++                    grad = p.grad
++                    m = exp_avg
++                    v = exp_avg_sq
++                else:
++                    p_math = p.float()
++                    grad = p.grad.float()
++                    m = exp_avg.float()
++                    v = exp_avg_sq.float()
++
++                p_math.mul_(1 - wd_step_size)
++                m.lerp_(grad, 1 - beta1)
++                v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
++                denom = v.sqrt() / bias_correction2_sqrt
++                p_math.add_(torch.atan2(m, denom), alpha=-step_size)
++
++                if orig_dtype != torch.float64:
++                    p.copy_(p_math.to(orig_dtype))
++                    exp_avg.copy_(m.to(orig_dtype))
++                    exp_avg_sq.copy_(v.to(orig_dtype))
++
++
 +def _load_adam_atan2():
-+    from adam_atan2 import AdamATan2
-+    return AdamATan2
++    try:
++        from adam_atan2 import AdamATan2
++        return AdamATan2
++    except ModuleNotFoundError as exc:
++        if exc.name != "adam_atan2_backend":
++            raise
++        print(
++            "[HRM AnchorMuon patch] adam_atan2_backend is unavailable; "
++            "using exact torch AdamATan2Reference fallback for baseline quality runs."
++        )
++        return AdamATan2Reference
 +
 +
 +def _load_anchor_muon():
@@ -125,7 +239,18 @@ index 245cb5c..cd9de60 100644
  class LossConfig(pydantic.BaseModel):
      model_config = pydantic.ConfigDict(extra='allow')
      
-@@ -69,6 +98,16 @@ class PretrainConfig(pydantic.BaseModel):
+@@ -47,8 +171,10 @@ class PretrainConfig(pydantic.BaseModel):
+     epochs: int
+ 
+     lr: float
++    lr_schedule: str = "cosine"
+     lr_min_ratio: float
+     lr_warmup_steps: int
++    wsd_decay_frac: float = 0.2
+ 
+     weight_decay: float
+     beta1: float
+@@ -69,6 +195,16 @@ class PretrainConfig(pydantic.BaseModel):
      eval_interval: Optional[int] = None
      eval_save_outputs: List[str] = []
  
@@ -142,7 +267,7 @@ index 245cb5c..cd9de60 100644
  
  @dataclass
  class TrainState:
-@@ -134,22 +173,47 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata,
+@@ -134,22 +270,47 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata,
                      dist.broadcast(param, src=0)
  
      # Optimizers and lr
@@ -157,13 +282,13 @@ index 245cb5c..cd9de60 100644
 +        
 +        lr=0,  # Needs to be set by scheduler
 +        weight_decay=config.puzzle_emb_weight_decay,
-+
-+        world_size=world_size
-+    )
  
 -            world_size=world_size
 -        ),
 -        AdamATan2(
++        world_size=world_size
++    )
++
 +    optimizer_name = config.optimizer.lower().replace("-", "_")
 +    if optimizer_name in {"adam_atan2", "adamatan2", "baseline"}:
 +        AdamATan2 = _load_adam_atan2()
@@ -199,7 +324,52 @@ index 245cb5c..cd9de60 100644
      ]
      optimizer_lrs = [
          config.puzzle_emb_lr,
-@@ -236,7 +300,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
+@@ -197,13 +358,37 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
+ 
+ 
+ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
+-    return cosine_schedule_with_warmup_lr_lambda(
+-        current_step=train_state.step,
+-        base_lr=base_lr,
+-        num_warmup_steps=round(config.lr_warmup_steps),
+-        num_training_steps=train_state.total_steps,
+-        min_ratio=config.lr_min_ratio
+-    )
++    schedule = config.lr_schedule.lower().replace("-", "_")
++    if schedule == "cosine":
++        return cosine_schedule_with_warmup_lr_lambda(
++            current_step=train_state.step,
++            base_lr=base_lr,
++            num_warmup_steps=round(config.lr_warmup_steps),
++            num_training_steps=train_state.total_steps,
++            min_ratio=config.lr_min_ratio
++        )
++    if schedule == "constant":
++        warmup_steps = max(0, round(config.lr_warmup_steps))
++        if train_state.step < warmup_steps:
++            return base_lr * float(train_state.step) / float(max(1, warmup_steps))
++        return base_lr
++    if schedule == "wsd":
++        warmup_steps = max(0, round(config.lr_warmup_steps))
++        total_steps = max(1, train_state.total_steps)
++        if train_state.step < warmup_steps:
++            return base_lr * float(train_state.step) / float(max(1, warmup_steps))
++
++        decay_frac = min(max(config.wsd_decay_frac, 0.0), 1.0)
++        decay_steps = max(1, round((total_steps - warmup_steps) * decay_frac))
++        stable_until = max(warmup_steps, total_steps - decay_steps)
++        if train_state.step <= stable_until:
++            return base_lr
++
++        progress = (train_state.step - stable_until) / float(max(1, total_steps - stable_until))
++        progress = min(max(progress, 0.0), 1.0)
++        decay_mult = 0.5 * (1.0 + math.cos(math.pi * progress))
++        return base_lr * (config.lr_min_ratio + (1.0 - config.lr_min_ratio) * decay_mult)
++    raise ValueError(f"Unknown lr_schedule={config.lr_schedule!r}; expected cosine, constant, or wsd.")
+ 
+ 
+ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
+@@ -236,7 +421,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
          lr_this_step = compute_lr(base_lr, config, train_state)
  
          for param_group in optim.param_groups:

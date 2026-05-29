@@ -1,0 +1,6 @@
+[HRM AnchorMuon patch] adam_atan2_backend is unavailable; using exact torch AdamATan2Reference fallback for baseline quality runs.
+[HRM AnchorMuon patch] adam_atan2_backend is unavailable; using exact torch AdamATan2Reference fallback for baseline quality runs.
+Starting evaluationStarting evaluation
+
+{'all': {'accuracy': np.float32(0.43788892), 'exact_accuracy': np.float32(0.0), 'lm_loss': np.float32(2.6899097), 'q_halt_accuracy': np.float32(0.165), 'q_halt_loss': np.float32(1.9370828), 'steps': np.float32(16.0)}}
+[rank0]:[W529 16:57:52.854046003 ProcessGroupNCCL.cpp:1648] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

@@ -1,0 +1,4 @@
+cd /home/catid/screen/repos/optimizer_experiments/workers/codex_noradam_confidence/external/HRM
+OMP_NUM_THREADS=16 WANDB_MODE=offline DISABLE_COMPILE=1 HRM_ALLOW_SDPA_FALLBACK=1 ANCHORMUON_OPTIMIZER_PATH=/home/catid/screen/repos/optimizer_experiments/optimizer.py \
+/home/catid/screen/.venv/bin/python -m torch.distributed.run --nproc-per-node 2 pretrain.py \
+  data_path=data/sudoku-extreme-1k-noaug-test1k optimizer=adam_atan2 epochs=1000 eval_interval=1000 checkpoint_every_eval=False +checkpoint_path=checkpoints/final1000_adam_atan2_ref_loss_pick_wsd_lr0p0000125_e1000 +run_name=final1000_adam_atan2_ref_loss_pick_wsd_lr0p0000125_e1000 global_batch_size=384 lr=0.0000125 puzzle_emb_lr=0.0000125 lr_schedule=wsd lr_warmup_steps=50 lr_min_ratio=0.1 wsd_decay_frac=0.2 weight_decay=1.0 puzzle_emb_weight_decay=1.0
