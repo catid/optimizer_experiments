@@ -4,6 +4,9 @@ This file packages the best-performing optimizer recipe from the local ViT-5
 CIFAR experiments as a focused, copyable PyTorch optimizer. It intentionally
 removes the ablation switches from ``sodamuse_eq.py``:
 
+For a compact handoff summary with the final comparison table, see
+``ALGORITHM_RESULTS.md`` in this folder.
+
     no AMUSE / schedule-free train-eval sequence
     no MiMuon branch
     no optional PMuonEq disable path

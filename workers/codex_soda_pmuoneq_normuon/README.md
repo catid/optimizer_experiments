@@ -5,6 +5,8 @@ This folder contains my standalone optimizer contribution to the shared
 
 ## Contents
 
+- `ALGORITHM_RESULTS.md` - compact algorithm, tuned recipe, final comparison
+  table, artifact list, and validation commands.
 - `soda_pmuoneq_normuon.py` - a focused, copyable PyTorch optimizer file.
 - `tests/test_soda_pmuoneq_normuon.py` - self-contained CPU tests for grouping,
   finite updates, state creation, no-op train/eval compatibility, state-dict
@@ -27,6 +29,12 @@ This folder contains my standalone optimizer contribution to the shared
   PNG figures.
 - `results/cifar10_peer_feedback_final50_aggregate/` - three-seed aggregate
   after implementing peer feedback.
+
+## Optimizer Summary
+
+For the compact handoff version of the algorithm and final table, start with
+`ALGORITHM_RESULTS.md`. The rest of this README keeps the longer experiment
+history and reproduction commands.
 
 ## Optimizer
 
