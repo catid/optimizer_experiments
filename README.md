@@ -51,13 +51,31 @@ The final 50-epoch schedule-winner plots are in
 
 ![Validation accuracy curves for the 50-epoch AnchorMuon schedule winners](workers/codex_noradam_confidence/results/root_lr_schedule_sweep_20260529/final50_schedule_winners/val_acc.png)
 
-**Component-removal ablation note:** a separate worker-research ablation tuned
-each component-removal family for 12 epochs, then replayed each selected winner
-for 50 epochs on the same ViT-5 micro CIFAR-10 split. This was motivated by the
-fact that SODA-like anchor effects can appear late. In that run, the no-SODA
-family won the 12-epoch HPO selector but fell behind by 50 epochs, losing 0.69
-official test points versus the full worker recipe. GramNS remained essential;
-removing it lost 4.39 official test points versus the full worker recipe.
+**Component-removal ablation note:** worker-research ablations tuned
+component-removal families for 12 epochs, then replayed selected winners for 50
+epochs on the same ViT-5 micro CIFAR-10 split. This was motivated by the fact
+that SODA-like anchor effects can appear late. In the first single-seed run, the
+no-SODA family won the 12-epoch HPO selector but fell behind by 50 epochs,
+losing 0.69 official test points versus the full worker recipe. GramNS remained
+essential; removing it lost 4.39 official test points versus the full worker
+recipe.
+
+A follow-up three-seed replay compared the close variants: full, `-PMuonEq`,
+and `-NorMuon`. Full had the best mean official test accuracy, but only by a
+small margin over `-PMuonEq`, while `-PMuonEq` was materially faster. This makes
+PMuonEq questionable on value-for-speed in this worker harness, but not a clear
+quality regression.
+
+| Worker ablation | Official test acc | Best val acc | Step time | Examples/sec | Takeaway |
+|---|---:|---:|---:|---:|---|
+| AnchorMuon full | 84.94% +/- 0.10 | 85.95% +/- 0.02 | 20.06 ms | 25.5k | Best mean quality; PMuonEq gain is tiny. |
+| AnchorMuon -PMuonEq | 84.83% +/- 0.37 | 85.80% +/- 0.44 | 18.04 ms | 28.4k | Nearly tied quality and about 11% faster. |
+| AnchorMuon -NorMuon | 84.54% +/- 0.63 | 85.52% +/- 0.49 | 18.92 ms | 27.1k | Worse mean quality; NorMuon still looks useful. |
+
+Full multi-seed report:
+`workers/codex_noradam_confidence/results/component_ablation_multiseed_20260529/summary.md`.
+
+Earlier single-seed component-removal table:
 
 | Worker ablation | Official test acc | Best val acc | Step time | Takeaway |
 |---|---:|---:|---:|---|
@@ -69,10 +87,9 @@ removing it lost 4.39 official test points versus the full worker recipe.
 | AdamW baseline | 79.55% | 79.64% | 11.56 ms | Fast per step, much worse accuracy. |
 
 This ablation does not supersede the root `optimizer.py` recommendation above:
-it is single-seed and uses the worker research optimizer path. It does set the
-next validation target: multi-seed full vs `-PMuonEq` vs `-NorMuon`, then replay
-the winner through root `optimizer.py` before changing the standalone default.
-Full report:
+it uses the worker research optimizer path. It does set the next validation
+target: replay the PMuonEq question through root `optimizer.py` before changing
+the standalone default. Full single-seed report:
 `workers/codex_noradam_confidence/results/component_ablation_50e_20260529/summary.md`.
 
 **Previous three-seed direct root validation:** same ViT-5 micro CIFAR-10 split

@@ -170,7 +170,7 @@ AdamW remains the fastest per step.
 
 ### Latest Component Removal Ablation
 
-This ablation tested whether each part of the worker AnchorMuon recipe was
+These ablations tested whether each part of the worker AnchorMuon recipe was
 actually helping after short HPO and a longer replay. Each family received
 12-epoch HPO, then the family winner was replayed for 50 epochs. Protocol:
 `vit5_micro`, CIFAR-10 45k/5k train/validation split, official 10k test
@@ -178,7 +178,25 @@ evaluated only at the end, batch size 512, seed `123`, BF16 autocast,
 channels-last tensors, 16 dataloader workers, and two GPUs scheduled one trial
 per GPU.
 
-50-epoch replay, sorted by official test accuracy:
+Follow-up three-seed replay for the close variants:
+
+| Run | Official test acc | Best val acc | Best val loss | Step | Throughput | Finding |
+|---|---:|---:|---:|---:|---:|---|
+| AnchorMuon full | 84.94% +/- 0.10 | 85.95% +/- 0.02 | 0.4186 +/- 0.0019 | 20.06 ms | 25.5k ex/s | Best mean quality, but the margin is tiny. |
+| AnchorMuon -PMuonEq | 84.83% +/- 0.37 | 85.80% +/- 0.44 | 0.4193 +/- 0.0138 | 18.04 ms | 28.4k ex/s | Nearly tied and about 11% faster; PMuonEq is questionable on value-for-speed. |
+| AnchorMuon -NorMuon | 84.54% +/- 0.63 | 85.52% +/- 0.49 | 0.4265 +/- 0.0130 | 18.92 ms | 27.1k ex/s | Worse mean quality; NorMuon still looks useful. |
+
+The multi-seed replay does not confirm the single-seed impression that removing
+PMuonEq is a quality win. It does confirm that PMuonEq costs meaningful speed
+for only a very small mean quality gain in this worker harness.
+
+Multi-seed report and plots:
+`results/component_ablation_multiseed_20260529/summary.md`,
+`results/component_ablation_multiseed_20260529/val_acc.png`,
+`results/component_ablation_multiseed_20260529/val_loss.png`, and
+`results/component_ablation_multiseed_20260529/step_time_ms_bar.png`.
+
+Earlier single-seed 50-epoch replay, sorted by official test accuracy:
 
 | Run | Final val loss | Best val loss | Final val acc | Best val acc | Official test loss | Official test acc | Step | Throughput |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -192,11 +210,13 @@ per GPU.
 Findings: SODA should not be judged from short runs alone. The no-SODA family
 won the 12-epoch HPO stage, but fell behind by 50 epochs and lost 0.69 official
 test points versus the full recipe. GramNS is clearly important, losing 4.39
-official test points when removed. PMuonEq and NorMuon are less settled in this
-single-seed worker-run ablation: removing PMuonEq gave the best official test
-accuracy, while removing NorMuon gave the best validation loss. Before changing
-the shippable root default, rerun full vs `-PMuonEq` vs `-NorMuon` with multiple
-seeds and then validate the winner through root `optimizer.py`.
+official test points when removed. PMuonEq and NorMuon were less settled in
+this single-seed worker-run ablation: removing PMuonEq gave the best official
+test accuracy, while removing NorMuon gave the best validation loss. The
+three-seed follow-up above reduced that uncertainty: full AnchorMuon has the
+best mean quality, but PMuonEq's quality margin is small relative to its speed
+cost. Validate the PMuonEq question through root `optimizer.py` before changing
+the shippable default.
 
 Full component-ablation report and plots:
 `results/component_ablation_50e_20260529/summary.md`,
