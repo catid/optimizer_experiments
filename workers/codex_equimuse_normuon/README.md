@@ -7,6 +7,41 @@ peer-feedback comparison artifacts. There are two standalone optimizer files:
 - `direct_soda_pmuoneq_normuon.py`: the direct no-AMUSE recipe that produced
   the best result in the latest matched ViT-5/CIFAR-10 run.
 
+## Best Current Version
+
+The current winner in this folder is:
+
+```text
+Direct SODA-PMuonEq-NorMuon + aspect
+```
+
+It was measured on **CIFAR-10**, not CIFAR-100, with `vit5_small`
+(`21,657,994` trainable parameters), img224, 4-GPU DDP, per-GPU batch 128,
+effective global batch 512, seed `67890`, and 1000 optimizer steps. The winning
+exact hyperparameters were:
+
+```text
+optimizer = soda_pmuoneq_normuon
+matrix_lr = 8e-3
+fallback_adam_lr = 8e-4
+pmuoneq_beta = 0.90
+row_gamma = 0.35
+col_gamma = 0.05
+normuon_beta2 = 0.93
+normuon_orientation = row
+normuon_aspect_scale = true
+warmup_steps = 10
+matrix_weight_decay = 0.0
+fallback_weight_decay = 0.05
+per_gpu_batch = 128
+gradient_accumulation = 1
+effective_global_batch = 512
+```
+
+Final readout for that run: `76.69%` CIFAR-10 acc@1, `0.7269` validation loss,
+`1.2382` train loss, and `4009` samples/s. See `ALGORITHM_RESULTS.md` for the
+full command, comparison table, artifacts, and caveats.
+
 ## Algorithm Summary
 
 The schedule-free EquiMuse recipe is:
@@ -40,6 +75,8 @@ replicate next.
 - `direct_soda_pmuoneq_normuon.py`: direct SODA-PMuonEq-NorMuon standalone
   optimizer with row+aspect defaults.
 - `test_equimuse_normuon.py`: lightweight unit tests for the standalone file.
+- `ALGORITHM_RESULTS.md`: exact winning CIFAR-10 recipe, command, protocol, and
+  comparison table.
 - `VALIDATION.md`: validation result from the source workstation.
 - `RESULTS.md`: compact final readout with figure links.
 - `results/tables/equimuse_best_vs_adamw_results.csv`: final 1000-step
@@ -177,7 +214,9 @@ Tune in this order:
 
 After peer feedback, the fixed ViT-5-Small/CIFAR-10 img224 harness was rerun on
 all 4 visible GPUs with DDP, seed `67890`, 1000 optimizer steps, and 8
-validation bins.
+validation bins. These headline numbers are CIFAR-10 results. Older CIFAR-100
+notes in source docstrings refer to separate historical checks and are not the
+headline comparison for this folder.
 
 | method | acc@1 | val loss | train loss | samples/s |
 | --- | ---: | ---: | ---: | ---: |
@@ -194,6 +233,8 @@ this single-seed run: +13.63 accuracy points and -0.3622 validation loss versus
 AdamW. Within schedule-free EquiMuse, aspect scaling improved validation loss
 but not accuracy; row/no-aspect remained the best EquiMuse accuracy. The direct
 path should be replicated across seeds before treating the large delta as final.
+
+For the exact winning recipe, use `ALGORITHM_RESULTS.md` as the source of truth.
 
 Artifacts:
 

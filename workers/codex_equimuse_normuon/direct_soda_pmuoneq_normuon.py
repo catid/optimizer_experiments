@@ -89,6 +89,13 @@ If matrix weight decay is enabled deliberately as an ablation, set this flag to
 Best local tuning result
 ========================
 
+The current monorepo headline result for this worker is the CIFAR-10
+ViT-5-Small controlled comparison documented in ``ALGORITHM_RESULTS.md``:
+``matrix_lr=8e-3``, ``adam_lr=8e-4``, ``row_gamma=0.35``,
+``col_gamma=0.05``, ``normuon_beta2=0.93``, row-wise NorMuon, and the aspect
+multiplier enabled. The CIFAR-100 numbers below are historical checks, not the
+headline comparison for this folder.
+
 On ViT-5 tiny / CIFAR-10, the best tuned recipe was:
 
     matrix_lr       = 8e-3

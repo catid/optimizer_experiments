@@ -5,6 +5,46 @@ Generated: 2026-05-29T01:18:00Z
 Scope: ViT-5-Small on CIFAR-10, img224, 1000 optimizer steps, 8 validation
 bins, seed 67890, all 4 visible GPUs with DDP.
 
+These headline results are **CIFAR-10** results. A separate historical
+CIFAR-100 check appears in the standalone optimizer docstring, but it is not
+the matched monorepo comparison summarized here.
+
+## Best Specific Version
+
+Use this exact version when referring to the winner:
+
+```text
+Direct SODA-PMuonEq-NorMuon + aspect
+```
+
+Implementation:
+
+```text
+workers/codex_equimuse_normuon/direct_soda_pmuoneq_normuon.py
+```
+
+Protocol and key settings:
+
+| field | value |
+| --- | --- |
+| model | `vit5_small`, 21,657,994 trainable params |
+| dataset | CIFAR-10, img224 |
+| seed | `67890` |
+| GPUs | 4-GPU DDP |
+| per-GPU batch | 128 |
+| gradient accumulation | 1 |
+| effective global batch | 512 |
+| optimizer steps | 1000 |
+| matrix LR | `8e-3` |
+| fallback LR | `8e-4` |
+| PMuonEq beta | `0.90` |
+| PMuonEq row/col gamma | `0.35 / 0.05` |
+| NorMuon beta2 | `0.93` |
+| NorMuon orientation | `row` |
+| aspect multiplier | enabled |
+
+Full reproduction command and caveats are in `ALGORITHM_RESULTS.md`.
+
 ## Peer-Feedback Comparison
 
 | method | final acc@1 | final val loss | final train loss | samples/s | optimizer s/bin | total train s |
