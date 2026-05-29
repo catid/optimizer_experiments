@@ -29,10 +29,13 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO_ROOT = Path(__file__).resolve().parents[3]
+for import_root in (ROOT, REPO_ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
 import models_vit5  # noqa: F401  Registers vit5_micro/vit5_tiny with timm.
+import optimizer as root_optimizer
 from golden_soda_pmuoneq_normuon import GoldenSodaPmuonEqNorMuon
 from optim_anchormuon import AnchorMuon
 from optim_factory import _anchor_param_groups
@@ -58,6 +61,8 @@ class TrialConfig:
     normuon: bool = False
     normuon_beta: float = 0.95
     normuon_aspect_scale: bool = False
+    root_grouping: str = "anchor"
+    root_normuon_mode: str = "row"
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,6 +85,8 @@ def parse_args() -> argparse.Namespace:
             "confidence",
             "feedback",
             "best_cifar10",
+            "root_normuon_ablation",
+            "root_soda_ablation",
         ],
     )
     parser.add_argument("--only", default="", help="Regex filter for trial names")
@@ -292,6 +299,124 @@ def trial_grid(preset: str) -> list[TrialConfig]:
     ]
     if preset == "best_cifar10":
         return best_cifar10
+    root_normuon_ablation = [
+        TrialConfig("adamw_cosine_lr0.004_wd0.001", "adamw", 4e-3, lr_schedule="cosine", weight_decay=0.001),
+        TrialConfig(
+            "root_row_anchor_soda_mlr0.008_rg0.35_pb0.9_nb0.93",
+            "root",
+            8e-3,
+            soda="all",
+            row_gamma=0.35,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.93,
+            amuse=False,
+            root_grouping="anchor",
+            root_normuon_mode="row",
+        ),
+        TrialConfig(
+            "root_orient_anchor_soda_mlr0.008_rg0.35_pb0.9_nb0.93",
+            "root",
+            8e-3,
+            soda="all",
+            row_gamma=0.35,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.93,
+            amuse=False,
+            root_grouping="anchor",
+            root_normuon_mode="orientation",
+        ),
+        TrialConfig(
+            "golden_orient_anchor_soda_mlr0.008_rg0.35_pb0.9_nb0.93",
+            "golden",
+            8e-3,
+            soda="all",
+            row_gamma=0.35,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.93,
+            amuse=False,
+        ),
+    ]
+    if preset == "root_normuon_ablation":
+        return root_normuon_ablation
+    root_soda_ablation = [
+        TrialConfig("adamw_cosine_lr0.004_wd0.001", "adamw", 4e-3, lr_schedule="cosine", weight_decay=0.001),
+        TrialConfig(
+            "root_row_anchor_soda_mlr0.008_rg0.35_pb0.9_nb0.93",
+            "root",
+            8e-3,
+            soda="all",
+            row_gamma=0.35,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.93,
+            amuse=False,
+            root_grouping="anchor",
+            root_normuon_mode="row",
+        ),
+        TrialConfig(
+            "root_row_anchor_nosoda_mlr0.008_rg0.35_pb0.9_nb0.93",
+            "root",
+            8e-3,
+            soda="none",
+            row_gamma=0.35,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.93,
+            amuse=False,
+            root_grouping="anchor",
+            root_normuon_mode="row",
+        ),
+        TrialConfig(
+            "root_row_named_soda_mlr0.008_rg0.35_pb0.9_nb0.93",
+            "root",
+            8e-3,
+            soda="all",
+            row_gamma=0.35,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.93,
+            amuse=False,
+            root_grouping="named",
+            root_normuon_mode="row",
+        ),
+        TrialConfig(
+            "root_row_named_nosoda_mlr0.008_rg0.35_pb0.9_nb0.93",
+            "root",
+            8e-3,
+            soda="none",
+            row_gamma=0.35,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.93,
+            amuse=False,
+            root_grouping="named",
+            root_normuon_mode="row",
+        ),
+        TrialConfig(
+            "golden_orient_anchor_soda_mlr0.008_rg0.35_pb0.9_nb0.93",
+            "golden",
+            8e-3,
+            soda="all",
+            row_gamma=0.35,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.93,
+            amuse=False,
+        ),
+    ]
+    if preset == "root_soda_ablation":
+        return root_soda_ablation
     feedback = [
         TrialConfig("adamw_cosine_lr0.004_wd0.001", "adamw", 4e-3, lr_schedule="cosine", weight_decay=0.001),
     ]
@@ -393,6 +518,8 @@ def trial_grid(preset: str) -> list[TrialConfig]:
 
 
 def trial_family(cfg: TrialConfig) -> str:
+    if cfg.optimizer == "root":
+        return f"root_{cfg.root_grouping}_{cfg.root_normuon_mode}_{cfg.soda}"
     if cfg.optimizer == "golden":
         return "golden_normuon"
     if cfg.optimizer == "adamw":
@@ -488,6 +615,14 @@ def cifar10_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, D
     return train_loader, val_loader, test_loader, dataset_info
 
 
+def ensure_cifar10_downloaded(data_path: Path) -> None:
+    """Download/extract CIFAR-10 once before launching parallel GPU workers."""
+
+    data_path.mkdir(parents=True, exist_ok=True)
+    datasets.CIFAR10(data_path, train=True, download=True)
+    datasets.CIFAR10(data_path, train=False, download=True)
+
+
 def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -508,6 +643,125 @@ def adamw_lr(
         raise ValueError(f"unknown AdamW lr schedule {schedule!r}")
     progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
     return base_lr * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress))))
+
+
+class RootSodaPmuonEqNorMuonOrientation(root_optimizer.SodaPmuonEqNorMuon):
+    """Trainer-side root optimizer adapter for the NorMuon orientation ablation.
+
+    The root optimizer intentionally stays untouched. This subclass keeps the
+    root Polar Express / PMuonEq / SODA implementation, but changes only the
+    post-Gram NorMuon second-moment axis: rows for tall matrices and columns for
+    wide matrices. That isolates difference #2 without changing difference #1.
+    """
+
+    def _ensure_orientation_state(
+        self,
+        p: torch.Tensor,
+        rows: int,
+        cols: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        state = self.state[p]
+        row_ema = state.get("pmuoneq_row_ema")
+        if row_ema is None or row_ema.shape != (rows,) or row_ema.device != device:
+            row_ema = state["pmuoneq_row_ema"] = torch.ones(rows, device=device, dtype=torch.float32)
+        row_factor = state.get("pmuoneq_row_factor")
+        if row_factor is None or row_factor.shape != (rows,) or row_factor.device != device:
+            row_factor = state["pmuoneq_row_factor"] = torch.ones(rows, device=device, dtype=torch.float32)
+        second_shape = (rows, 1) if rows >= cols else (1, cols)
+        second = state.get("normuon_second_momentum")
+        if second is None or second.shape != second_shape or second.device != device:
+            second = state["normuon_second_momentum"] = torch.zeros(*second_shape, device=device, dtype=torch.float32)
+        return row_ema, row_factor, second
+
+    @staticmethod
+    def _orientation_normuon(
+        update: torch.Tensor,
+        second_momentum: torch.Tensor,
+        *,
+        beta2: float,
+        eps: float,
+    ) -> torch.Tensor:
+        dtype = update.dtype
+        eps_t = torch.tensor(eps, dtype=dtype, device=update.device)
+        old_norm = update.norm(dim=(-2, -1), keepdim=True)
+        if update.shape[-2] >= update.shape[-1]:
+            power = update.square().mean(dim=-1, keepdim=True)
+        else:
+            power = update.square().mean(dim=-2, keepdim=True)
+        second_momentum.lerp_(power.to(second_momentum.dtype), 1.0 - beta2)
+        out = update * torch.rsqrt(second_momentum.to(dtype).clamp_min(eps))
+        return out * (old_norm / (out.norm(dim=(-2, -1), keepdim=True) + eps_t))
+
+    def _transform_matrix_bucket(
+        self,
+        entries: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+        group: dict,
+    ) -> torch.Tensor:
+        sources = torch.stack([entry[2].to(torch.float32) for entry in entries], dim=0)
+        grads = torch.stack([entry[3].to(torch.float32) for entry in entries], dim=0)
+        _batch, rows, cols = grads.shape
+
+        row_buffers: list[torch.Tensor] = []
+        row_factor_buffers: list[torch.Tensor] = []
+        second_buffers: list[torch.Tensor] = []
+        for p, _anchor, _source, _grad in entries:
+            row_ema, row_factor, second = self._ensure_orientation_state(p, rows, cols, grads.device)
+            row_buffers.append(row_ema)
+            row_factor_buffers.append(row_factor)
+            second_buffers.append(second)
+
+        beta_p = float(group["pmuoneq_beta"])
+        row_stack = torch.stack(row_buffers, dim=0)
+        row_stack.mul_(beta_p).add_(grads.square().mean(dim=2), alpha=1.0 - beta_p)
+        row_factor = root_optimizer._diag_inverse_power(
+            row_stack,
+            gamma=float(group["row_gamma"]),
+            eps=float(group["pmuoneq_eps"]),
+        )
+
+        preconditioned = sources * row_factor[:, :, None]
+        update = self._orthogonalizer(preconditioned)
+        update = update * (0.2 * math.sqrt(max(update.size(-2), update.size(-1))))
+
+        second_stack = torch.stack(second_buffers, dim=0)
+        update = self._orientation_normuon(
+            update,
+            second_stack,
+            beta2=float(group["normuon_beta2"]),
+            eps=float(group["normuon_eps"]),
+        )
+
+        for idx, (p, _anchor, _source, _grad) in enumerate(entries):
+            self.state[p]["pmuoneq_row_ema"].copy_(row_stack[idx])
+            self.state[p]["pmuoneq_row_factor"].copy_(row_factor[idx])
+            self.state[p]["normuon_second_momentum"].copy_(second_stack[idx])
+        return update
+
+
+def root_anchor_param_groups(model: nn.Module, cfg: TrialConfig) -> list[dict]:
+    groups: list[dict] = []
+    for group in _anchor_param_groups(model, cfg.weight_decay):
+        cloned = dict(group)
+        cloned["params"] = list(group["params"])
+        cloned.update({
+            "use_matrix_update": True,
+            "lr": cfg.lr,
+            "base_lr": cfg.lr,
+            "momentum": cfg.momentum,
+            "pmuoneq_beta": cfg.pmuon_beta,
+            "row_gamma": cfg.row_gamma,
+            "pmuoneq_eps": 1e-6,
+            "normuon_beta2": cfg.normuon_beta,
+            "normuon_eps": 1e-10,
+            "betas": (0.9, 0.95),
+            "eps": 1e-8,
+            "use_external_lr": False,
+        })
+        if cfg.soda == "all":
+            cloned["weight_decay"] = 0.0
+        groups.append(cloned)
+    return groups
 
 
 def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace) -> torch.optim.Optimizer:
@@ -532,6 +786,37 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             normuon=cfg.normuon,
             normuon_beta=cfg.normuon_beta,
             normuon_aspect_scale=cfg.normuon_aspect_scale,
+        )
+    if cfg.optimizer == "root":
+        if cfg.soda not in {"all", "none"}:
+            raise ValueError("root optimizer trainer adapter supports soda='all' or soda='none'")
+        if cfg.col_gamma != 0.0:
+            raise ValueError("root optimizer is row-only PMuonEq; col_gamma must be 0.0")
+        if cfg.root_grouping not in {"anchor", "named"}:
+            raise ValueError("root_grouping must be 'anchor' or 'named'")
+        if cfg.root_normuon_mode not in {"row", "orientation"}:
+            raise ValueError("root_normuon_mode must be 'row' or 'orientation'")
+        opt_cls = (
+            RootSodaPmuonEqNorMuonOrientation
+            if cfg.root_normuon_mode == "orientation"
+            else root_optimizer.SodaPmuonEqNorMuon
+        )
+        soda_lambda_scale = 1.0 if cfg.soda == "all" else 0.0
+        fallback_weight_decay = 0.0 if cfg.soda == "all" else cfg.weight_decay
+        params = root_anchor_param_groups(model, cfg) if cfg.root_grouping == "anchor" else model.named_parameters()
+        return opt_cls(
+            params,
+            matrix_lr=cfg.lr,
+            fallback_lr=cfg.lr,
+            warmup_steps=args.warmup_steps,
+            momentum=cfg.momentum,
+            pmuoneq_beta=cfg.pmuon_beta,
+            row_gamma=cfg.row_gamma,
+            normuon_beta2=cfg.normuon_beta,
+            fallback_betas=(0.9, 0.95),
+            fallback_weight_decay=fallback_weight_decay,
+            soda_lambda_scale=soda_lambda_scale,
+            min_matrix_dim=int(getattr(args, "anchor_min_matrix_dim", 2)),
         )
     if cfg.optimizer == "golden":
         if cfg.soda != "all":
@@ -788,6 +1073,8 @@ def run_worker(args: argparse.Namespace) -> None:
         "normuon": cfg.normuon,
         "normuon_beta": cfg.normuon_beta,
         "normuon_aspect_scale": cfg.normuon_aspect_scale,
+        "root_grouping": cfg.root_grouping,
+        "root_normuon_mode": cfg.root_normuon_mode,
         "avg_step_ms": 1000.0 * total_train_seconds / max(global_step, 1),
         "overall_examples_per_sec": total_examples_seen / max(total_train_seconds, 1e-9),
         "elapsed_sec": time.perf_counter() - started,
@@ -808,6 +1095,7 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output_dir = args.output_dir.resolve()
     data_path = args.data_path.resolve()
+    ensure_cifar10_downloaded(data_path)
     pending = list(trials)
     running: list[tuple[subprocess.Popen, str]] = []
     next_gpu = 0
@@ -942,6 +1230,8 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
             normuon=parse_bool(row.get("normuon", False)),
             normuon_beta=float(row.get("normuon_beta", 0.95)),
             normuon_aspect_scale=parse_bool(row.get("normuon_aspect_scale", False)),
+            root_grouping=str(row.get("root_grouping", "anchor")),
+            root_normuon_mode=str(row.get("root_normuon_mode", "row")),
         )
         fam = trial_family(cfg)
         current = by_family.get(fam)
@@ -1062,6 +1352,8 @@ def summaries_to_trials(rows: Iterable[dict]) -> list[TrialConfig]:
             normuon=parse_bool(row.get("normuon", False)),
             normuon_beta=float(row.get("normuon_beta", 0.95)),
             normuon_aspect_scale=parse_bool(row.get("normuon_aspect_scale", False)),
+            root_grouping=str(row.get("root_grouping", "anchor")),
+            root_normuon_mode=str(row.get("root_normuon_mode", "row")),
         ))
     return trials
 
