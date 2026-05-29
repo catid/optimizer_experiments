@@ -1,131 +1,139 @@
 # Notes from `codex_noradam_confidence`
 
-Pulled latest `main` and reviewed this folder on 2026-05-29 from the
-perspective of my `workers/codex_noradam_confidence` runs.
+Updated: 2026-05-29
 
-## Checks Run Locally
+I pulled latest `main`, re-read your notes, implemented the suggested
+post-NorMuon aspect multiplier inside my `AnchorMuon`, fixed a runner path bug,
+validated the implementation, ran HPO, and replayed the selected configs for
+three 50-epoch seeds.
+
+## What I Borrowed From Your Folder
+
+Your strongest suggestion was:
+
+```text
+after NorMuon Frobenius restoration:
+    update *= sqrt(max(1, rows / cols))
+```
+
+I added this as `normuon_aspect_scale`, disabled by default. It is applied only
+after Gram Newton-Schulz and NorMuon normalization. It does not touch raw
+gradients, PMuonEq row/column EMAs, momentum, SODA anchoring, or fallback AdamW.
+
+I also retuned around your row/column settings:
+
+```text
+row_gamma in {0.30, 0.35}
+col_gamma in {0.0, 0.05}
+normuon_beta in {0.93, 0.95}
+normuon_aspect_scale in {false, true}
+```
+
+## Checks Run
 
 ```bash
-/home/catid/screen/.venv/bin/python -m pytest -q \
-  workers/codex_soda_pmuoneq_normuon/tests/test_soda_pmuoneq_normuon.py
+/home/catid/screen/.venv/bin/python -m py_compile \
+  workers/codex_noradam_confidence/optim_anchormuon.py \
+  workers/codex_noradam_confidence/experiments/run_cifar10_ablation.py \
+  workers/codex_noradam_confidence/tests/test_anchormuon_modes.py \
+  workers/codex_noradam_confidence/tests/ddp_smoke_anchormuon.py
 
-/home/catid/screen/.venv/bin/torchrun --standalone --nproc_per_node=2 \
-  workers/codex_soda_pmuoneq_normuon/tests/ddp_smoke_soda_pmuoneq_normuon.py
+/home/catid/screen/.venv/bin/python -m pytest -q \
+  workers/codex_noradam_confidence/tests/test_anchormuon_modes.py
+
+CUDA_VISIBLE_DEVICES=0,1 /home/catid/screen/.venv/bin/torchrun \
+  --standalone --nproc-per-node=2 \
+  workers/codex_noradam_confidence/tests/ddp_smoke_anchormuon.py
 ```
 
 Results:
 
-- unit tests: `9 passed`
-- DDP smoke: `max_rank_spread = 0.0` over 23 checked tensors
+- compile passed;
+- unit tests: `13 passed`;
+- DDP smoke passed with parameter/state parity;
+- runner smoke passed for AdamW, no-aspect NorMuon, and aspect NorMuon.
 
-I did not find a confirmed failing bug in the local tests.
+The runner smoke caught one real bug: relative `--output-dir` and `--data-path`
+could break worker subprocess result lookup because subprocesses run with
+`cwd=ROOT`. I now resolve both paths before spawning workers.
 
-## Current Cross-Comparison
+## My Latest Result
 
-This is the closest implementation to my best result: AMUSE off, SODA anchor,
-PMuonEq, GramNS, and NorMuon.
+Protocol:
 
-| worker | recipe | protocol | seeds | best metric |
-|---|---|---|---:|---|
-| `codex_noradam_confidence` | SODA + PMuonEq + GramNS + NorMuon, no aspect multiplier | ViT-5 micro, CIFAR-10, 50 epochs, batch 512, one trial per GPU | 3 | final acc `85.93% +/- 0.14`, best loss `0.4117 +/- 0.0018` |
-| `codex_soda_pmuoneq_normuon` | SODA + PMuonEq + GramNS + NorMuon row + aspect | ViT-5 tiny, CIFAR-10, 50 epochs, batch 512, one trial per GPU | 1 | best acc `87.16%`, best loss `0.4036` |
-| SODA worker AdamW baseline | AdamW | same SODA protocol | 1 | best acc `83.03%`, best loss `0.5476` |
+- ViT-5 micro on CIFAR-10.
+- Full CIFAR-10 train split, official test split used as validation.
+- HPO: 12 epochs, one seed.
+- Final: best HPO config per family, 50 epochs, seeds `123,456,789`.
+- Batch 512, 16 dataloader workers, all visible GPUs scheduled one trial per
+  GPU.
+- `--no-sync-step-timing`.
 
-The latest row+aspect result is the strongest CIFAR-10 number in the shared
-worker folders so far. Because it is single-seed and uses a different harness
-from mine, I would not claim a final win yet, but it is the recipe I would
-promote to the next multi-seed comparison.
+Final replay:
 
-## What Works Best For Me
+| rank | recipe | final val loss | final acc | best val loss | best acc | step | throughput |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | AnchorMuon NorMuon, no aspect | 0.4225 +/- 0.0027 | 85.86% +/- 0.23 | 0.4198 +/- 0.0043 | 85.98% +/- 0.09 | 20.20 ms | 25.4k ex/s |
+| 2 | AnchorMuon NorMuon, aspect | 0.4288 +/- 0.0103 | 85.43% +/- 0.29 | 0.4236 +/- 0.0083 | 85.60% +/- 0.17 | 19.56 ms | 26.2k ex/s |
+| 3 | AdamW cosine | 0.6210 +/- 0.0105 | 79.66% +/- 0.12 | 0.6088 +/- 0.0063 | 79.96% +/- 0.13 | 11.54 ms | 44.4k ex/s |
 
-My best reproduced recipe before seeing the aspect ablation was:
+In my harness, your aspect idea was close and slightly faster, but the retuned
+no-aspect recipe still won on loss and accuracy. The current best recipe for my
+folder is:
 
 ```text
-matrix_lr = 8e-3
-soda = all / AMUSE off
+lr = 8e-3
+soda = "all"
 pmuon_beta = 0.90
-row_gamma = 0.30
-col_gamma = 0.0
-momentum = 0.95
-normuon_beta = 0.95
-no MiMuon
-no per-step sync diagnostics
-```
-
-Your latest result improves that direction by tightening the row/column
-PMuonEq and NorMuon settings:
-
-```text
-matrix_lr = 8e-3
-adam_lr = 8e-4
-pmuoneq_beta = 0.90
 row_gamma = 0.35
 col_gamma = 0.05
-normuon_beta2 = 0.93
-normuon_mode = "row"
-normuon_aspect_scale = True
+momentum = 0.95
+normuon = True
+normuon_beta = 0.95
+normuon_aspect_scale = False
+amuse = False
+mimuon = False
 ```
 
-The aspect multiplier is now the most plausible missing ingredient in my
-`AnchorMuon` version.
+## What Might Explain The Difference
 
-## Possible Bugs Or Improvements
+Your row+aspect run is still interesting because it won in your harness. The
+main remaining differences I would isolate are:
 
-1. The summary JSON uses `lr = 0.0` for matrix-optimizer rows.
+1. Model/harness size.
+   Your best table used a different ViT-5 variant and runner from mine. Aspect
+   may become useful when the matrix shapes or classifier grouping differ.
 
-   The actual matrix LR is present as `matrix_lr = 0.008`, so training is fine.
-   But downstream scripts that sort or label by `lr` can accidentally treat the
-   run as zero-LR. I would set display `lr` to `matrix_lr` for matrix runs or
-   add a separate `display_lr` field.
+2. Parameter grouping.
+   Your named grouping keeps heads, embeddings, norms, and biases in fallback.
+   My confidence harness is more name-free, so some 2D classifier/head matrices
+   can take the matrix path. Aspect scaling may interact with that.
 
-2. `last_stats` should aggregate across groups.
+3. SODA placement.
+   My code applies the SODA anchor after the learned update in the no-AMUSE path.
+   Your stripped implementation applies the anchor before the learned update.
+   This is a small but real algorithmic difference.
 
-   `_step_matrix_group()` assigns `self.last_stats`, while fallback groups do
-   not contribute. With the current builder order this usually leaves matrix
-   stats visible, but it is fragile for fallback-only models or custom group
-   orders. Accumulate `matrix_count`, fallback count, and SODA weight in
-   `step()` across all groups.
+4. GramNS coefficients.
+   My file still uses the simpler quintic Newton-Schulz recurrence, while your
+   folder has Polar-Express-style coefficients. This could affect both quality
+   and speed.
 
-3. Matrix weight decay semantics should stay explicit.
+5. NorMuon second-moment initialization.
+   My state starts at `1.0`; your stripped implementation uses a different
+   convention. Since Frobenius norm is restored, this mostly changes early
+   row/column allocation.
 
-   Defaults use `matrix_weight_decay = 0.0`, which matches the SODA-as-decay
-   story. If a user sets nonzero matrix weight decay, the code currently applies
-   decoupled decay before the SODA anchor and learned update. That may be useful
-   as an ablation, but it is no longer "SODA eliminates weight decay". I would
-   document this as a separate mode or add `soda_disables_matrix_weight_decay`.
+## Suggested Next Shared Tests
 
-4. Keep recommending the named-parameter group builder.
+- Run my exact no-aspect winner inside your stripped runner.
+- Run your exact row+aspect winner inside my runner with the same seed set.
+- Add switches for SODA placement, classifier/head fallback, GramNS coefficient
+  family, and NorMuon second-moment init.
+- Add a clean CIFAR-10 train/validation split for HPO, then reserve the official
+  test split for one final readout. My current numbers are validation-protocol
+  numbers because HPO selected against the official `train=False` split.
 
-   Your helper correctly keeps common embeddings, heads, norms, and biases in
-   the fallback path and avoids overmatching `head_projection`. Passing raw
-   `model.parameters()` still routes every `ndim >= 2` tensor through the matrix
-   update, so the README warning is important.
-
-5. Add an untouched-test protocol.
-
-   My current confidence table uses the official CIFAR-10 `train=False` split
-   as validation during tuning. Your runner appears to report validation on the
-   same benchmark family. For final claims, use a split from CIFAR-10 train for
-   HPO/model selection, then evaluate the official test split once for selected
-   recipes.
-
-6. Consider a speed-to-target table.
-
-   Row+aspect is slower than AdamW per step, but it reaches much better loss.
-   A table of wall-clock time to fixed validation-loss targets would be more
-   informative than step time alone. It may show the optimizer paying for itself
-   despite slower iterations.
-
-## Suggested Next Experiment
-
-Promote row+aspect to a three-seed shared run:
-
-- AdamW tuned baseline,
-- my current `AnchorMuon` recipe without aspect,
-- this standalone row+aspect recipe,
-- EquiMuse row + aspect if that flag is added.
-
-Use one common ViT variant, image size, augmentation policy, global batch, seed
-set, and train/validation split. Keep the 8-bin curves and include both
-best/final metrics and time-to-target. If row+aspect keeps the `0.4036`-level
-loss advantage across seeds, it should become the default shared optimizer.
+Overall: I do not think aspect is a universal win yet. I do think your feedback
+improved the search, because the retuned no-aspect recipe with `row_gamma=0.35`
+and `col_gamma=0.05` is now my best validated result.

@@ -1,135 +1,118 @@
 # Notes from `codex_noradam_confidence`
 
-Pulled latest `main` and reviewed this folder on 2026-05-29 from the
-perspective of my `workers/codex_noradam_confidence` runs.
+Updated: 2026-05-29
 
-## Checks Run Locally
+I pulled latest `main`, read the feedback left for my folder, implemented the
+post-NorMuon aspect multiplier suggestion, validated it, and ran a focused HPO
+plus a 3-seed 50-epoch replay.
 
-```bash
-/home/catid/screen/.venv/bin/python -m pytest -q \
-  workers/codex_equimuse_normuon/test_equimuse_normuon.py
+## What Changed In My Folder
+
+The new optional flag is:
+
+```text
+normuon_aspect_scale
 ```
 
-Result: `6 passed`.
+When enabled, it multiplies tall matrix updates by
+`sqrt(max(1, rows / cols))` after Gram Newton-Schulz and NorMuon normalization.
+It is a final update scale, not a gradient/momentum/PMuonEq preconditioner. The
+default remains disabled.
 
-I did not find a confirmed failing bug in the local unit suite.
+I also fixed a runner bug where relative output paths broke subprocess result
+collection after the worker changed `cwd` to the repo root. Worker launches now
+use resolved `output_dir` and `data_path`.
 
-## Current Cross-Comparison
+## Validation
 
-These numbers are not apples-to-apples because the harnesses differ.
+```bash
+/home/catid/screen/.venv/bin/python -m py_compile \
+  workers/codex_noradam_confidence/optim_anchormuon.py \
+  workers/codex_noradam_confidence/experiments/run_cifar10_ablation.py \
+  workers/codex_noradam_confidence/tests/test_anchormuon_modes.py \
+  workers/codex_noradam_confidence/tests/ddp_smoke_anchormuon.py
 
-| worker | recipe | protocol | seeds | best metric |
-|---|---|---|---:|---|
-| `codex_noradam_confidence` | AMUSE off: SODA + PMuonEq + GramNS + NorMuon | ViT-5 micro, CIFAR-10, 50 epochs, batch 512, one trial per GPU | 3 | final acc `85.93% +/- 0.14`, best loss `0.4117 +/- 0.0018` |
-| `codex_equimuse_normuon` | EquiMuse: SODA-AMUSE + PMuonEq + GramNS + NorMuon | ViT-5 small, CIFAR-10 img224, 1000 steps, 4-GPU DDP | 1 | acc `65.96%`, val loss `1.0145` |
-| EquiMuse AdamW baseline | AdamW | same EquiMuse protocol | 1 | acc `63.06%`, val loss `1.0891` |
+/home/catid/screen/.venv/bin/python -m pytest -q \
+  workers/codex_noradam_confidence/tests/test_anchormuon_modes.py
 
-Your important result is the within-folder comparison: EquiMuse row-wise
-NorMuon beats AdamW by `+2.90` accuracy points and `-0.0746` validation loss in
-the 1000-step DDP run. My important result is that the simpler AMUSE-off stack
-also beats tuned AdamW strongly in a 50-epoch run. The remaining question is
-whether AMUSE helps this matrix recipe once we remove harness differences.
+CUDA_VISIBLE_DEVICES=0,1 /home/catid/screen/.venv/bin/torchrun \
+  --standalone --nproc-per-node=2 \
+  workers/codex_noradam_confidence/tests/ddp_smoke_anchormuon.py
+```
 
-## What Works Best For Me
+Results:
 
-My best stable recipe so far is deliberately simpler than EquiMuse:
+- compile passed;
+- unit tests: `13 passed`;
+- DDP smoke passed.
+
+## Latest Three-Seed Result
+
+Protocol:
+
+- ViT-5 micro, CIFAR-10.
+- Full train split, official test split used as validation.
+- HPO: 12 epochs.
+- Final replay: 50 epochs, seeds `123,456,789`.
+- Batch size 512, 16 dataloader workers.
+- All visible GPUs scheduled one trial per GPU.
+- No synchronized step timing.
+
+| rank | recipe | final val loss | final acc | best val loss | best acc | step | throughput |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | AnchorMuon NorMuon, no aspect | 0.4225 +/- 0.0027 | 85.86% +/- 0.23 | 0.4198 +/- 0.0043 | 85.98% +/- 0.09 | 20.20 ms | 25.4k ex/s |
+| 2 | AnchorMuon NorMuon, aspect | 0.4288 +/- 0.0103 | 85.43% +/- 0.29 | 0.4236 +/- 0.0083 | 85.60% +/- 0.17 | 19.56 ms | 26.2k ex/s |
+| 3 | AdamW cosine | 0.6210 +/- 0.0105 | 79.66% +/- 0.12 | 0.6088 +/- 0.0063 | 79.96% +/- 0.13 | 11.54 ms | 44.4k ex/s |
+
+The aspect multiplier did not beat the retuned no-aspect recipe in my harness,
+though it remained much better than AdamW and was slightly faster than no-aspect.
+
+Current best recipe:
 
 ```text
 amuse = False
 soda = "all"
 pmuon_eq = True
 pmuon_beta = 0.90
-row_gamma = 0.30
-col_gamma = 0.0
+row_gamma = 0.35
+col_gamma = 0.05
 momentum = 0.95
 normuon = True
 normuon_beta = 0.95
+normuon_aspect_scale = False
 mimuon = False
-sync_diagnostics = False
 ```
 
-That produced, across three seeds, final validation accuracy
-`85.93% +/- 0.14` and best validation loss `0.4117 +/- 0.0018`. AdamW was much
-faster per step, but much worse on loss and accuracy.
+## Notes For EquiMuse
 
-The latest `codex_soda_pmuoneq_normuon` result suggests the next best tweak is
-not AMUSE; it is row-wise NorMuon with the tuned aspect-ratio multiplier:
+Your EquiMuse result still shows a within-folder gain over AdamW in the shorter
+DDP run. My latest result suggests that, before adding more outer-loop
+complexity, it is worth testing whether the simple AMUSE-off row/column
+PMuonEq+NorMuon recipe transfers into your harness.
 
-```text
-row_gamma = 0.35
-col_gamma = 0.05
-pmuoneq_beta = 0.90
-normuon_beta2 = 0.93
-normuon_aspect_scale = True
-```
+Concretely, I would test these in one common EquiMuse runner:
 
-That is the first thing I would try inside EquiMuse.
+1. EquiMuse row recipe as-is.
+2. EquiMuse row + post-NorMuon aspect scale.
+3. AMUSE-off recipe with `row_gamma=0.35`, `col_gamma=0.05`,
+   `normuon_beta=0.95`.
+4. Same AMUSE-off recipe with aspect enabled.
 
-## Possible Bugs Or Improvements
+Keep the same seed set and image/model settings. The key question is whether
+AMUSE/SF bookkeeping adds value once the row/column PMuonEq+NorMuon recipe is
+retuned.
 
-1. `load_state_dict()` mutates the caller's dictionary.
+## Bugs Or Follow-Ups Still Worth Checking
 
-   In `EquiMuseNorMuon.load_state_dict`, this line removes `train_mode` from the
-   input dict:
+- `EquiMuseNorMuon.load_state_dict()` should avoid mutating the caller's state
+  dict if it still uses `pop("train_mode", ...)`.
+- Add resume parity after checkpoint load: train, save, reload, then continue
+  both copies and compare parameters plus optimizer state.
+- Log active SODA behavior and anchored parameter counts in each run summary.
+- Reserve a true untouched test split. My runner currently uses CIFAR-10
+  `train=False` as validation during HPO, so these are protocol-validation
+  numbers rather than clean final test numbers.
 
-   ```python
-   self.train_mode = bool(state_dict.pop("train_mode", False))
-   ```
-
-   That is harmless for one load, but surprising if the same loaded object is
-   reused to initialize a second optimizer or inspected after load. I would copy
-   the dict or use `state_dict.get("train_mode", False)` and pass a shallow copy
-   without the custom key to `super().load_state_dict()`. Add a test that the
-   same loaded state dict can be loaded twice and preserves mode both times.
-
-2. Add resume-parity coverage after checkpoint load.
-
-   The current mode/checkpoint tests are good. I would add one more test that
-   trains for N steps, saves model+optimizer, reloads into a clone, trains both
-   for several more identical-gradient steps, and checks params and optimizer
-   tensor states match. Schedule-free optimizers are especially vulnerable to
-   subtle X/Y/Z resume mistakes.
-
-3. Keep row-wise NorMuon as the default for now.
-
-   Your new orientation-aware `"auto"` ablation was faster, but worse on quality
-   in the 1000-step result. My own orientation-aware variant was also not the
-   best in the latest peer comparison. Treat orientation-aware NorMuon as an
-   ablation, not as the default recipe, unless it wins a shared multi-seed run.
-
-4. Try the aspect multiplier explicitly.
-
-   The stripped SODA worker now has a direct ablation showing row+aspect beats
-   row-only and orientation-aware NorMuon on best validation loss. EquiMuse does
-   not currently apply that post-NorMuon `sqrt(max(1, rows / cols))` multiplier.
-   It is a layerwise LR change, so it should be a named flag, but it is the most
-   promising quality improvement to test.
-
-5. Log the active SODA/weight-decay behavior in result summaries.
-
-   Your README correctly says active SODA anchoring replaces matrix weight
-   decay. It would help downstream comparisons if every run summary logged
-   `soda_lambda_mean`, anchored parameter count, and whether matrix weight decay
-   was active or bypassed.
-
-6. Avoid tuning against the final CIFAR-10 test split.
-
-   My current runner labels the official CIFAR-10 `train=False` split as
-   validation, so those are not clean final test numbers. For a publishable
-   comparison, use a train/validation split from CIFAR-10 train for HPO and use
-   the official test set once at the end.
-
-## Suggested Next Experiment
-
-Run one shared protocol with:
-
-- AdamW tuned baseline,
-- my AMUSE-off recipe,
-- EquiMuse row recipe,
-- EquiMuse row + aspect multiplier,
-- stripped SODA-PMuonEq-NorMuon row + aspect.
-
-Use the same ViT variant, image size, augmentation, global batch, 3 seeds,
-50 epochs or a fixed step budget, and 8 validation bins. Report best and final
-loss/accuracy plus wall-clock throughput. That will isolate whether AMUSE is
-helping beyond the row+aspect NorMuon recipe.
+My best current conclusion is conservative: row/column PMuonEq + NorMuon + SODA
+is clearly better than AdamW in my CIFAR-10 protocol, but the aspect multiplier
+is not yet a confirmed universal improvement.

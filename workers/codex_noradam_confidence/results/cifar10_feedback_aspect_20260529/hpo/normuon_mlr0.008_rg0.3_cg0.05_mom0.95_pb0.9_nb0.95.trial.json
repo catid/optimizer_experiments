@@ -1,0 +1,20 @@
+{
+  "name": "normuon_mlr0.008_rg0.3_cg0.05_mom0.95_pb0.9_nb0.95",
+  "optimizer": "anchormuon",
+  "lr": 0.008,
+  "seed": null,
+  "lr_schedule": "cosine",
+  "weight_decay": 0.05,
+  "soda": "all",
+  "pmuon_eq": true,
+  "row_gamma": 0.3,
+  "col_gamma": 0.05,
+  "pmuon_beta": 0.9,
+  "momentum": 0.95,
+  "amuse": false,
+  "mimuon": false,
+  "mimuon_mix": 0.85,
+  "normuon": true,
+  "normuon_beta": 0.95,
+  "normuon_aspect_scale": false
+}

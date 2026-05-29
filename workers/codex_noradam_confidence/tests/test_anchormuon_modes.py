@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import sys
 from pathlib import Path
 
@@ -50,6 +51,7 @@ def _step(mode: dict) -> tuple[TinyNet, AnchorMuon]:
         mimuon_mix=mode.get("mimuon_mix", 0.85),
         normuon=mode.get("normuon", False),
         normuon_beta=mode.get("normuon_beta", 0.95),
+        normuon_aspect_scale=mode.get("normuon_aspect_scale", False),
         amuse=mode.get("amuse", True),
         sync_diagnostics=mode.get("sync_diagnostics", False),
     )
@@ -107,6 +109,25 @@ def test_normuon_normalizes_rows_or_columns_and_preserves_norm() -> None:
     assert torch.allclose(wide_out.norm(), wide.norm(), atol=1e-5, rtol=1e-5)
 
 
+def test_normuon_aspect_scale_is_post_normalization_layer_scale() -> None:
+    torch.manual_seed(4)
+    update = torch.randn(12, 3)
+    second_plain = torch.ones(12, 1)
+    second_aspect = torch.ones(12, 1)
+    plain = normuon_normalize_update(update, second_plain, beta=0.90, aspect_scale=False)
+    aspect = normuon_normalize_update(update, second_aspect, beta=0.90, aspect_scale=True)
+    expected = math.sqrt(update.shape[0] / update.shape[1])
+    assert torch.allclose(second_plain, second_aspect)
+    assert torch.allclose(aspect, plain * expected, atol=1e-5, rtol=1e-5)
+
+    wide = torch.randn(3, 12)
+    second_wide_plain = torch.ones(1, 12)
+    second_wide_aspect = torch.ones(1, 12)
+    wide_plain = normuon_normalize_update(wide, second_wide_plain, beta=0.90, aspect_scale=False)
+    wide_aspect = normuon_normalize_update(wide, second_wide_aspect, beta=0.90, aspect_scale=True)
+    assert torch.allclose(wide_plain, wide_aspect, atol=1e-5, rtol=1e-5)
+
+
 def test_modes_run_without_nan_and_keep_gradients_unchanged() -> None:
     modes = [
         {"soda": "matrix", "pmuon_eq": True, "mimuon": False},
@@ -115,6 +136,7 @@ def test_modes_run_without_nan_and_keep_gradients_unchanged() -> None:
         {"soda": "matrix", "pmuon_eq": False, "mimuon": False},
         {"soda": "matrix", "pmuon_eq": True, "mimuon": True, "mimuon_mix": 0.75},
         {"soda": "all", "pmuon_eq": True, "normuon": True, "normuon_beta": 0.90},
+        {"soda": "all", "pmuon_eq": True, "normuon": True, "normuon_beta": 0.95, "normuon_aspect_scale": True},
         {"soda": "all", "pmuon_eq": True, "mimuon": True, "mimuon_mix": 0.85, "normuon": True},
         {"soda": "all", "pmuon_eq": True, "normuon": True, "normuon_beta": 0.90, "amuse": False},
     ]
@@ -155,12 +177,14 @@ def test_reported_normuon_base_recipe_flags_are_explicit() -> None:
         momentum=0.95,
         normuon=True,
         normuon_beta=0.95,
+        normuon_aspect_scale=False,
         mimuon=False,
     )
     assert all(group["soda"] == "all" for group in opt.param_groups)
     assert all(group["amuse"] is False for group in opt.param_groups)
     assert all(group["pmuon_eq"] is True for group in opt.param_groups)
     assert all(group["normuon"] is True for group in opt.param_groups)
+    assert all(group["normuon_aspect_scale"] is False for group in opt.param_groups)
     assert all(group["mimuon"] is False for group in opt.param_groups)
     assert {group["sync_diagnostics"] for group in opt.param_groups} == {False}
 
@@ -169,6 +193,34 @@ def test_reported_normuon_base_recipe_flags_are_explicit() -> None:
     opt.step()
     assert opt.last_stats["matrix_params"] > 0
     assert opt.last_stats["normuon_params"] == opt.last_stats["matrix_params"]
+    assert opt.last_stats["normuon_aspect_params"] == 0.0
+
+
+def test_reported_aspect_feedback_recipe_flags_are_explicit() -> None:
+    torch.manual_seed(14)
+    model = TinyNet()
+    opt = AnchorMuon(
+        _anchor_param_groups(model, weight_decay=0.05),
+        lr=8e-3,
+        warmup_steps=80,
+        soda="all",
+        amuse=False,
+        pmuon_eq=True,
+        pmuon_beta=0.90,
+        row_gamma=0.35,
+        col_gamma=0.05,
+        momentum=0.95,
+        normuon=True,
+        normuon_beta=0.93,
+        normuon_aspect_scale=True,
+        mimuon=False,
+    )
+    assert all(group["normuon_aspect_scale"] is True for group in opt.param_groups)
+    loss = _loss(model)
+    loss.backward()
+    opt.step()
+    assert opt.last_stats["matrix_params"] > 0
+    assert opt.last_stats["normuon_aspect_params"] == opt.last_stats["matrix_params"]
 
 
 def test_factory_currently_routes_2d_head_through_muon_path() -> None:
@@ -200,6 +252,7 @@ def test_reported_recipe_state_dict_resume_matches_uninterrupted_step() -> None:
             momentum=0.95,
             normuon=True,
             normuon_beta=0.95,
+            normuon_aspect_scale=False,
             mimuon=False,
         )
 

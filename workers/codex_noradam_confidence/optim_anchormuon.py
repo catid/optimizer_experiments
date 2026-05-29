@@ -14,7 +14,8 @@ schedule-free train/eval interpolation, ``soda="none"`` disables the SODA anchor
 pull, ``pmuon_eq=False`` disables row/column PMuonEq scaling, ``mimuon=True``
 blends the Muon branch with a normalized momentum-SGD branch, and
 ``normuon=True`` adds NorMuon-style row/column second-moment normalization after
-the Gram Newton-Schulz transform.
+the Gram Newton-Schulz transform. ``normuon_aspect_scale=True`` optionally adds
+the peer-review aspect multiplier after that normalization.
 
 For matrix-like parameters, AnchorMuon computes
 
@@ -178,6 +179,7 @@ def normuon_normalize_update(
     *,
     beta: float = 0.95,
     eps: float = 1e-10,
+    aspect_scale: bool = False,
 ) -> Tensor:
     """Apply NorMuon-style row/column second-moment normalization.
 
@@ -185,7 +187,9 @@ def normuon_normalize_update(
     gradient or momentum. For tall matrices this tracks row mean-square update
     energy; for wide matrices it tracks column mean-square update energy. The
     final Frobenius norm is restored so this changes row/column allocation
-    without silently changing the whole-layer step size.
+    without silently changing the whole-layer step size. ``aspect_scale`` then
+    applies the optional row-heavy multiplier ``sqrt(max(1, rows / cols))`` as a
+    deliberate layer update-scale ablation, matching the cross-worker feedback.
     """
 
     if update_matrix.ndim != 2:
@@ -210,7 +214,10 @@ def normuon_normalize_update(
     second_moment.lerp_(mean_square.to(second_moment.dtype), 1.0 - float(beta))
     normalized = update * torch.rsqrt(second_moment.to(update.dtype).clamp_min(float(eps)))
     new_norm = normalized.norm(dim=(-2, -1), keepdim=True).clamp_min(float(eps))
-    return normalized * (old_norm / new_norm)
+    normalized = normalized * (old_norm / new_norm)
+    if aspect_scale:
+        normalized = normalized * math.sqrt(max(1.0, float(update.shape[0]) / float(max(update.shape[1], 1))))
+    return normalized
 
 
 class AnchorMuon(torch.optim.Optimizer):
@@ -238,6 +245,9 @@ class AnchorMuon(torch.optim.Optimizer):
     * ``normuon``: applies NorMuon-style row/column second-moment normalization
       after Gram Newton-Schulz and before the existing Muon scale. This is off by
       default and exposed for ablations on top of PMuonEq/SODA.
+    * ``normuon_aspect_scale``: after NorMuon Frobenius restoration, multiply
+      tall matrices by ``sqrt(rows / cols)``. This is off by default because it
+      changes effective per-layer step size and must be tuned.
     * ``soda``: ``"matrix"`` by default, meaning only matrix/Muon parameters get
       SODA's initialization-anchor pull. Use ``True``/``"all"`` for all params or
       ``False``/``"none"`` to disable SODA.
@@ -268,6 +278,7 @@ class AnchorMuon(torch.optim.Optimizer):
         mimuon_mix: float = 0.85,
         normuon: bool = False,
         normuon_beta: float = 0.95,
+        normuon_aspect_scale: bool = False,
         normuon_eps: float = 1e-10,
         eps: float = 1e-8,
         pmuon_eps: float = 1e-6,
@@ -315,6 +326,7 @@ class AnchorMuon(torch.optim.Optimizer):
             mimuon_mix=float(mimuon_mix),
             normuon=bool(normuon),
             normuon_beta=float(normuon_beta),
+            normuon_aspect_scale=bool(normuon_aspect_scale),
             normuon_eps=float(normuon_eps),
             eps=float(eps),
             pmuon_eps=float(pmuon_eps),
@@ -473,6 +485,7 @@ class AnchorMuon(torch.optim.Optimizer):
         matrix_params = 0
         mimuon_params = 0
         normuon_params = 0
+        normuon_aspect_params = 0
         update_rms_sum = 0.0
         precond_rms_sum = 0.0
         sync_diagnostics_count = 0
@@ -535,12 +548,15 @@ class AnchorMuon(torch.optim.Optimizer):
                     )
                     if bool(group["normuon"]):
                         normuon_params += 1
+                        if bool(group.get("normuon_aspect_scale", False)):
+                            normuon_aspect_params += 1
                         normuon_second = self._ensure_normuon_state(param, state)
                         muon_matrix = normuon_normalize_update(
                             muon_matrix,
                             normuon_second,
                             beta=float(group["normuon_beta"]),
                             eps=float(group["normuon_eps"]),
+                            aspect_scale=bool(group.get("normuon_aspect_scale", False)),
                         )
                     muon_matrix = muon_matrix * (0.2 * math.sqrt(max(muon_matrix.shape[-2], muon_matrix.shape[-1])))
                     if bool(group["mimuon"]):
@@ -595,6 +611,7 @@ class AnchorMuon(torch.optim.Optimizer):
             "matrix_params": float(matrix_params),
             "mimuon_params": float(mimuon_params),
             "normuon_params": float(normuon_params),
+            "normuon_aspect_params": float(normuon_aspect_params),
             "sync_diagnostics": float(sync_diagnostics_count > 0),
         }
         if sync_diagnostics_count > 0:

@@ -24,17 +24,43 @@ commit b009f03 Compare NorMuon base against AdamW
 - `results/cifar10_feedback_nosync_20260529/final50/`: latest committed
   feedback run with synchronization diagnostics disabled, comparison diagrams,
   curves, CSV, and per-trial JSONL.
+- `results/cifar10_feedback_aspect_20260529/`: HPO and 3-seed 50-epoch replay
+  for the peer-suggested post-NorMuon aspect multiplier.
 
 ## Main Result
 
 Latest result summary:
-`results/cifar10_feedback_nosync_20260529/final50/summary.md`.
+`results/cifar10_feedback_aspect_20260529/summary.md`.
 
 Latest diagrams:
 
-- Loss curves: `results/cifar10_feedback_nosync_20260529/final50/comparison_loss_curves.png`
-- Validation accuracy: `results/cifar10_feedback_nosync_20260529/final50/comparison_accuracy.png`
-- Iteration speed: `results/cifar10_feedback_nosync_20260529/final50/comparison_iteration_speed.png`
+- Loss curves: `results/cifar10_feedback_aspect_20260529/final50/val_loss.png`
+- Validation accuracy: `results/cifar10_feedback_aspect_20260529/final50/val_acc.png`
+- Iteration speed: `results/cifar10_feedback_aspect_20260529/final50/step_time_ms_bar.png`
+
+### Latest Aspect-Feedback Replay
+
+This replay tested the cross-worker suggestion to add
+`normuon_aspect_scale=True`, a post-NorMuon `sqrt(max(1, rows / cols))`
+multiplier for tall matrices. The flag is disabled by default and the older
+reported no-aspect behavior remains available.
+
+HPO over aspect/no-aspect plus small `row_gamma`, `col_gamma`, and
+`normuon_beta` changes selected the no-aspect recipe
+`row_gamma=0.35`, `col_gamma=0.05`, `normuon_beta=0.95`. A 50-epoch replay used
+three seeds.
+
+| Run | AdamW | NorMuon no aspect | NorMuon aspect |
+|---|---:|---:|---:|
+| 50 epoch final val loss | 0.6210 +/- 0.0105 | 0.4225 +/- 0.0027 | 0.4288 +/- 0.0103 |
+| 50 epoch best val loss | 0.6088 +/- 0.0063 | 0.4198 +/- 0.0043 | 0.4236 +/- 0.0083 |
+| 50 epoch final val acc | 79.66% +/- 0.12 | 85.86% +/- 0.23 | 85.43% +/- 0.29 |
+| 50 epoch best val acc | 79.96% +/- 0.13 | 85.98% +/- 0.09 | 85.60% +/- 0.17 |
+| 50 epoch step time | 11.54 ms +/- 0.08 | 20.20 ms +/- 0.41 | 19.56 ms +/- 0.43 |
+| 50 epoch throughput | 44.36k ex/s +/- 0.31k | 25.36k ex/s +/- 0.51k | 26.18k ex/s +/- 0.58k |
+
+Conclusion: aspect scaling was close and slightly faster in this run, but did
+not beat the retuned no-aspect recipe on validation loss or accuracy.
 
 ### Latest 50-Epoch Replay
 
@@ -82,11 +108,12 @@ soda = "all"
 soda_disables_weight_decay = True
 pmuon_eq = True
 pmuon_beta = 0.90
-row_gamma = 0.30
-col_gamma = 0.0
+row_gamma = 0.35 for the latest aspect-feedback replay, 0.30 for the earlier no-sync replay
+col_gamma = 0.05 for the latest aspect-feedback replay, 0.0 for the earlier no-sync replay
 momentum = 0.95
 normuon = True
 normuon_beta = 0.95
+normuon_aspect_scale = False for the current best recipe
 mimuon = False
 ns_steps = 5
 sync_diagnostics = False for the latest run
@@ -150,6 +177,41 @@ OUT=results/cifar10_feedback_nosync_20260529/final50
   --warmup-steps 80 \
   --eval-bins 8 \
   --log-every 200 \
+  --model vit5_micro \
+  --seeds 123,456,789 \
+  --no-sync-step-timing
+```
+
+The latest aspect-feedback HPO and replay used:
+
+```bash
+OUT=results/cifar10_feedback_aspect_20260529/hpo
+/home/catid/screen/.venv/bin/python experiments/run_cifar10_ablation.py \
+  --preset feedback \
+  --output-dir "$OUT" \
+  --data-path /home/catid/screen/repos/TinyRecursiveModels/data/cifar10 \
+  --epochs 12 \
+  --train-subset 0 --val-subset 0 \
+  --batch-size 512 \
+  --num-workers 16 \
+  --warmup-steps 80 \
+  --eval-bins 8 \
+  --log-every 200 \
+  --model vit5_micro \
+  --no-sync-step-timing
+
+OUT=results/cifar10_feedback_aspect_20260529/final50
+/home/catid/screen/.venv/bin/python experiments/run_cifar10_ablation.py \
+  --final-from-hpo results/cifar10_feedback_aspect_20260529/hpo/best_by_family.json \
+  --output-dir "$OUT" \
+  --data-path /home/catid/screen/repos/TinyRecursiveModels/data/cifar10 \
+  --final-epochs 50 \
+  --train-subset 0 --val-subset 0 \
+  --batch-size 512 \
+  --num-workers 16 \
+  --warmup-steps 80 \
+  --eval-bins 8 \
+  --log-every 500 \
   --model vit5_micro \
   --seeds 123,456,789 \
   --no-sync-step-timing

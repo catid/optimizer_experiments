@@ -56,6 +56,7 @@ class TrialConfig:
     mimuon_mix: float = 0.85
     normuon: bool = False
     normuon_beta: float = 0.95
+    normuon_aspect_scale: bool = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preset",
         default="quick",
-        choices=["smoke", "quick", "full", "sweep", "focused20", "confidence"],
+        choices=["smoke", "quick", "full", "sweep", "focused20", "confidence", "feedback"],
     )
     parser.add_argument("--only", default="", help="Regex filter for trial names")
     parser.add_argument("--max-trials", type=int, default=0)
@@ -196,6 +197,33 @@ def trial_grid(preset: str) -> list[TrialConfig]:
     ]
     if preset == "focused20":
         return focused20
+    feedback = [
+        TrialConfig("adamw_cosine_lr0.004_wd0.001", "adamw", 4e-3, lr_schedule="cosine", weight_decay=0.001),
+    ]
+    for aspect in [False, True]:
+        for row_gamma in [0.30, 0.35]:
+            for col_gamma in [0.0, 0.05]:
+                for normuon_beta in [0.93, 0.95]:
+                    feedback.append(TrialConfig(
+                        (
+                            f"normuon{'_aspect' if aspect else ''}_mlr0.008"
+                            f"_rg{row_gamma:g}_cg{col_gamma:g}"
+                            f"_mom0.95_pb0.9_nb{normuon_beta:g}"
+                        ),
+                        "anchormuon",
+                        8e-3,
+                        soda="all",
+                        row_gamma=row_gamma,
+                        col_gamma=col_gamma,
+                        pmuon_beta=0.90,
+                        momentum=0.95,
+                        normuon=True,
+                        normuon_beta=normuon_beta,
+                        normuon_aspect_scale=aspect,
+                        amuse=False,
+                    ))
+    if preset == "feedback":
+        return feedback
     confidence: list[TrialConfig] = []
     for schedule in ["cosine", "constant"]:
         for lr in [2e-3, 3e-3, 4e-3]:
@@ -272,10 +300,14 @@ def trial_grid(preset: str) -> list[TrialConfig]:
 def trial_family(cfg: TrialConfig) -> str:
     if cfg.optimizer == "adamw":
         return "adamw"
+    if cfg.mimuon and cfg.normuon and cfg.normuon_aspect_scale:
+        return "anchormuon_mimuon_normuon_aspect"
     if cfg.mimuon and cfg.normuon:
         return "anchormuon_mimuon_normuon"
     if cfg.mimuon:
         return "anchormuon_mimuon"
+    if cfg.normuon and cfg.normuon_aspect_scale:
+        return "anchormuon_normuon_aspect"
     if cfg.normuon:
         return "anchormuon_normuon"
     if cfg.soda == "all":
@@ -363,6 +395,7 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             mimuon_mix=cfg.mimuon_mix,
             normuon=cfg.normuon,
             normuon_beta=cfg.normuon_beta,
+            normuon_aspect_scale=cfg.normuon_aspect_scale,
         )
     raise ValueError(f"unknown optimizer {cfg.optimizer}")
 
@@ -592,6 +625,7 @@ def run_worker(args: argparse.Namespace) -> None:
         "mimuon_mix": cfg.mimuon_mix,
         "normuon": cfg.normuon,
         "normuon_beta": cfg.normuon_beta,
+        "normuon_aspect_scale": cfg.normuon_aspect_scale,
         "avg_step_ms": 1000.0 * total_train_seconds / max(global_step, 1),
         "overall_examples_per_sec": total_examples_seen / max(total_train_seconds, 1e-9),
         "elapsed_sec": time.perf_counter() - started,
@@ -609,21 +643,23 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> None:
     if gpu_count < 1:
         raise RuntimeError("No visible CUDA GPUs")
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = args.output_dir.resolve()
+    data_path = args.data_path.resolve()
     pending = list(trials)
     running: list[tuple[subprocess.Popen, str]] = []
     next_gpu = 0
     while pending or running:
         while pending and len(running) < gpu_count:
             cfg = pending.pop(0)
-            trial_json = args.output_dir / f"{cfg.name}.trial.json"
+            trial_json = output_dir / f"{cfg.name}.trial.json"
             trial_json.write_text(json.dumps(asdict(cfg), indent=2) + "\n")
             cmd = [
                 sys.executable,
                 str(Path(__file__).resolve()),
                 "--worker",
                 "--trial-json", str(trial_json),
-                "--data-path", str(args.data_path),
-                "--output-dir", str(args.output_dir),
+                "--data-path", str(data_path),
+                "--output-dir", str(output_dir),
                 "--model", args.model,
                 "--epochs", str(args.epochs),
                 "--max-steps", str(args.max_steps),
@@ -736,6 +772,7 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
             mimuon_mix=float(row["mimuon_mix"]),
             normuon=parse_bool(row.get("normuon", False)),
             normuon_beta=float(row.get("normuon_beta", 0.95)),
+            normuon_aspect_scale=parse_bool(row.get("normuon_aspect_scale", False)),
         )
         fam = trial_family(cfg)
         current = by_family.get(fam)
@@ -855,6 +892,7 @@ def summaries_to_trials(rows: Iterable[dict]) -> list[TrialConfig]:
             mimuon_mix=float(row["mimuon_mix"]),
             normuon=parse_bool(row.get("normuon", False)),
             normuon_beta=float(row.get("normuon_beta", 0.95)),
+            normuon_aspect_scale=parse_bool(row.get("normuon_aspect_scale", False)),
         ))
     return trials
 

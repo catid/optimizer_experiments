@@ -52,7 +52,16 @@ def main() -> None:
     torch.manual_seed(100 + dist.get_rank())
     model = TinyDDP().cuda()
     ddp = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
-    opt = AnchorMuon(ddp.parameters(), lr=1e-3, warmup_steps=2, soda="all", pmuon_eq=True, mimuon=True, normuon=True)
+    opt = AnchorMuon(
+        ddp.parameters(),
+        lr=1e-3,
+        warmup_steps=2,
+        soda="all",
+        pmuon_eq=True,
+        mimuon=True,
+        normuon=True,
+        normuon_aspect_scale=True,
+    )
     for _ in range(3):
         opt.train()
         x = torch.randn(32, 16, device="cuda")
