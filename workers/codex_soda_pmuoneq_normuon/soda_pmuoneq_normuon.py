@@ -13,6 +13,20 @@ The matrix path is always:
 
     SODA anchor + PMuonEq row/column scaling + Gram Newton-Schulz + NorMuon
 
+By default NorMuon is the tuned row-wise variant with the aspect-ratio
+multiplier enabled. The ``normuon_mode`` and ``normuon_aspect_scale`` arguments
+exist only for compatibility and ablation:
+
+    normuon_mode="row", normuon_aspect_scale=True
+        winning/default recipe;
+
+    normuon_mode="row", normuon_aspect_scale=False
+        row-wise NorMuon without the extra tall-matrix multiplier;
+
+    normuon_mode="orientation", normuon_aspect_scale=False
+        use row statistics for tall matrices and column statistics for wide
+        matrices, without the extra aspect multiplier.
+
 The fallback path for biases, norms, embeddings, heads, and other non-matrix
 parameters is an RMS/AdamW-style second-moment adaptive update with ordinary
 weight decay. It intentionally matches the fallback path used in the winning
@@ -95,6 +109,26 @@ Speed tradeoff:
     SODA-PMuonEq-NorMuon was about 1.33x AdamW step time on the ViT-5 tiny
     CIFAR-10 confirmation runs. Use it when quality matters more than raw
     iterations/sec.
+
+Latest NorMuon aspect ablation
+==============================
+
+The code path used for the latest shared monorepo run is in
+``experiments/run_cifar10_normuon_aspect_ablation.py``. It launched four
+single-GPU trials concurrently across all four visible GPUs: AdamW, row-wise
+NorMuon with aspect scaling, row-wise NorMuon without aspect scaling, and
+orientation-aware NorMuon without aspect scaling.
+
+ViT-5 tiny / CIFAR-10, 50 epochs, batch size 512 per trial, seed 34000:
+
+    row + aspect:       val loss 0.4036, val acc 87.16%, 34.14 ms/step
+    row no aspect:      val loss 0.4174, val acc 86.43%, 34.29 ms/step
+    orientation no asp: val loss 0.4212, val acc 86.98%, 34.16 ms/step
+    tuned AdamW:        val loss 0.5476, val acc 83.03%, 18.91 ms/step
+
+This ablation supports keeping the row-wise aspect multiplier as the default.
+The quality gain versus AdamW is substantial in this setting, but the matrix
+optimizer path is about 1.8x slower per step than AdamW on this small model.
 
 Hyperparameter sensitivity
 ==========================
@@ -217,19 +251,42 @@ def _diag_inverse_power(diag: torch.Tensor, *, gamma: float, eps: float) -> torc
 
 
 @torch.no_grad()
-def _normuon_row_normalize(update: torch.Tensor, second_momentum: torch.Tensor, *, beta2: float, eps: float) -> torch.Tensor:
+def _normuon_second_shape(rows: int, cols: int, mode: str) -> tuple[int, int]:
+    if mode == "row":
+        return (rows, 1)
+    if mode == "orientation":
+        return (rows, 1) if rows >= cols else (1, cols)
+    raise ValueError(f"unknown NorMuon mode {mode!r}")
+
+
+@torch.no_grad()
+def _normuon_normalize(
+    update: torch.Tensor,
+    second_momentum: torch.Tensor,
+    *,
+    beta2: float,
+    eps: float,
+    mode: str,
+    aspect_scale: bool,
+) -> torch.Tensor:
     dtype = update.dtype
     eps_t = torch.tensor(eps, dtype=dtype, device=update.device)
     vnorm = update.norm(dim=(-2, -1), keepdim=True)
+    rows, cols = update.shape[-2], update.shape[-1]
+    expected_shape = _normuon_second_shape(rows, cols, mode)
+    if tuple(second_momentum.shape[-2:]) != expected_shape:
+        raise ValueError(f"NorMuon second momentum shape {tuple(second_momentum.shape[-2:])} != {expected_shape}")
+    reduce_dim = -1 if expected_shape[-1] == 1 else -2
     try:
-        row_power = update.square().mean(dim=-1, keepdim=True, dtype=dtype)
+        power = update.square().mean(dim=reduce_dim, keepdim=True, dtype=dtype)
     except TypeError:
-        row_power = update.square().mean(dim=-1, keepdim=True).to(dtype)
-    second_momentum.lerp_(row_power, 1.0 - beta2)
+        power = update.square().mean(dim=reduce_dim, keepdim=True).to(dtype)
+    second_momentum.lerp_(power, 1.0 - beta2)
     out = update * torch.rsqrt(second_momentum + eps_t)
     out = out * (vnorm / (out.norm(dim=(-2, -1), keepdim=True) + eps_t))
-    rows, cols = out.shape[-2], out.shape[-1]
-    return out * math.sqrt(max(1.0, rows / cols))
+    if aspect_scale:
+        out = out * math.sqrt(max(1.0, rows / cols))
+    return out
 
 
 def _is_default_fallback_name(name: str) -> bool:
@@ -394,6 +451,8 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         pmuoneq_eps: float = 1e-6,
         normuon_beta2: float = 0.93,
         normuon_eps: float = 1e-10,
+        normuon_mode: str = "row",
+        normuon_aspect_scale: bool = True,
         ns_epsilon: float = 1e-7,
         ns_compute_dtype: torch.dtype | None = None,
         use_external_lr: bool = False,
@@ -420,6 +479,8 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             pmuoneq_eps=pmuoneq_eps,
             normuon_beta2=normuon_beta2,
             normuon_eps=normuon_eps,
+            normuon_mode=normuon_mode,
+            normuon_aspect_scale=normuon_aspect_scale,
             use_external_lr=use_external_lr,
         )
         super().__init__(prepared, defaults={})
@@ -452,6 +513,8 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         pmuoneq_eps: float,
         normuon_beta2: float,
         normuon_eps: float,
+        normuon_mode: str,
+        normuon_aspect_scale: bool,
         use_external_lr: bool,
     ) -> list[dict[str, Any]]:
         items = list(params)
@@ -474,6 +537,8 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                     group.setdefault("pmuoneq_eps", pmuoneq_eps)
                     group.setdefault("normuon_beta2", normuon_beta2)
                     group.setdefault("normuon_eps", normuon_eps)
+                    group.setdefault("normuon_mode", normuon_mode)
+                    group.setdefault("normuon_aspect_scale", normuon_aspect_scale)
                 else:
                     group.setdefault("weight_decay", adam_weight_decay)
                     group.setdefault("betas", adam_betas)
@@ -506,6 +571,8 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                     "pmuoneq_eps": pmuoneq_eps,
                     "normuon_beta2": normuon_beta2,
                     "normuon_eps": normuon_eps,
+                    "normuon_mode": normuon_mode,
+                    "normuon_aspect_scale": normuon_aspect_scale,
                     "use_external_lr": use_external_lr,
                 }
             )
@@ -550,7 +617,14 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         source = torch.lerp(g, momentum, momentum_beta)
         return _matrix_view(source), _matrix_view(g)
 
-    def _ensure_matrix_state(self, p: torch.Tensor, rows: int, cols: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _ensure_matrix_state(
+        self,
+        p: torch.Tensor,
+        rows: int,
+        cols: int,
+        device: torch.device,
+        normuon_mode: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         state = self.state[p]
         row_ema = state.get("pmuoneq_row_ema")
         if row_ema is None or row_ema.shape != (rows,) or row_ema.device != device:
@@ -565,8 +639,9 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         if col_factor is None or col_factor.shape != (cols,) or col_factor.device != device:
             col_factor = state["pmuoneq_col_factor"] = torch.ones(cols, device=device, dtype=torch.float32)
         second = state.get("normuon_second_momentum")
-        if second is None or second.shape != (rows, 1) or second.device != device:
-            second = state["normuon_second_momentum"] = torch.zeros(rows, 1, device=device, dtype=torch.float32)
+        second_shape = _normuon_second_shape(rows, cols, normuon_mode)
+        if second is None or second.shape != second_shape or second.device != device:
+            second = state["normuon_second_momentum"] = torch.zeros(*second_shape, device=device, dtype=torch.float32)
         return row_ema, col_ema, row_factor, col_factor, second
 
     def _transform_matrix_bucket(
@@ -582,9 +657,10 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         row_factor_buffers: list[torch.Tensor] = []
         col_factor_buffers: list[torch.Tensor] = []
         second_buffers: list[torch.Tensor] = []
+        normuon_mode = str(group.get("normuon_mode", "row"))
 
         for p, _anchor, _source, _grad in entries:
-            row_ema, col_ema, row_factor, col_factor, second = self._ensure_matrix_state(p, rows, cols, grads.device)
+            row_ema, col_ema, row_factor, col_factor, second = self._ensure_matrix_state(p, rows, cols, grads.device, normuon_mode)
             row_buffers.append(row_ema)
             col_buffers.append(col_ema)
             row_factor_buffers.append(row_factor)
@@ -605,11 +681,13 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         update = update * (0.2 * math.sqrt(max(update.size(-2), update.size(-1))))
 
         second_stack = torch.stack(second_buffers, dim=0)
-        update = _normuon_row_normalize(
+        update = _normuon_normalize(
             update,
             second_stack,
             beta2=float(group["normuon_beta2"]),
             eps=float(group["normuon_eps"]),
+            mode=normuon_mode,
+            aspect_scale=bool(group.get("normuon_aspect_scale", True)),
         )
 
         for idx, (p, _anchor, _source, _grad) in enumerate(entries):
@@ -722,6 +800,8 @@ def build_soda_pmuoneq_normuon_param_groups(
     pmuoneq_eps: float = 1e-6,
     normuon_beta2: float = 0.93,
     normuon_eps: float = 1e-10,
+    normuon_mode: str = "row",
+    normuon_aspect_scale: bool = True,
     matrix_filter: Callable[[str, torch.nn.Parameter], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Split named parameters into matrix and RMS/AdamW-style fallback groups."""
@@ -762,6 +842,8 @@ def build_soda_pmuoneq_normuon_param_groups(
                 "pmuoneq_eps": pmuoneq_eps,
                 "normuon_beta2": normuon_beta2,
                 "normuon_eps": normuon_eps,
+                "normuon_mode": normuon_mode,
+                "normuon_aspect_scale": normuon_aspect_scale,
             }
         )
     if fallback_params:
