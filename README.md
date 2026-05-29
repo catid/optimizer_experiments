@@ -22,6 +22,17 @@ batch size 512, 50 epochs, three seeds, BF16 autocast, channels-last tensors,
 | AnchorMuon + NorMuon + aspect scale | 84.55% +/- 0.40 | 0.4595 +/- 0.0074 | 85.25% +/- 0.32 | 0.4445 +/- 0.0130 | 19.92 ms |
 | AdamW cosine baseline | 79.28% +/- 0.23 | 0.6338 +/- 0.0125 | 79.69% +/- 0.22 | 0.6180 +/- 0.0043 | 11.59 ms |
 
+Latest direct root-optimizer validation, single seed `123`, used the same
+ViT-5 micro / CIFAR-10 split protocol and called the root optimizer directly as
+`SodaPmuonEqNorMuon(model.named_parameters(), ...)`. No trainer-side custom
+parameter groups, matrix filters, root subclasses, column-gamma adapters, or
+aspect-scaling adapters were used.
+
+| Recipe | Official test acc | Official test loss | Final val acc | Final val loss | Best val acc | Best val loss | Step time |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Root `optimizer.py` SODA + PMuonEq + GramNS + NorMuon | 85.31% | 0.4527 | 85.70% | 0.4260 | 85.72% | 0.4157 | 16.72 ms |
+| AdamW cosine baseline | 79.69% | 0.6265 | 79.84% | 0.6133 | 80.56% | 0.6000 | 11.99 ms |
+
 Use `workers/codex_noradam_confidence/ALGORITHM_RESULTS.md` for the full
 self-contained algorithm description, hyperparameters, protocol, and caveats.
 The runner also exposes a `--preset best_cifar10` preset containing the winning
@@ -42,13 +53,31 @@ print(optimizer.group_summary())
 The root file implements only the focused winner: SODA anchor updates,
 row-only PMuonEq, Gram Newton-Schulz, and NorMuon. It intentionally does not
 include AMUSE, MiMuon, full PMuon, column PMuonEq, or aspect-scaling ablations.
-The param-group builder remains available for advanced custom routing, but
-normal training code should not need to construct optimizer groups by hand.
+The direct validation above used the normal public API, not a trainer-side
+adapter. The param-group builder remains available for advanced custom routing,
+but normal training code should not need to construct optimizer groups by hand.
 Prefer passing a module or `model.named_parameters()` rather than
 `model.parameters()`, because names are needed to route embeddings, heads,
 normalization weights, and tied tensors safely. Sparse gradients are not
 supported; use dense embeddings or a separate sparse optimizer for those
 parameters.
+
+Trainer integration should be boring:
+
+```python
+optimizer = SodaPmuonEqNorMuon(
+    model.named_parameters(),
+    matrix_lr=8e-3,
+    fallback_lr=8e-3,
+    row_gamma=0.35,
+    normuon_beta2=0.93,
+    warmup_steps=80,
+)
+```
+
+Do not scale gradients, override the matrix grouping to reproduce old ablation
+paths, or subclass the optimizer for aspect/column-gamma behavior when testing
+the root file. Those are research ablations, not the shippable root optimizer.
 
 ### Default Hyperparameters
 
