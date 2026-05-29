@@ -1,0 +1,56 @@
+{"event": "step", "step": 100, "epoch": 1, "batch": 2, "train_loss": 1.3507404327392578}
+{"event": "step", "step": 200, "epoch": 2, "batch": 5, "train_loss": 1.3058438301086426}
+{"event": "step", "step": 300, "epoch": 3, "batch": 8, "train_loss": 1.202425479888916}
+{"event": "step", "step": 400, "epoch": 4, "batch": 11, "train_loss": 1.0558311939239502}
+{"event": "step", "step": 500, "epoch": 5, "batch": 14, "train_loss": 1.0387191772460938}
+{"event": "step", "step": 600, "epoch": 6, "batch": 17, "train_loss": 0.8210484981536865}
+{"event": "bin", "trial": "orientation_aspect_mlr0.008_rg0.3_cg0_nb0.95", "step": 606, "epoch": 7, "progress": 0.12494845360824743, "train_loss_interval": 1.2397353035388607, "val_loss": 0.8301707458496094, "val_accuracy": 0.7095, "best_val_loss": 0.8301707458496094, "best_val_accuracy": 0.7095, "examples_per_s_interval": 14144.82203288393, "mean_step_s_interval": 0.034719682816322275, "overall_examples_per_s": 14746.678496708519, "elapsed_s": 21.935504297027364}
+{"event": "step", "step": 700, "epoch": 7, "batch": 20, "train_loss": 0.7629683017730713}
+{"event": "step", "step": 800, "epoch": 8, "batch": 23, "train_loss": 0.8388339877128601}
+{"event": "step", "step": 900, "epoch": 9, "batch": 26, "train_loss": 0.7375572919845581}
+{"event": "step", "step": 1000, "epoch": 10, "batch": 29, "train_loss": 0.6552073359489441}
+{"event": "step", "step": 1100, "epoch": 11, "batch": 32, "train_loss": 0.6454803943634033}
+{"event": "step", "step": 1200, "epoch": 12, "batch": 35, "train_loss": 0.734528124332428}
+{"event": "bin", "trial": "orientation_aspect_mlr0.008_rg0.3_cg0_nb0.95", "step": 1212, "epoch": 13, "progress": 0.24989690721649485, "train_loss_interval": 0.7287139677175201, "val_loss": 0.6256637588500976, "val_accuracy": 0.7836, "best_val_loss": 0.6256637588500976, "best_val_accuracy": 0.7836, "examples_per_s_interval": 14691.360885071152, "mean_step_s_interval": 0.033915894054930666, "overall_examples_per_s": 14919.3763158839, "elapsed_s": 43.05505725101102}
+{"event": "step", "step": 1300, "epoch": 13, "batch": 38, "train_loss": 0.6473873853683472}
+{"event": "step", "step": 1400, "epoch": 14, "batch": 41, "train_loss": 0.47935187816619873}
+{"event": "step", "step": 1500, "epoch": 15, "batch": 44, "train_loss": 0.5532044768333435}
+{"event": "step", "step": 1600, "epoch": 16, "batch": 47, "train_loss": 0.5188153386116028}
+{"event": "step", "step": 1700, "epoch": 17, "batch": 50, "train_loss": 0.511084794998169}
+{"event": "step", "step": 1800, "epoch": 18, "batch": 53, "train_loss": 0.4926187992095947}
+{"event": "bin", "trial": "orientation_aspect_mlr0.008_rg0.3_cg0_nb0.95", "step": 1819, "epoch": 19, "progress": 0.3750515463917526, "train_loss_interval": 0.5353610094826933, "val_loss": 0.4856597732543945, "val_accuracy": 0.8319, "best_val_loss": 0.4856597732543945, "best_val_accuracy": 0.8319, "examples_per_s_interval": 14443.511111871792, "mean_step_s_interval": 0.03447544787104412, "overall_examples_per_s": 14896.539158280671, "elapsed_s": 64.57236862601712}
+{"event": "step", "step": 1900, "epoch": 19, "batch": 56, "train_loss": 0.4123861491680145}
+{"event": "step", "step": 2000, "epoch": 20, "batch": 59, "train_loss": 0.4496521055698395}
+{"event": "step", "step": 2100, "epoch": 21, "batch": 62, "train_loss": 0.4527556598186493}
+{"event": "step", "step": 2200, "epoch": 22, "batch": 65, "train_loss": 0.37435346841812134}
+{"event": "step", "step": 2300, "epoch": 23, "batch": 68, "train_loss": 0.42856407165527344}
+{"event": "step", "step": 2400, "epoch": 24, "batch": 71, "train_loss": 0.3901805579662323}
+{"event": "bin", "trial": "orientation_aspect_mlr0.008_rg0.3_cg0_nb0.95", "step": 2425, "epoch": 25, "progress": 0.5, "train_loss_interval": 0.43246671242682455, "val_loss": 0.44520537185668946, "val_accuracy": 0.8488, "best_val_loss": 0.44520537185668946, "best_val_accuracy": 0.8488, "examples_per_s_interval": 14549.740621722167, "mean_step_s_interval": 0.03423673860773309, "overall_examples_per_s": 14911.029807810806, "elapsed_s": 85.8973912410438}
+{"event": "step", "step": 2500, "epoch": 25, "batch": 74, "train_loss": 0.43891850113868713}
+{"event": "step", "step": 2600, "epoch": 26, "batch": 77, "train_loss": 0.38827601075172424}
+{"event": "step", "step": 2700, "epoch": 27, "batch": 80, "train_loss": 0.4439345896244049}
+{"event": "step", "step": 2800, "epoch": 28, "batch": 83, "train_loss": 0.3414885103702545}
+{"event": "step", "step": 2900, "epoch": 29, "batch": 86, "train_loss": 0.4049164354801178}
+{"event": "step", "step": 3000, "epoch": 30, "batch": 89, "train_loss": 0.36370623111724854}
+{"event": "bin", "trial": "orientation_aspect_mlr0.008_rg0.3_cg0_nb0.95", "step": 3031, "epoch": 32, "progress": 0.6249484536082475, "train_loss_interval": 0.363284762887278, "val_loss": 0.43007882537841796, "val_accuracy": 0.8571, "best_val_loss": 0.43007882537841796, "best_val_accuracy": 0.8571, "examples_per_s_interval": 14501.912457394754, "mean_step_s_interval": 0.03432243220160774, "overall_examples_per_s": 14912.294549271588, "elapsed_s": 107.29276106401812}
+{"event": "step", "step": 3100, "epoch": 31, "batch": 92, "train_loss": 0.341594398021698}
+{"event": "step", "step": 3200, "epoch": 32, "batch": 95, "train_loss": 0.32159483432769775}
+{"event": "step", "step": 3300, "epoch": 34, "batch": 1, "train_loss": 0.29731249809265137}
+{"event": "step", "step": 3400, "epoch": 35, "batch": 4, "train_loss": 0.25823894143104553}
+{"event": "step", "step": 3500, "epoch": 36, "batch": 7, "train_loss": 0.27112874388694763}
+{"event": "step", "step": 3600, "epoch": 37, "batch": 10, "train_loss": 0.2669246196746826}
+{"event": "bin", "trial": "orientation_aspect_mlr0.008_rg0.3_cg0_nb0.95", "step": 3638, "epoch": 38, "progress": 0.7501030927835052, "train_loss_interval": 0.31201758907104443, "val_loss": 0.3900567024230957, "val_accuracy": 0.8689, "best_val_loss": 0.3900567024230957, "best_val_accuracy": 0.8689, "examples_per_s_interval": 14479.591390516944, "mean_step_s_interval": 0.03440304509271243, "overall_examples_per_s": 14907.298893677198, "elapsed_s": 128.75646184606012}
+{"event": "step", "step": 3700, "epoch": 38, "batch": 13, "train_loss": 0.3007814884185791}
+{"event": "step", "step": 3800, "epoch": 39, "batch": 16, "train_loss": 0.25696858763694763}
+{"event": "step", "step": 3900, "epoch": 40, "batch": 19, "train_loss": 0.2574310898780823}
+{"event": "step", "step": 4000, "epoch": 41, "batch": 22, "train_loss": 0.23209959268569946}
+{"event": "step", "step": 4100, "epoch": 42, "batch": 25, "train_loss": 0.2655389606952667}
+{"event": "step", "step": 4200, "epoch": 43, "batch": 28, "train_loss": 0.23427557945251465}
+{"event": "bin", "trial": "orientation_aspect_mlr0.008_rg0.3_cg0_nb0.95", "step": 4244, "epoch": 44, "progress": 0.8750515463917525, "train_loss_interval": 0.2741664637482599, "val_loss": 0.413529719543457, "val_accuracy": 0.8677, "best_val_loss": 0.3900567024230957, "best_val_accuracy": 0.8689, "examples_per_s_interval": 14570.65602274277, "mean_step_s_interval": 0.03417395307642497, "overall_examples_per_s": 14917.944001074113, "elapsed_s": 150.05093283799943}
+{"event": "step", "step": 4300, "epoch": 44, "batch": 31, "train_loss": 0.27284809947013855}
+{"event": "step", "step": 4400, "epoch": 45, "batch": 34, "train_loss": 0.22033454477787018}
+{"event": "step", "step": 4500, "epoch": 46, "batch": 37, "train_loss": 0.2744348645210266}
+{"event": "step", "step": 4600, "epoch": 47, "batch": 40, "train_loss": 0.285054087638855}
+{"event": "step", "step": 4700, "epoch": 48, "batch": 43, "train_loss": 0.28328806161880493}
+{"event": "step", "step": 4800, "epoch": 49, "batch": 46, "train_loss": 0.20219919085502625}
+{"event": "bin", "trial": "orientation_aspect_mlr0.008_rg0.3_cg0_nb0.95", "step": 4850, "epoch": 50, "progress": 1.0, "train_loss_interval": 0.24403870499173408, "val_loss": 0.4256081153869629, "val_accuracy": 0.8655, "best_val_loss": 0.3900567024230957, "best_val_accuracy": 0.8689, "examples_per_s_interval": 14607.25097150613, "mean_step_s_interval": 0.034124687441975096, "overall_examples_per_s": 14928.617873601823, "elapsed_s": 171.2919943240704}

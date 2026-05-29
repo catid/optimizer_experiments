@@ -102,6 +102,7 @@ def test_optimizer_step_is_finite_and_creates_matrix_state() -> None:
     assert "pmuoneq_col_ema" in state
     assert "normuon_second_momentum" in state
     assert opt.last_stats["matrix_count"] >= 1
+    assert opt.last_stats["fallback_count"] >= 1
 
 
 def test_normuon_aspect_and_orientation_ablation_controls() -> None:
@@ -289,3 +290,38 @@ def test_external_lr_is_not_overwritten_by_internal_warmup() -> None:
         group["lr"] = 3e-4
     _run_step(model, opt, 0)
     assert {group["lr"] for group in opt.param_groups} == {3e-4}
+
+
+def test_soda_disables_matrix_weight_decay_by_default() -> None:
+    def make_model_and_grad() -> tuple[nn.Linear, torch.Tensor]:
+        torch.manual_seed(31)
+        model = nn.Linear(8, 8, bias=False)
+        x = torch.randn(16, 8)
+        y = torch.randn(16, 8)
+        loss = F.mse_loss(model(x), y)
+        loss.backward()
+        return model, model.weight.grad.detach().clone()
+
+    disabled, grad = make_model_and_grad()
+    enabled = copy.deepcopy(disabled)
+    enabled.weight.grad = grad.clone()
+
+    opt_disabled = SodaPmuonEqNorMuon(
+        [{"params": [disabled.weight], "use_matrix_update": True, "weight_decay": 0.5}],
+        matrix_lr=1e-3,
+        warmup_steps=1,
+        soda_disables_matrix_weight_decay=True,
+    )
+    opt_enabled = SodaPmuonEqNorMuon(
+        [{"params": [enabled.weight], "use_matrix_update": True, "weight_decay": 0.5}],
+        matrix_lr=1e-3,
+        warmup_steps=1,
+        soda_disables_matrix_weight_decay=False,
+    )
+
+    opt_disabled.step()
+    opt_enabled.step()
+
+    assert opt_disabled.last_stats["matrix_weight_decay_count"] == 0.0
+    assert opt_enabled.last_stats["matrix_weight_decay_count"] == 1.0
+    assert not torch.allclose(disabled.weight, enabled.weight)

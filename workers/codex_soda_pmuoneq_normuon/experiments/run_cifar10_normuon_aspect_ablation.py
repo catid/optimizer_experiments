@@ -7,6 +7,7 @@ the tuned standalone recipe plus two NorMuon variants requested by peer review:
 * current row-wise NorMuon with the tuned aspect-ratio scale;
 * row-wise NorMuon without the extra aspect-ratio scale;
 * orientation-aware NorMuon without the extra aspect-ratio scale;
+* orientation-aware NorMuon with the same aspect-ratio scale;
 * tuned AdamW baseline for context.
 """
 
@@ -77,12 +78,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=10)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--only", default="", help="Regex-free substring filter for trial names")
+    parser.add_argument("--preset", choices=("fixed", "tune", "peer_final"), default="fixed")
     parser.add_argument("--sync-step-timing", action="store_true", help="Synchronize CUDA around every measured step")
     parser.add_argument("--skip-existing", action="store_true")
     return parser.parse_args()
 
 
-def default_trials(seed: int) -> list[Trial]:
+def fixed_trials(seed: int) -> list[Trial]:
     return [
         Trial("adamw_lr0.0025_wd0.005", "adamw", lr=2.5e-3, weight_decay=0.005, seed=seed),
         Trial(
@@ -106,7 +108,111 @@ def default_trials(seed: int) -> list[Trial]:
             normuon_aspect_scale=False,
             seed=seed,
         ),
+        Trial(
+            "orientation_aspect_mlr0.008_rg0.35_cg0.05_nb0.93",
+            "soda_pmuoneq_normuon",
+            normuon_mode="orientation",
+            normuon_aspect_scale=True,
+            seed=seed,
+        ),
     ]
+
+
+def tuning_trials(seed: int) -> list[Trial]:
+    trials = [Trial("adamw_lr0.0025_wd0.005", "adamw", lr=2.5e-3, weight_decay=0.005, seed=seed)]
+    for mode, aspect in [("row", True), ("orientation", True), ("row", False), ("orientation", False)]:
+        for row_gamma, col_gamma, beta2 in [(0.30, 0.0, 0.95), (0.35, 0.05, 0.93), (0.40, 0.05, 0.93)]:
+            aspect_tag = "aspect" if aspect else "noaspect"
+            name = (
+                f"{mode}_{aspect_tag}_mlr0.008_"
+                f"rg{row_gamma:g}_cg{col_gamma:g}_nb{beta2:g}"
+            ).replace(".", "p")
+            trials.append(
+                Trial(
+                    name,
+                    "soda_pmuoneq_normuon",
+                    row_gamma=row_gamma,
+                    col_gamma=col_gamma,
+                    normuon_beta2=beta2,
+                    normuon_mode=mode,
+                    normuon_aspect_scale=aspect,
+                    seed=seed,
+                )
+            )
+    return trials
+
+
+def peer_final_trials(seed: int) -> list[Trial]:
+    return [
+        Trial("adamw_lr0.0025_wd0.005", "adamw", lr=2.5e-3, weight_decay=0.005, seed=seed),
+        Trial(
+            "row_aspect_mlr0.008_rg0.35_cg0.05_nb0.93",
+            "soda_pmuoneq_normuon",
+            normuon_mode="row",
+            normuon_aspect_scale=True,
+            seed=seed,
+        ),
+        Trial(
+            "row_aspect_mlr0.008_rg0.4_cg0.05_nb0.93",
+            "soda_pmuoneq_normuon",
+            row_gamma=0.40,
+            col_gamma=0.05,
+            normuon_beta2=0.93,
+            normuon_mode="row",
+            normuon_aspect_scale=True,
+            seed=seed,
+        ),
+        Trial(
+            "orientation_aspect_mlr0.008_rg0.3_cg0_nb0.95",
+            "soda_pmuoneq_normuon",
+            row_gamma=0.30,
+            col_gamma=0.0,
+            normuon_beta2=0.95,
+            normuon_mode="orientation",
+            normuon_aspect_scale=True,
+            seed=seed,
+        ),
+        Trial(
+            "orientation_aspect_mlr0.008_rg0.4_cg0.05_nb0.93",
+            "soda_pmuoneq_normuon",
+            row_gamma=0.40,
+            col_gamma=0.05,
+            normuon_beta2=0.93,
+            normuon_mode="orientation",
+            normuon_aspect_scale=True,
+            seed=seed,
+        ),
+        Trial(
+            "row_noaspect_mlr0.008_rg0.3_cg0_nb0.95",
+            "soda_pmuoneq_normuon",
+            row_gamma=0.30,
+            col_gamma=0.0,
+            normuon_beta2=0.95,
+            normuon_mode="row",
+            normuon_aspect_scale=False,
+            seed=seed,
+        ),
+        Trial(
+            "orientation_noaspect_mlr0.008_rg0.4_cg0.05_nb0.93",
+            "soda_pmuoneq_normuon",
+            row_gamma=0.40,
+            col_gamma=0.05,
+            normuon_beta2=0.93,
+            normuon_mode="orientation",
+            normuon_aspect_scale=False,
+            seed=seed,
+        ),
+    ]
+
+
+def default_trials(seed: int, preset: str) -> list[Trial]:
+    if preset == "fixed":
+        return fixed_trials(seed)
+    if preset == "tune":
+        return tuning_trials(seed)
+    if preset == "peer_final":
+        return peer_final_trials(seed)
+    raise ValueError(preset)
 
 
 def selected_eval_steps(total_steps: int, bins: int) -> set[int]:
@@ -239,6 +345,9 @@ def run_worker(args: argparse.Namespace) -> None:
     global_step = 0
     best_val_loss = float("inf")
     best_val_accuracy = 0.0
+    final_val_loss = float("nan")
+    final_val_accuracy = float("nan")
+    final_train_loss_interval = float("nan")
     total_examples = 0
     total_step_s = 0.0
     started = time.perf_counter()
@@ -281,6 +390,9 @@ def run_worker(args: argparse.Namespace) -> None:
                     handle.flush()
                 if global_step in eval_steps:
                     val_loss, val_accuracy = evaluate(model, val_loader, device)
+                    final_val_loss = val_loss
+                    final_val_accuracy = val_accuracy
+                    final_train_loss_interval = interval_loss / max(interval_examples, 1)
                     best_val_loss = min(best_val_loss, val_loss)
                     best_val_accuracy = max(best_val_accuracy, val_accuracy)
                     row = {
@@ -289,7 +401,7 @@ def run_worker(args: argparse.Namespace) -> None:
                         "step": global_step,
                         "epoch": epoch + 1,
                         "progress": global_step / max(total_steps, 1),
-                        "train_loss_interval": interval_loss / max(interval_examples, 1),
+                        "train_loss_interval": final_train_loss_interval,
                         "val_loss": val_loss,
                         "val_accuracy": val_accuracy,
                         "best_val_loss": best_val_loss,
@@ -311,9 +423,13 @@ def run_worker(args: argparse.Namespace) -> None:
                 break
     final = {
         **asdict(trial),
+        "display_lr": trial.lr if trial.optimizer == "adamw" else trial.matrix_lr,
         "steps": global_step,
         "best_val_loss": best_val_loss,
         "best_val_accuracy": best_val_accuracy,
+        "final_val_loss": final_val_loss,
+        "final_val_accuracy": final_val_accuracy,
+        "final_train_loss_interval": final_train_loss_interval,
         "overall_examples_per_s": total_examples / max(total_step_s, 1e-9),
         "mean_step_s": total_step_s / max(global_step, 1),
         "elapsed_s": time.perf_counter() - started,
@@ -338,20 +454,25 @@ def summarize(output_dir: Path) -> None:
     if summaries:
         keys = sorted({key for row in summaries for key in row})
         with (output_dir / "summary.csv").open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=keys)
+            writer = csv.DictWriter(handle, fieldnames=keys, lineterminator="\n")
             writer.writeheader()
             writer.writerows(summaries)
     if curves:
         keys = sorted({key for row in curves for key in row})
         with (output_dir / "curves.csv").open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=keys)
+            writer = csv.DictWriter(handle, fieldnames=keys, lineterminator="\n")
             writer.writeheader()
             writer.writerows(curves)
     ranked = sorted(summaries, key=lambda row: (row["best_val_loss"], -row["best_val_accuracy"]))
-    lines = ["# CIFAR-10 NorMuon Aspect Ablation\n", "| trial | best val loss | best val acc | examples/s | mean step ms |", "|---|---:|---:|---:|---:|"]
+    lines = [
+        "# CIFAR-10 NorMuon Aspect Ablation\n",
+        "| trial | best val loss | final val loss | best val acc | final val acc | examples/s | mean step ms |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
     for row in ranked:
         lines.append(
-            f"| {row['name']} | {row['best_val_loss']:.4f} | {100*row['best_val_accuracy']:.2f}% | "
+            f"| {row['name']} | {row['best_val_loss']:.4f} | {row.get('final_val_loss', float('nan')):.4f} | "
+            f"{100*row['best_val_accuracy']:.2f}% | {100*row.get('final_val_accuracy', float('nan')):.2f}% | "
             f"{row['overall_examples_per_s']:.0f} | {1000*row['mean_step_s']:.2f} |"
         )
     (output_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -361,7 +482,7 @@ def launch(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for these training runs")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    trials = [trial for trial in default_trials(args.seed) if not args.only or args.only in trial.name]
+    trials = [trial for trial in default_trials(args.seed, args.preset) if not args.only or args.only in trial.name]
     pending = list(trials)
     running: list[tuple[subprocess.Popen, str]] = []
     gpu_count = torch.cuda.device_count()
@@ -405,6 +526,8 @@ def launch(args: argparse.Namespace) -> None:
                 str(args.warmup_steps),
                 "--log-every",
                 str(args.log_every),
+                "--preset",
+                args.preset,
             ]
             if args.sync_step_timing:
                 cmd.append("--sync-step-timing")

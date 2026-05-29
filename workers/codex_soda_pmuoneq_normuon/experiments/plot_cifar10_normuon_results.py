@@ -22,6 +22,12 @@ LABELS = {
     "row_aspect_mlr0.008_rg0.35_cg0.05_nb0.93": "SODA-PMuonEq-NorMuon row + aspect",
     "row_noaspect_mlr0.008_rg0.35_cg0.05_nb0.93": "SODA-PMuonEq-NorMuon row",
     "orientation_noaspect_mlr0.008_rg0.35_cg0.05_nb0.93": "SODA-PMuonEq-NorMuon orient",
+    "orientation_aspect_mlr0.008_rg0.35_cg0.05_nb0.93": "SODA-PMuonEq-NorMuon orient + aspect",
+    "row_aspect_mlr0.008_rg0.4_cg0.05_nb0.93": "row + aspect, rg0.40",
+    "orientation_aspect_mlr0.008_rg0.3_cg0_nb0.95": "orient + aspect, rg0.30/cg0",
+    "orientation_aspect_mlr0.008_rg0.4_cg0.05_nb0.93": "orient + aspect, rg0.40",
+    "row_noaspect_mlr0.008_rg0.3_cg0_nb0.95": "row no aspect, rg0.30/cg0",
+    "orientation_noaspect_mlr0.008_rg0.4_cg0.05_nb0.93": "orient no aspect, rg0.40",
 }
 
 
@@ -143,13 +149,14 @@ def write_report(result_dir: Path, summaries: list[dict[str, str]], best_name: s
         "",
         "![Iteration speed](figures/iteration_speed.png)",
         "",
-        "| rank | optimizer | best val loss | best val acc | examples/s | mean step ms |",
-        "|---:|---|---:|---:|---:|---:|",
+        "| rank | optimizer | best val loss | final val loss | best val acc | final val acc | examples/s | mean step ms |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|",
     ]
     for idx, row in enumerate(by_loss, start=1):
         lines.append(
             f"| {idx} | {LABELS.get(row['name'], row['name'])} | {as_float(row, 'best_val_loss'):.4f} | "
-            f"{100.0 * as_float(row, 'best_val_accuracy'):.2f}% | {as_float(row, 'overall_examples_per_s'):.0f} | "
+            f"{as_float(row, 'final_val_loss'):.4f} | {100.0 * as_float(row, 'best_val_accuracy'):.2f}% | "
+            f"{100.0 * as_float(row, 'final_val_accuracy'):.2f}% | {as_float(row, 'overall_examples_per_s'):.0f} | "
             f"{1000.0 * as_float(row, 'mean_step_s'):.2f} |"
         )
     lines.extend(
@@ -157,7 +164,7 @@ def write_report(result_dir: Path, summaries: list[dict[str, str]], best_name: s
             "",
             "## Interpretation",
             "",
-            "The tuned row-wise NorMuon plus aspect scaling produced the best validation loss and accuracy in this run. Removing the aspect multiplier or switching to orientation-aware row/column NorMuon remained stronger than AdamW, but both were slightly worse on best validation loss.",
+            "The report ranks by best validation loss and also includes final validation metrics so late-epoch reversals are visible. The aspect multiplier is a real layerwise step-size change, so compare it with LR tuning in mind.",
             "",
             "The optimizer variants cost about 1.8x wall-clock per step compared with AdamW in this small ViT-5 CIFAR-10 setting, so the quality gain is not free. These results are one seed and should be treated as confirmation of the recipe direction, not as a final statistical claim.",
         ]

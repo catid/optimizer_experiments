@@ -20,9 +20,13 @@ This folder contains my standalone optimizer contribution to the shared
   AdamW vs NorMuon aspect-scaling ablation, one trial per visible GPU.
 - `experiments/plot_cifar10_normuon_results.py` - regenerates the loss,
   accuracy, and speed figures from a result directory.
+- `experiments/aggregate_cifar10_peer_feedback.py` - aggregates the
+  peer-feedback final runs across seeds and regenerates aggregate figures.
 - `results/cifar10_normuon_aspect_ablation_seed34000/` - latest result bundle
   with metrics JSONL, summaries, logs, resolved commands, markdown report, and
   PNG figures.
+- `results/cifar10_peer_feedback_final50_aggregate/` - three-seed aggregate
+  after implementing peer feedback.
 
 ## Optimizer
 
@@ -133,11 +137,41 @@ This run supports keeping the aspect multiplier in the default recipe. Removing
 it or switching to orientation-aware row/column statistics remained much better
 than AdamW, but both were worse than the default on best validation loss.
 
+## Peer Feedback Follow-Up
+
+After reading peer notes, I implemented the missing `orientation + aspect`
+cells, added final metrics next to best metrics, fixed the summary LR display
+for matrix optimizers, made matrix weight decay explicitly disabled by SODA by
+default, and aggregated optimizer stats across parameter groups.
+
+The follow-up includes a 12-epoch tuning pass plus 50-epoch confirmation on
+seeds `34000`, `456`, and `789`. Full artifacts are in
+`results/cifar10_peer_feedback_final50_aggregate/`.
+
+| rank | optimizer | final val loss | best val loss | final val acc | examples/s | mean step |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | row + aspect, rg0.35 | 0.3975 +/- 0.0150 | 0.3935 +/- 0.0119 | 87.44% +/- 0.43% | 14,816 | 34.56 ms |
+| 2 | orient + aspect, rg0.40 | 0.4087 +/- 0.0155 | 0.3988 +/- 0.0033 | 87.04% +/- 0.55% | 14,689 | 34.86 ms |
+| 3 | orient + aspect, rg0.30/cg0 | 0.4115 +/- 0.0123 | 0.3996 +/- 0.0084 | 87.04% +/- 0.46% | 14,885 | 34.40 ms |
+| 4 | row + aspect, rg0.40 | 0.4115 +/- 0.0140 | 0.4073 +/- 0.0174 | 87.05% +/- 0.59% | 14,580 | 35.12 ms |
+| 5 | orient no aspect, rg0.40 | 0.4133 +/- 0.0194 | 0.3978 +/- 0.0099 | 87.05% +/- 0.41% | 14,602 | 35.06 ms |
+| 6 | row no aspect, rg0.30/cg0 | 0.4146 +/- 0.0166 | 0.4105 +/- 0.0095 | 87.05% +/- 0.66% | 15,024 | 34.08 ms |
+| 7 | AdamW baseline | 0.5868 +/- 0.0289 | 0.5614 +/- 0.0191 | 82.56% +/- 0.89% | 26,441 | 19.37 ms |
+
+The peer-requested orientation variants were competitive, especially early in
+training, but the three-seed final-loss aggregate still favors the original
+row-wise aspect recipe. AdamW remains about 1.8x faster per step on this small
+model, so the recommendation is quality-first rather than throughput-first.
+
 Generated figures:
 
 - `results/cifar10_normuon_aspect_ablation_seed34000/figures/loss_curves.png`
 - `results/cifar10_normuon_aspect_ablation_seed34000/figures/accuracy_best_vs_adamw.png`
 - `results/cifar10_normuon_aspect_ablation_seed34000/figures/iteration_speed.png`
+- `results/cifar10_peer_feedback_final50_aggregate/figures/mean_validation_loss.png`
+- `results/cifar10_peer_feedback_final50_aggregate/figures/final_validation_loss.png`
+- `results/cifar10_peer_feedback_final50_aggregate/figures/final_validation_accuracy.png`
+- `results/cifar10_peer_feedback_final50_aggregate/figures/mean_step_time.png`
 
 Reproduce the run:
 
@@ -154,6 +188,17 @@ Regenerate figures:
 /home/catid/attractor/.venv/bin/python \
   workers/codex_soda_pmuoneq_normuon/experiments/plot_cifar10_normuon_results.py \
   workers/codex_soda_pmuoneq_normuon/results/cifar10_normuon_aspect_ablation_seed34000
+```
+
+Aggregate peer-feedback runs:
+
+```bash
+/home/catid/attractor/.venv/bin/python \
+  workers/codex_soda_pmuoneq_normuon/experiments/aggregate_cifar10_peer_feedback.py \
+  --output-dir workers/codex_soda_pmuoneq_normuon/results/cifar10_peer_feedback_final50_aggregate \
+  workers/codex_soda_pmuoneq_normuon/results/cifar10_peer_feedback_final50_seed34000 \
+  workers/codex_soda_pmuoneq_normuon/results/cifar10_peer_feedback_final50_seed456 \
+  workers/codex_soda_pmuoneq_normuon/results/cifar10_peer_feedback_final50_seed789
 ```
 
 ## Quick Test
