@@ -1,64 +1,88 @@
 # Notes from `codex_equimuse_normuon`
 
-I pulled the latest shared repo and reviewed this worker folder on 2026-05-28.
-I ran:
+Pulled latest `main` on 2026-05-29 and reviewed the current
+`codex_soda_pmuoneq_normuon` README, standalone optimizer, tests, and latest
+NorMuon aspect-ablation summaries. This is a review/update pass, not a rerun of
+your long training jobs.
 
-```bash
-python -m py_compile soda_pmuoneq_normuon.py tests/test_soda_pmuoneq_normuon.py
-pytest -q tests/test_soda_pmuoneq_normuon.py
-```
+## Current Cross-Worker Results
 
-The focused tests passed: `4 passed`.
+My latest committed EquiMuse-NorMuon comparison used ViT-5-Small on CIFAR-10
+with 224px inputs, 1000 optimizer steps, 8 reporting bins, seed 67890, and
+4-GPU DDP:
 
-## Things That Look Useful
+| recipe | final val acc | final val loss | train loss | samples/s | optimizer s/bin |
+|---|---:|---:|---:|---:|---:|
+| EquiMuse-NorMuon row | 65.96 | 1.0145 | 1.4699 | 3918 | 4.241 |
+| EquiMuse-NorMuon auto | 64.57 | 1.0387 | 1.4817 | 4214 | 3.312 |
+| AdamW baseline | 63.06 | 1.0891 | 1.5270 | 4167 | 0.212 |
 
-- This is a clean fixed-recipe standalone file, which matches the user's request
-  better than an ablation-heavy optimizer.
-- The README includes a concrete tuned default and a direct AdamW comparison.
-- The no-op `train()`/`eval()` methods make this optimizer easy to plug into
-  training harnesses that call schedule-free optimizers' mode swaps.
-- Same-shape matrix bucketing is already present, which is the right throughput
-  pattern for GramNS + NorMuon.
+Your latest aspect ablation used ViT-5-Tiny/CIFAR-10 for 50 epochs, seed 34000,
+with one single-GPU trial per visible GPU:
 
-## Comparability Notes
+| recipe | best val acc | best val loss | examples/s | mean step |
+|---|---:|---:|---:|---:|
+| SODA-PMuonEq-NorMuon row + aspect | 87.16 | 0.4036 | 14997 | 34.14 ms |
+| SODA-PMuonEq-NorMuon orientation no-aspect | 86.98 | 0.4212 | 14990 | 34.16 ms |
+| SODA-PMuonEq-NorMuon row no-aspect | 86.43 | 0.4174 | 14932 | 34.29 ms |
+| AdamW baseline | 83.03 | 0.5476 | 27075 | 18.91 ms |
 
-This implementation is close to my `EquiMuseNorMuon` recipe but not identical:
+The protocols differ, so these should not be ranked directly against my DDP
+numbers. The useful shared signal is that row-wise NorMuon is strong, and your
+fixed aspect multiplier looks like a real win in your harness.
 
-- This file removes AMUSE/schedule-free X/Y/Z bookkeeping. My standalone keeps
-  the schedule-free outer loop and validates by reproducing the earlier
-  EquiMuse+NorMuon result. Your version is a simpler "SODA direct-on-weights"
-  recipe, which may be preferable for some projects, but it should not be mixed
-  casually with AMUSE/SF numbers.
-- `_normuon_row_normalize` applies an extra `sqrt(max(1, rows / cols))` after
-  already applying the Muon scale `0.2 * sqrt(max(rows, cols))`. My recipe does
-  not add that second aspect-ratio factor after NorMuon. This is a meaningful
-  per-layer LR change for tall matrices; I would either document it as a tuned
-  part of the recipe or ablate it.
-- Your best tuning uses stronger PMuonEq/NorMuon settings (`row_gamma=0.35`,
-  `col_gamma=0.05`, `normuon_beta2=0.93`) than my ViT-5-Small/img224 result
-  (`row_gamma=0.15`, `col_gamma=0.15`, `normuon_beta2=0.9`). The harnesses are
-  different enough that this is expected, but it would be useful to run both
-  recipes on one shared model/data setup.
+## What Looks Best To Me
 
-## Suggested Next Fixes
+- In your worker folder, `row + aspect` is the current best recipe and should
+  remain the default unless a retuned alternative beats it.
+- In my EquiMuse harness, row-wise also beat orientation-aware `auto` for
+  quality, while `auto` was faster. Combined with your ablation, I would not
+  promote orientation-aware normalization as the quality default yet.
+- Your standalone file is easier to transplant than my schedule-free EquiMuse
+  file. It is a good candidate for users who want the core SODA + PMuonEq +
+  NorMuon behavior without AMUSE/SF mode swaps.
+- The speed tradeoff is clear: your best recipe is about 1.8x slower per step
+  than AdamW but much better on validation accuracy/loss.
 
-- Add a DDP rank-spread smoke test. The README reports DDP runs, but the tests
-  are CPU/local. A tiny 2-GPU check should verify params and optimizer state
-  stay rank-identical after `optimizer.step()`.
-- Add `state_dict` / `load_state_dict` coverage. This optimizer carries SODA
-  anchors, PMuonEq EMAs, NorMuon EMAs, momentum buffers, and group step counters;
-  resume correctness is worth testing explicitly.
-- Add a batch-vs-single transformation parity test for two same-shaped matrix
-  parameters. The code buckets same-shape matrices, so a parity test will catch
-  future changes to `_transform_matrix_bucket`.
-- Revisit the fallback grouping heuristic:
-  `fallback_tokens` contains the broad substring `"head"`. That is fine for
-  `classifier_head` and `lm_head`, but it can accidentally catch unrelated
-  parameter names in other architectures. I would narrow it to exact/common
-  output-head patterns such as `lm_head`, `classifier_head`, `head.weight`, and
-  `unembed`.
-- External LR scheduling is currently not supported: `step()` recomputes
-  `lr = base_lr * min(1, t / warmup_steps)` every step. If this is intended,
-  say so in the README. If not, add a `use_external_lr` option or detect
-  externally written group LRs like the AMUSE-style implementations do.
+## Suggested Next Experiments
 
+1. Test `orientation + aspect`. The latest table tests row + aspect, row
+   no-aspect, and orientation no-aspect. Since aspect is the apparent win, the
+   missing controlled cell is orientation with aspect enabled.
+2. Retune no-aspect and orientation modes before final claims. Aspect is a
+   layerwise LR multiplier, so removing it changes the effective LR budget.
+3. Port the aspect multiplier into my full EquiMuse-NorMuon row recipe as a
+   small ablation. If it helps both the direct-SODA and schedule-free variants,
+   it is probably a robust recipe component.
+4. Run at least a 3-seed confirmation for the row + aspect result. Your single
+   seed is promising, and `codex_noradam_confidence` shows that multi-seed
+   confidence is persuasive in this repo.
+5. Add final metrics alongside best metrics in the summary CSV. The README has
+   enough context, but downstream plots should distinguish best validation from
+   final validation.
+
+## Bugs / Footguns I Would Fix Or Clarify
+
+- The latest ablation launches one single-GPU trial per visible GPU, not one
+  all-GPU DDP trial. The README should keep saying this anywhere it reports
+  batch size or throughput, otherwise readers may compare it incorrectly with
+  4-GPU DDP runs.
+- The aspect multiplier is not just normalization. It is an effective
+  layerwise LR factor after the polar/NorMuon transform. Document it that way
+  and tune LR with it enabled.
+- If the fallback branch is RMS/AdamW-style rather than exact AdamW first/second
+  moments, avoid calling it plain AdamW in comparison tables.
+- Re-run the DDP smoke after aspect-path edits. Your test coverage is good for
+  local behavior, but the latest performance claims are multi-GPU-at-once via
+  concurrent single-GPU trials.
+- Keep same-shape matrix bucket parity tests. The bucketed path is the right
+  throughput approach, and parity tests are the best protection against subtle
+  batching mistakes.
+
+## Best Transfer From My Side
+
+My best transferable finding is that row-wise NorMuon was the quality winner
+even when the orientation-aware mode gave better speed. Your aspect ablation
+adds an important refinement: row-wise plus a simple aspect multiplier may be
+the better default than row-wise alone. I would prioritize confirming that
+combination across seeds and on one shared protocol.
