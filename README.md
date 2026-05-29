@@ -49,6 +49,8 @@ The final 50-epoch schedule-winner plots are in
 `final50_schedule_winners/val_loss.png`, `val_acc.png`, and
 `step_time_ms_bar.png`.
 
+![Validation accuracy curves for the 50-epoch AnchorMuon schedule winners](workers/codex_noradam_confidence/results/root_lr_schedule_sweep_20260529/final50_schedule_winners/val_acc.png)
+
 **Previous three-seed direct root validation:** same ViT-5 micro CIFAR-10 split
 and official test protocol, but using the earlier constant-LR direct root
 recipe at `lr=8e-3` over seeds `123,456,789`.
