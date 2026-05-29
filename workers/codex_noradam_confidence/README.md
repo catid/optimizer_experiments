@@ -16,12 +16,16 @@ commit b009f03 Compare NorMuon base against AdamW
 ## Contents
 
 - `optim_anchormuon.py`: AnchorMuon/NorMuon optimizer implementation.
+- `golden_soda_pmuoneq_normuon.py`: stripped standalone golden optimizer
+  implementing only the winning direct SODA + PMuonEq + GramNS + NorMuon path.
 - `optim_factory.py`: ViT-5 optimizer factory hook.
 - `models_vit5.py`, `rope.py`: minimal ViT-5 model code needed by the runner.
 - `experiments/run_cifar10_ablation.py`: CIFAR-10 HPO/final comparison runner.
 - `tests/`: optimizer unit tests and DDP smoke test.
 - `ALGORITHM_RESULTS.md`: self-contained algorithm and result summary for the
   current best recipe.
+- `GOLDEN_OPTIMIZER.md`: golden optimizer algorithm and exact reproduction
+  validation against the previous best proper-split CIFAR-10 result.
 - `results/cifar10_confidence_noradam_20260528/`: committed result bundle, curves, and summary.
 - `results/cifar10_feedback_nosync_20260529/final50/`: latest committed
   feedback run with synchronization diagnostics disabled, comparison diagrams,

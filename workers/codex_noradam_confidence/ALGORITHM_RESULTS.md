@@ -175,6 +175,17 @@ Primary result bundle:
 workers/codex_noradam_confidence/results/cifar10_proper_split_20260529/
 ```
 
+The stripped golden implementation is:
+
+```text
+workers/codex_noradam_confidence/golden_soda_pmuoneq_normuon.py
+```
+
+It was replayed on the same proper split and reproduced the previous winner's
+train/validation/test metrics exactly at CSV precision. See
+`GOLDEN_OPTIMIZER.md` and
+`results/cifar10_golden_repro_20260529/final50/`.
+
 ## Known Caveats
 
 - The result is for the ViT-5 micro CIFAR-10 harness, not a general proof that

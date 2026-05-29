@@ -33,6 +33,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import models_vit5  # noqa: F401  Registers vit5_micro/vit5_tiny with timm.
+from golden_soda_pmuoneq_normuon import GoldenSodaPmuonEqNorMuon
 from optim_anchormuon import AnchorMuon
 from optim_factory import _anchor_param_groups
 
@@ -261,6 +262,20 @@ def trial_grid(preset: str) -> list[TrialConfig]:
             amuse=False,
         ),
         TrialConfig(
+            "golden_normuon_mlr0.008_rg0.35_cg0_mom0.95_pb0.9_nb0.93",
+            "golden",
+            8e-3,
+            soda="all",
+            row_gamma=0.35,
+            col_gamma=0.0,
+            pmuon_beta=0.90,
+            momentum=0.95,
+            normuon=True,
+            normuon_beta=0.93,
+            normuon_aspect_scale=False,
+            amuse=False,
+        ),
+        TrialConfig(
             "normuon_aspect_mlr0.008_rg0.3_cg0.05_mom0.95_pb0.9_nb0.95",
             "anchormuon",
             8e-3,
@@ -378,6 +393,8 @@ def trial_grid(preset: str) -> list[TrialConfig]:
 
 
 def trial_family(cfg: TrialConfig) -> str:
+    if cfg.optimizer == "golden":
+        return "golden_normuon"
     if cfg.optimizer == "adamw":
         return "adamw"
     if cfg.mimuon and cfg.normuon and cfg.normuon_aspect_scale:
@@ -515,6 +532,24 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             normuon=cfg.normuon,
             normuon_beta=cfg.normuon_beta,
             normuon_aspect_scale=cfg.normuon_aspect_scale,
+        )
+    if cfg.optimizer == "golden":
+        if cfg.soda != "all":
+            raise ValueError("golden optimizer always uses SODA on all parameter groups")
+        if cfg.col_gamma != 0.0:
+            raise ValueError("golden optimizer is row-only PMuonEq; col_gamma must be 0.0")
+        if cfg.amuse or cfg.mimuon or cfg.normuon_aspect_scale or not cfg.pmuon_eq or not cfg.normuon:
+            raise ValueError("golden optimizer only implements the direct no-AMUSE/no-MiMuon/no-aspect winning path")
+        return GoldenSodaPmuonEqNorMuon(
+            _anchor_param_groups(model, cfg.weight_decay),
+            lr=cfg.lr,
+            warmup_steps=args.warmup_steps,
+            momentum=cfg.momentum,
+            pmuoneq_beta=cfg.pmuon_beta,
+            row_gamma=cfg.row_gamma,
+            normuon_beta=cfg.normuon_beta,
+            ns_steps=int(getattr(args, "anchor_ns_steps", 5)),
+            min_matrix_dim=int(getattr(args, "anchor_min_matrix_dim", 2)),
         )
     raise ValueError(f"unknown optimizer {cfg.optimizer}")
 
