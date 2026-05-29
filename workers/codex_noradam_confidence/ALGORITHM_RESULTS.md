@@ -11,12 +11,12 @@ AnchorMuon + SODA + PMuonEq + Gram Newton-Schulz + NorMuon
 The best observed single-seed recipe in this folder disables AMUSE/SF iterate
 averaging and uses AnchorMuon as a SODA-regularized Muon-family optimizer with
 row-wise PMuonEq and NorMuon normalization under a trainer-side WSD schedule.
-The strongest multi-seed evidence now uses the same core optimizer with the
-trainer-side WSD schedule.
+The strongest multi-seed evidence uses the same core optimizer with a constant
+LR schedule.
 
 ## Current Monorepo Winner
 
-The current best version to cite is:
+The best observed single-seed version to cite is:
 
 ```text
 root_named_wsd_lr0.012_rg0.35_pb0.9_nb0.93
@@ -36,17 +36,20 @@ Exact scope of the claim:
   CIFAR-10 `train=True`
 - final test: official CIFAR-10 `train=False` 10,000-example test split,
   evaluated only at the end of selected final runs
-- final training: 50 epochs, 4,350 optimizer steps, seeds `123,456,789` for
-  the latest fallback-inner-momentum replay
+- final training: 50 epochs, 4,350 optimizer steps, seed `123` for the latest
+  schedule study; seeds `123,456,789` for the older multi-seed constant-LR
+  confidence replay
 - batch size: 512
 - dataloader workers: 16
 - precision/layout: BF16 autocast with channels-last tensors
 - hardware used: two NVIDIA RTX PRO 6000 Blackwell Workstation Edition GPUs,
   scheduled as one trial per visible GPU
 - software used: PyTorch `2.13.0.dev20260506+cu130`
-- selection protocol: 12-epoch HPO over fallback-inner-momentum settings on
-  top of the WSD winner, followed by a 50-epoch replay of AdamW, the existing
-  no-inner-momentum WSD recipe, and the tuned fallback-inner-momentum variant.
+- selection protocol: 12-epoch HPO over constant/cosine/linear/WSD schedules
+  and LR candidates for root `AnchorMuon`, followed by a 50-epoch replay of the
+  best config per schedule. Older confidence intervals used 17-trial HPO over
+  AdamW, no-aspect NorMuon, and aspect-scaled NorMuon followed by a three-seed
+  50-epoch replay.
 
 The exact optimizer settings for the winner are:
 
@@ -67,7 +70,6 @@ momentum = 0.95
 normuon = True
 normuon_beta = 0.93
 normuon_aspect_scale = False
-fallback_inner_momentum = False
 mimuon = False
 ns_steps = 5
 sync_diagnostics = False
@@ -144,34 +146,10 @@ momentum = 0.95
 normuon = True
 normuon_beta = 0.93
 normuon_aspect_scale = False
-fallback_inner_momentum = False
 mimuon = False
 ns_steps = 5
 sync_diagnostics = False
 ```
-
-## Fallback Inner Momentum Result
-
-This study added an opt-in first-moment accumulator only for scalar/vector
-fallback tensors. Matrix tensors were unchanged because they already use the
-Muon/Nesterov-style momentum source.
-
-The 12-epoch HPO selected `lr=0.014`, `row_gamma=0.35`,
-`fallback_beta1=0.85`, and `fallback_inner_momentum=True`, reaching `80.18%`
-validation accuracy. The existing no-inner-momentum WSD control reached
-`80.08%`, so the short proxy looked mildly positive.
-
-The 50-epoch replay did not confirm the proxy gain:
-
-| recipe | final val loss | final val acc | best val loss | best val acc | official test loss | official test acc | step | throughput |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| AnchorMuon WSD, no fallback inner momentum | 0.3886 +/- 0.0122 | 88.18% +/- 0.41 | 0.3747 +/- 0.0025 | 88.35% +/- 0.29 | 0.4084 +/- 0.0035 | 87.80% +/- 0.21 | 16.57 ms | 30.9k ex/s |
-| AnchorMuon WSD + fallback inner momentum | 0.3975 +/- 0.0021 | 88.17% +/- 0.14 | 0.3766 +/- 0.0093 | 88.23% +/- 0.19 | 0.4160 +/- 0.0061 | 87.73% +/- 0.43 | 16.97 ms | 30.2k ex/s |
-| AdamW cosine | 0.6164 +/- 0.0024 | 79.71% +/- 0.20 | 0.6027 +/- 0.0024 | 79.96% +/- 0.38 | 0.6301 +/- 0.0052 | 79.32% +/- 0.17 | 11.43 ms | 44.8k ex/s |
-
-Conclusion: keep `fallback_inner_momentum=False` for the current best recipe.
-The flag remains available for future workloads, but it is not recommended for
-this ViT-5 CIFAR-10 setup.
 
 ## Root LR Schedule Result
 

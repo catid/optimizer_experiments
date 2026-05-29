@@ -178,7 +178,6 @@ def test_default_recipe_matches_root_documented_winner() -> None:
     assert matrix_group["row_gamma"] == 0.35
     assert matrix_group["normuon_beta2"] == 0.93
     assert fallback_group["betas"] == (0.9, 0.95)
-    assert fallback_group["fallback_inner_momentum"] is False
     assert fallback_group["eps"] == 1e-8
 
 
@@ -308,49 +307,3 @@ def test_anchor_short_training_sanity_loss_decreases() -> None:
 
     assert all(torch.isfinite(torch.tensor(losses)))
     assert min(losses[-4:]) < losses[0]
-
-
-def test_fallback_inner_momentum_is_opt_in_and_creates_exp_avg() -> None:
-    torch.manual_seed(51)
-    model = TinyClassifier()
-    groups = build_param_groups(
-        model.named_parameters(),
-        lr=1e-3,
-        fallback_lr=1e-4,
-        fallback_inner_momentum=True,
-        fallback_betas=(0.85, 0.95),
-    )
-    fallback_group = next(group for group in groups if not group["use_matrix_update"])
-    assert fallback_group["fallback_inner_momentum"] is True
-    assert fallback_group["betas"] == (0.85, 0.95)
-
-    opt = AnchorMuon(groups)
-    _run_step(model, opt, 0)
-
-    assert "exp_avg" in opt.state[model.fc1.bias]
-    assert "exp_avg" in opt.state[model.norm.weight]
-    assert "exp_avg" not in opt.state[model.fc1.weight]
-
-
-def test_fallback_inner_momentum_false_matches_default_fallback_path() -> None:
-    torch.manual_seed(52)
-    default_model = TinyClassifier()
-    explicit_model = copy.deepcopy(default_model)
-    default_opt = AnchorMuon(
-        build_param_groups(default_model.named_parameters(), lr=1e-3, fallback_lr=1e-4)
-    )
-    explicit_opt = AnchorMuon(
-        build_param_groups(
-            explicit_model.named_parameters(),
-            lr=1e-3,
-            fallback_lr=1e-4,
-            fallback_inner_momentum=False,
-        )
-    )
-
-    for step in range(3):
-        _run_step(default_model, default_opt, step)
-        _run_step(explicit_model, explicit_opt, step)
-
-    for a, b in zip(default_model.parameters(), explicit_model.parameters(), strict=True):
-        assert torch.allclose(a, b, atol=1e-6, rtol=1e-6)
