@@ -36,7 +36,7 @@ for import_root in (ROOT, REPO_ROOT):
 
 import models_vit5  # noqa: F401  Registers vit5_micro/vit5_tiny with timm.
 import optimizer as root_optimizer
-from golden_soda_pmuoneq_normuon import GoldenSodaPmuonEqNorMuon
+from golden_soda_pmuoneq_normuon import GoldenMuon
 from optim_anchormuon import AnchorMuon
 from optim_factory import _anchor_param_groups
 
@@ -87,6 +87,7 @@ def parse_args() -> argparse.Namespace:
             "best_cifar10",
             "root_normuon_ablation",
             "root_soda_ablation",
+            "root_lr_schedule_sweep",
         ],
     )
     parser.add_argument("--only", default="", help="Regex filter for trial names")
@@ -143,6 +144,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seeds", default="",
                         help="Comma-separated seeds. Supervisor duplicates selected trials for each seed.")
     parser.add_argument("--warmup-steps", type=int, default=80)
+    parser.add_argument("--lr-final-scale", type=float, default=0.1)
+    parser.add_argument("--wsd-decay-frac", type=float, default=0.2)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument(
         "--no-sync-step-timing",
@@ -389,6 +392,28 @@ def trial_grid(preset: str) -> list[TrialConfig]:
     ]
     if preset == "root_soda_ablation":
         return root_soda_ablation
+    root_lr_schedule_sweep = [
+        TrialConfig("adamw_cosine_lr0.004_wd0.001", "adamw", 4e-3, lr_schedule="cosine", weight_decay=0.001),
+    ]
+    for schedule in ["constant", "cosine", "linear", "wsd"]:
+        for lr in [6e-3, 8e-3, 1e-2, 1.2e-2]:
+            root_lr_schedule_sweep.append(TrialConfig(
+                f"root_named_{schedule}_lr{lr:g}_rg0.35_pb0.9_nb0.93",
+                "root",
+                lr,
+                lr_schedule=schedule,
+                soda="all",
+                row_gamma=0.35,
+                pmuon_beta=0.90,
+                momentum=0.95,
+                normuon=True,
+                normuon_beta=0.93,
+                amuse=False,
+                root_grouping="named",
+                root_normuon_mode="row",
+            ))
+    if preset == "root_lr_schedule_sweep":
+        return root_lr_schedule_sweep
     feedback = [
         TrialConfig("adamw_cosine_lr0.004_wd0.001", "adamw", 4e-3, lr_schedule="cosine", weight_decay=0.001),
     ]
@@ -600,24 +625,38 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def adamw_lr(
+def scheduled_lr(
     step: int,
     total_steps: int,
     base_lr: float,
     warmup_steps: int,
     schedule: str = "cosine",
+    *,
+    final_scale: float = 0.1,
+    wsd_decay_frac: float = 0.2,
 ) -> float:
     if step < max(1, warmup_steps):
         return base_lr * float(step + 1) / float(max(1, warmup_steps))
     if schedule == "constant":
         return base_lr
-    if schedule != "cosine":
-        raise ValueError(f"unknown AdamW lr schedule {schedule!r}")
     progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-    return base_lr * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress))))
+    progress = min(1.0, max(0.0, progress))
+    floor = max(0.0, float(final_scale))
+    if schedule == "cosine":
+        return base_lr * (floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress)))
+    if schedule == "linear":
+        return base_lr * (floor + (1.0 - floor) * (1.0 - progress))
+    if schedule == "wsd":
+        decay_frac = min(1.0, max(1e-9, float(wsd_decay_frac)))
+        stable_frac = 1.0 - decay_frac
+        if progress <= stable_frac:
+            return base_lr
+        decay_progress = (progress - stable_frac) / decay_frac
+        return base_lr * (floor + (1.0 - floor) * (1.0 - decay_progress))
+    raise ValueError(f"unknown lr schedule {schedule!r}")
 
 
-class RootSodaPmuonEqNorMuonOrientation(root_optimizer.SodaPmuonEqNorMuon):
+class RootAnchorMuonOrientation(root_optimizer.AnchorMuon):
     """Trainer-side root optimizer adapter for the NorMuon orientation ablation.
 
     The root optimizer intentionally stays untouched. This subclass keeps the
@@ -719,7 +758,6 @@ def root_anchor_param_groups(model: nn.Module, cfg: TrialConfig) -> list[dict]:
         cloned.update({
             "use_matrix_update": True,
             "lr": cfg.lr,
-            "base_lr": cfg.lr,
             "momentum": cfg.momentum,
             "pmuoneq_beta": cfg.pmuon_beta,
             "row_gamma": cfg.row_gamma,
@@ -728,7 +766,6 @@ def root_anchor_param_groups(model: nn.Module, cfg: TrialConfig) -> list[dict]:
             "normuon_eps": 1e-10,
             "betas": (0.9, 0.95),
             "eps": 1e-8,
-            "use_external_lr": False,
         })
         if cfg.soda == "all":
             cloned["weight_decay"] = 0.0
@@ -769,16 +806,15 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
         if cfg.root_normuon_mode not in {"row", "orientation"}:
             raise ValueError("root_normuon_mode must be 'row' or 'orientation'")
         opt_cls = (
-            RootSodaPmuonEqNorMuonOrientation
+            RootAnchorMuonOrientation
             if cfg.root_normuon_mode == "orientation"
-            else root_optimizer.SodaPmuonEqNorMuon
+            else root_optimizer.AnchorMuon
         )
         params = root_anchor_param_groups(model, cfg) if cfg.root_grouping == "anchor" else model.named_parameters()
         return opt_cls(
             params,
-            matrix_lr=cfg.lr,
+            lr=cfg.lr,
             fallback_lr=cfg.lr,
-            warmup_steps=args.warmup_steps,
             momentum=cfg.momentum,
             pmuoneq_beta=cfg.pmuon_beta,
             row_gamma=cfg.row_gamma,
@@ -794,7 +830,7 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             raise ValueError("golden optimizer is row-only PMuonEq; col_gamma must be 0.0")
         if cfg.amuse or cfg.mimuon or cfg.normuon_aspect_scale or not cfg.pmuon_eq or not cfg.normuon:
             raise ValueError("golden optimizer only implements the direct no-AMUSE/no-MiMuon/no-aspect winning path")
-        return GoldenSodaPmuonEqNorMuon(
+        return GoldenMuon(
             _anchor_param_groups(model, cfg.weight_decay),
             lr=cfg.lr,
             warmup_steps=args.warmup_steps,
@@ -904,8 +940,16 @@ def run_worker(args: argparse.Namespace) -> None:
             for batch_idx, (images, targets) in enumerate(train_loader):
                 if global_step >= total_steps:
                     break
-                if cfg.optimizer == "adamw":
-                    lr = adamw_lr(global_step, total_steps, cfg.lr, args.warmup_steps, cfg.lr_schedule)
+                if cfg.optimizer in {"adamw", "root"}:
+                    lr = scheduled_lr(
+                        global_step,
+                        total_steps,
+                        cfg.lr,
+                        args.warmup_steps,
+                        cfg.lr_schedule,
+                        final_scale=args.lr_final_scale,
+                        wsd_decay_frac=args.wsd_decay_frac,
+                    )
                     for group in optimizer.param_groups:
                         group["lr"] = lr
                 images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
@@ -1028,6 +1072,8 @@ def run_worker(args: argparse.Namespace) -> None:
         "optimizer": cfg.optimizer,
         "lr": cfg.lr,
         "lr_schedule": cfg.lr_schedule,
+        "lr_final_scale": args.lr_final_scale,
+        "wsd_decay_frac": args.wsd_decay_frac,
         "seed": trial_seed,
         "weight_decay": cfg.weight_decay,
         "soda": cfg.soda,
@@ -1094,6 +1140,8 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> None:
                 "--num-workers", str(args.num_workers),
                 "--seed", str(int(cfg.seed if cfg.seed is not None else args.seed)),
                 "--warmup-steps", str(args.warmup_steps),
+                "--lr-final-scale", str(args.lr_final_scale),
+                "--wsd-decay-frac", str(args.wsd_decay_frac),
                 "--log-every", str(args.log_every),
             ]
             if args.eval_test:

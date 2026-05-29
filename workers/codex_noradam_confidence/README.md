@@ -35,31 +35,85 @@ commit b009f03 Compare NorMuon base against AdamW
 - `results/cifar10_proper_split_20260529/`: proper CIFAR-10 45k/5k
   train/validation split with official test evaluated only at the end of final
   selected runs.
+- `results/root_lr_schedule_sweep_20260529/`: trainer-side LR schedule study
+  for root `optimizer.py`; 12-epoch HPO per schedule followed by 50-epoch
+  schedule-winner replay.
 
 ## Main Result
 
 Latest result summary:
 `ALGORITHM_RESULTS.md` and `results/cifar10_proper_split_20260529/summary.md`.
 
-Current best version to cite:
+Best observed single-seed version to cite:
 
 ```text
-normuon_mlr0.008_rg0.35_cg0_mom0.95_pb0.9_nb0.93
+root_named_wsd_lr0.012_rg0.35_pb0.9_nb0.93
 ```
 
-This is the no-aspect AnchorMuon + SODA + row-only PMuonEq + five-step GramNS +
-NorMuon recipe. It was evaluated on `vit5_micro` with CIFAR-10 45k/5k
-train/validation split, official 10k test evaluated at the end, batch size 512,
-50 epochs, seeds `123,456,789`, BF16 autocast, channels-last tensors, and 16
-dataloader workers. It is currently best by official test accuracy:
-`84.77% +/- 0.65`, compared with `79.28% +/- 0.23` for the tuned AdamW cosine
-baseline.
+This is root `AnchorMuon` with SODA + row-only PMuonEq + five-step GramNS +
+NorMuon, AMUSE off, trainer-side 80-step warmup and WSD schedule. It was
+evaluated on `vit5_micro` with CIFAR-10 45k/5k train/validation split, official
+10k test evaluated at the end, batch size 512, 50 epochs, seed `123`, BF16
+autocast, channels-last tensors, and 16 dataloader workers. It is currently the
+best observed single-seed result: `87.67%` official test accuracy, compared
+with `79.55%` for the tuned AdamW cosine baseline in the same replay.
+
+The previous strongest multi-seed evidence is still the no-aspect constant-LR
+recipe `normuon_mlr0.008_rg0.35_cg0_mom0.95_pb0.9_nb0.93`, which reached
+`84.77% +/- 0.65` official test accuracy over seeds `123,456,789`.
 
 Latest diagrams:
 
 - Loss curves: `results/cifar10_proper_split_20260529/final50/val_loss.png`
 - Validation accuracy: `results/cifar10_proper_split_20260529/final50/val_acc.png`
 - Iteration speed: `results/cifar10_proper_split_20260529/final50/step_time_ms_bar.png`
+- Latest LR-schedule loss curves:
+  `results/root_lr_schedule_sweep_20260529/final50_schedule_winners/val_loss.png`
+- Latest LR-schedule validation accuracy:
+  `results/root_lr_schedule_sweep_20260529/final50_schedule_winners/val_acc.png`
+- Latest LR-schedule iteration speed:
+  `results/root_lr_schedule_sweep_20260529/final50_schedule_winners/step_time_ms_bar.png`
+
+### Latest Root LR Schedule Sweep
+
+This study used the shippable root `optimizer.py` directly. The optimizer does
+not own the LR schedule; the trainer updated each parameter group's `lr`.
+
+Protocol:
+
+- HPO: 12 epochs, seed `123`, official training split divided into 45k train /
+  5k validation.
+- Schedule search: constant, cosine, linear, and WSD, plus AdamW cosine
+  baseline.
+- Final replay: only the best HPO config per schedule was extended to 50
+  epochs; official CIFAR-10 test was evaluated only at the end.
+- Shared settings: `vit5_micro`, batch size 512, BF16 autocast, channels-last,
+  16 dataloader workers, two GPUs scheduled one trial per GPU.
+
+Best 12-epoch HPO config per schedule:
+
+| Schedule | Trial | LR | 12-epoch val loss | 12-epoch val acc | Step time |
+|---|---|---:|---:|---:|---:|
+| constant | `root_named_constant_lr0.012_rg0.35_pb0.9_nb0.93` | 0.012 | 0.6865 | 75.36% | 16.94 ms |
+| cosine | `root_named_cosine_lr0.012_rg0.35_pb0.9_nb0.93` | 0.012 | 0.5946 | 79.30% | 17.09 ms |
+| linear | `root_named_linear_lr0.012_rg0.35_pb0.9_nb0.93` | 0.012 | 0.5820 | 79.46% | 16.86 ms |
+| WSD | `root_named_wsd_lr0.012_rg0.35_pb0.9_nb0.93` | 0.012 | 0.5632 | 80.08% | 16.06 ms |
+| AdamW cosine | `adamw_cosine_lr0.004_wd0.001` | 0.004 | 0.9095 | 67.56% | 11.04 ms |
+
+50-epoch replay of the schedule winners:
+
+| Recipe | Schedule | Final val loss | Best val loss | Final val acc | Best val acc | Official test loss | Official test acc | Step | Throughput |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| AnchorMuon | WSD | 0.4005 | 0.3716 | 88.36% | 88.36% | 0.4111 | 87.67% | 16.23 ms | 31.5k ex/s |
+| AnchorMuon | constant | 0.4036 | 0.4036 | 86.06% | 86.54% | 0.4317 | 85.74% | 17.19 ms | 29.8k ex/s |
+| AnchorMuon | cosine | 0.4511 | 0.4097 | 87.40% | 87.48% | 0.4588 | 86.90% | 16.96 ms | 30.2k ex/s |
+| AnchorMuon | linear | 0.4434 | 0.4151 | 87.18% | 87.58% | 0.4597 | 86.75% | 17.02 ms | 30.1k ex/s |
+| AdamW baseline | cosine | 0.6133 | 0.5998 | 79.62% | 79.64% | 0.6240 | 79.55% | 11.39 ms | 45.0k ex/s |
+
+Conclusion: WSD is the best schedule for AnchorMuon in this single-seed study.
+It improved official test accuracy by +8.12 percentage points over AdamW and
+by +1.93 points over the previous three-seed mean constant-LR AnchorMuon result.
+AdamW remains the fastest per step.
 
 ### Latest Proper-Split Replay
 
@@ -144,11 +198,35 @@ AdamW is faster per step.
 
 ## Exact Reported Recipe
 
-The reported NorMuon+base rows use this explicit AnchorMuon configuration:
+The latest observed best LR-schedule row uses this explicit root `AnchorMuon`
+configuration:
+
+```text
+lr = 0.012
+lr schedule = trainer-side 80-step warmup + WSD
+lr_final_scale = 0.1
+wsd_decay_frac = 0.2
+amuse = False
+soda = "all"
+pmuon_eq = True
+pmuon_beta = 0.90
+row_gamma = 0.35
+col_gamma = 0.0
+momentum = 0.95
+normuon = True
+normuon_beta = 0.93
+normuon_aspect_scale = False
+mimuon = False
+ns_steps = 5
+sync_diagnostics = False
+```
+
+The strongest multi-seed constant-LR rows used this explicit AnchorMuon
+configuration:
 
 ```text
 lr = 8e-3
-warmup_steps = 80
+lr schedule = trainer-side 80-step warmup + constant LR for the root optimizer
 amuse = False
 soda = "all"
 soda_disables_weight_decay = True
@@ -165,11 +243,10 @@ ns_steps = 5
 sync_diagnostics = False for the latest run
 ```
 
-`_anchor_param_groups()` is intentionally the grouping used by the committed
-confidence runs. It is name-free except for the model's `no_weight_decay()`
-hook, so a 2D classifier/head matrix can be routed through the Muon/NorMuon
-path unless the model excludes it. Treat that as part of the reported recipe
-rather than an implied general recommendation.
+The root optimizer now uses effective tensor shape only for routing and keeps
+names only for summaries. A sufficiently large 2D classifier/head/embedding
+matrix will therefore enter the PMuonEq/GramNS/NorMuon path unless a trainer
+supplies explicit param groups.
 
 `AnchorMuon.sync_diagnostics` now defaults to `False`. The committed historical
 metrics include `mean_update_rms` and `mean_precond_matrix_rms`, but those values
@@ -298,5 +375,45 @@ OUT=results/cifar10_proper_split_20260529/final50
   --log-every 500 \
   --model vit5_micro \
   --seeds 123,456,789 \
+  --no-sync-step-timing
+```
+
+The latest root LR-schedule HPO and final replay used:
+
+```bash
+OUT=results/root_lr_schedule_sweep_20260529/hpo
+/home/catid/screen/.venv/bin/python experiments/run_cifar10_ablation.py \
+  --preset root_lr_schedule_sweep \
+  --output-dir "$OUT" \
+  --epochs 12 \
+  --train-subset 0 --val-subset 0 \
+  --val-source train_split --train-val-size 5000 \
+  --batch-size 512 \
+  --num-workers 16 \
+  --seed 123 \
+  --warmup-steps 80 \
+  --lr-final-scale 0.1 \
+  --wsd-decay-frac 0.2 \
+  --eval-bins 8 \
+  --log-every 200 \
+  --no-sync-step-timing
+
+OUT=results/root_lr_schedule_sweep_20260529/final50_schedule_winners
+/home/catid/screen/.venv/bin/python experiments/run_cifar10_ablation.py \
+  --preset root_lr_schedule_sweep \
+  --only '^(adamw_cosine_lr0\.004_wd0\.001|root_named_(constant|cosine|linear|wsd)_lr0\.012_rg0\.35_pb0\.9_nb0\.93)$' \
+  --output-dir "$OUT" \
+  --epochs 50 \
+  --train-subset 0 --val-subset 0 \
+  --val-source train_split --train-val-size 5000 \
+  --eval-test --test-subset 0 \
+  --batch-size 512 \
+  --num-workers 16 \
+  --seed 123 \
+  --warmup-steps 80 \
+  --lr-final-scale 0.1 \
+  --wsd-decay-frac 0.2 \
+  --eval-bins 8 \
+  --log-every 200 \
   --no-sync-step-timing
 ```

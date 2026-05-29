@@ -78,11 +78,12 @@ For a matrix parameter ``W_t`` with gradient ``G_t``:
 Fallback parameters
 ===================
 
-Biases, norms, scalar/vector tensors, and any parameters routed to the fallback
-group use the same SODA anchor plus RMS-style second-moment update used by the
-winning research path. Matrix eligibility is based on effective shape after
-ignoring singleton dimensions: for example ``[1, 1, width]`` is a vector, while
-``[1, tokens, width]`` is a matrix.
+Scalar/vector tensors and any parameters explicitly placed in a fallback group
+use the same SODA anchor plus RMS-style second-moment update used by the winning
+research path. Automatic matrix eligibility is based only on effective shape
+after ignoring singleton dimensions: for example ``[1, 1, width]`` is a vector,
+while ``[1, tokens, width]`` is a matrix. Names are never used for routing in
+this standalone file.
 
        v_t = beta_2 v_{t-1} + (1 - beta_2) g_t^2
        update = g_t / sqrt(v_t / (1 - beta_2^t) + eps)
@@ -97,18 +98,18 @@ The constructor defaults are the recommended starting point. They are based on
 the CIFAR-10 ViT-5 sweeps above plus cross-worker comparisons against AdamW and
 nearby aspect/column/MiMuon ablations. New projects should start with:
 
-    matrix_lr       = 8e-3
-    fallback_lr     = matrix_lr
+    lr              = 8e-3
+    fallback_lr     = lr
     momentum        = 0.95
     pmuoneq_beta    = 0.90
     row_gamma       = 0.35
     normuon_beta2   = 0.93
-    warmup_steps    = 80
+    trainer schedule = 80-step warmup + constant LR
 
 Do not tune everything at once. Treat the knobs in three tiers:
 
     Tier 1, tune first:
-        matrix_lr
+        lr
             Main quality/speed knob for matrix weights. Try
             {0.004, 0.006, 0.008} for language models or smaller ViTs.
 
@@ -119,26 +120,25 @@ Do not tune everything at once. Treat the knobs in three tiers:
 
     Tier 2, tune only after Tier 1:
         fallback_lr
-            LR for norms, biases, scalars, vectors, and any tensors explicitly
+            LR for scalars, vectors, and any tensors explicitly
             routed to fallback.
-            Default matches matrix_lr because this is what the strongest
-            reproduced CIFAR recipe used. For language models, audit tied
-            embedding / LM-head routing before lowering it.
+            Default matches lr because this is what the strongest
+            reproduced CIFAR recipe used.
 
         normuon_beta2
             Row second-moment smoothing after GramNS. Default 0.93. Try
             {0.90, 0.93, 0.95}; higher is smoother, lower adapts faster.
 
-        warmup_steps
-            Optimizer-local linear warmup. Default 80 matches the strongest
-            reproduced proper-split CIFAR recipe. Increase it if early steps
-            are unstable; shorten it only after a controlled ablation.
+        learning-rate schedule
+            AnchorMuon intentionally does not own this. Training code should
+            update param-group ``lr`` values for warmup, WSD, cosine, or any
+            other schedule. The strongest reproduced CIFAR recipe used an
+            80-step warmup plus constant LR.
 
         min_matrix_dim
             Safety threshold for the spectral path. A 2D parameter must have
-            both flattened matrix dimensions at least this large unless a custom
-            matrix_filter explicitly routes it. This keeps tiny projections out
-            of GramNS by default.
+            both flattened matrix dimensions at least this large. This keeps
+            tiny projections out of GramNS by default.
 
     Tier 3, normally leave fixed:
         momentum = 0.95
@@ -163,9 +163,9 @@ Do not tune everything at once. Treat the knobs in three tiers:
 
 Language-modeling tuning order:
 
-    1. Verify parameter grouping, especially tied embedding / LM head handling.
+    1. Verify shape-based parameter grouping with ``optimizer.group_summary()``.
     2. Compare against the actual LM baseline optimizer, not only AdamW.
-    3. Tune matrix_lr in {0.004, 0.006, 0.008}.
+    3. Tune lr in {0.004, 0.006, 0.008}.
     4. Tune row_gamma in {0.25, 0.35, 0.45}.
     5. Tune normuon_beta2 in {0.90, 0.93, 0.95}.
     6. Tune pmuoneq_beta in {0.90, 0.95}.
@@ -179,12 +179,36 @@ DDP, which all-reduces gradients before ``optimizer.step()``. Optimizer state is
 local and deterministic across ranks when gradients are synchronized. For GPU
 efficiency, same-shape matrices in a parameter group are bucketed and processed
 as a batch through PMuonEq, Gram Newton-Schulz, and NorMuon.
+
+References and lineage
+======================
+
+This file combines ideas from several optimizer lines, but the implementation is
+not a verbatim copy of any one paper:
+
+* SODA anchor regularization follows the initialization-anchor/optimistic dual
+  averaging idea from ``Optimistic Dual Averaging Unifies Modern Optimizers``
+  (arXiv:2605.11172). Here SODA is always enabled and replaces ordinary weight
+  decay.
+* PMuonEq is this repo's cheap row-only approximation to PMuon-style
+  preconditioned Muon directions. Dense PMuon would use
+  ``polar(L^-gamma @ momentum @ R^-gamma)``; AnchorMuon keeps only a row EMA
+  scale before the polar approximation.
+* The polar direction uses the Muon/Gram Newton-Schulz family of matrix
+  orthogonalization, with coefficients from the Gram Newton-Schulz reference
+  implementation at ``github.com/Dao-AILab/gram-newton-schulz``.
+* NorMuon-style post-polar row normalization is from the HTMuon/NorMuon line,
+  especially ``HTMuon: Improving Muon via Heavy-Tailed Spectral Correction``
+  (arXiv:2603.10067). AnchorMuon applies it after GramNS and preserves the
+  whole-matrix Frobenius norm.
+* Learning-rate schedules such as warmup+constant, WSD, linear decay, and
+  cosine decay are intentionally trainer-side policies. AnchorMuon consumes the
+  current param-group ``lr`` and does not implement a scheduler internally.
 """
 
 from __future__ import annotations
 
 import math
-import warnings
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from typing import Any, TypeAlias
@@ -192,7 +216,7 @@ from typing import Any, TypeAlias
 import torch
 
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 try:
     from torch.optim.optimizer import ParamsT
@@ -263,30 +287,6 @@ def _normuon_row_normalize(
     second_momentum.lerp_(row_power, 1.0 - beta2)
     out = update * torch.rsqrt(second_momentum + eps_t)
     return out * (old_norm / (out.norm(dim=(-2, -1), keepdim=True) + eps_t))
-
-
-def _is_default_fallback_name(name: str) -> bool:
-    lower = name.lower().replace("/", ".")
-    parts = [part for part in lower.split(".") if part]
-    if not parts:
-        return False
-    if parts[-1] == "bias" or lower.endswith(".bias"):
-        return True
-
-    norm_parts = {
-        "norm",
-        "ln",
-        "bn",
-        "rmsnorm",
-        "layernorm",
-        "batchnorm",
-        "groupnorm",
-        "final_norm",
-    }
-    if any(part in norm_parts or part.endswith("norm") for part in parts):
-        return True
-
-    return False
 
 
 def _is_matrix_like_parameter(param: torch.Tensor, *, min_matrix_dim: int) -> bool:
@@ -402,31 +402,30 @@ class AnchorMuon(torch.optim.Optimizer):
 
         optimizer = AnchorMuon(model)
 
-    Passing a ``torch.nn.Module`` or ``model.named_parameters()`` lets the
-    optimizer keep embeddings, output heads, normalization weights, biases,
-    scalars, and vectors in the fallback path while sending ordinary large
-    matrices through PMuonEq/GramNS/NorMuon.
+    Passing a ``torch.nn.Module``, ``model.parameters()``, or
+    ``model.named_parameters()`` lets the optimizer route tensors by effective
+    shape: matrix-like tensors use PMuonEq/GramNS/NorMuon, while scalar/vector
+    tensors use the fallback path. Parameter names are accepted only for
+    reporting in ``group_summary()``.
 
     Call ``optimizer.group_summary()`` before long runs to audit this routing.
-    Passing unnamed ``model.parameters()`` is supported for compatibility, but
-    it disables name-based routing and will emit a warning.
 
-    The defaults are intentionally usable. For a new workload, tune
-    ``matrix_lr`` and ``row_gamma`` first; tune ``fallback_lr`` and
-    ``normuon_beta2`` second; leave the remaining arguments fixed unless a
-    targeted diagnostic gives a reason to move them.
+    The defaults are intentionally usable. For a new workload, tune ``lr`` and
+    ``row_gamma`` first; tune ``fallback_lr`` and ``normuon_beta2`` second;
+    leave the remaining arguments fixed unless a targeted diagnostic gives a
+    reason to move them. AnchorMuon consumes the current param-group ``lr`` and
+    does not own warmup or decay schedules; use normal trainer-side schedulers.
     """
 
     def __init__(
         self,
         params: ParamsT | Iterable[tuple[str, torch.nn.Parameter]] | torch.nn.Module,
         *,
-        matrix_lr: float = 8e-3,
+        lr: float = 8e-3,
         fallback_lr: float | None = None,
         momentum: float = 0.95,
         fallback_betas: tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
-        warmup_steps: int = 80,
         soda_lambda_scale: float = 1.0,
         soda_lambda_power: float = 1.0,
         pmuoneq_beta: float = 0.90,
@@ -436,16 +435,12 @@ class AnchorMuon(torch.optim.Optimizer):
         normuon_eps: float = 1e-10,
         ns_epsilon: float = 1e-7,
         ns_compute_dtype: torch.dtype | None = None,
-        use_external_lr: bool = False,
         min_matrix_dim: int = 2,
-        matrix_filter: Callable[[str, torch.nn.Parameter], bool] | None = None,
     ) -> None:
         if isinstance(params, torch.nn.Module):
-            params = params.named_parameters()
-        fallback_lr = matrix_lr if fallback_lr is None else fallback_lr
-        if warmup_steps <= 0:
-            raise ValueError("warmup_steps must be positive")
-        if matrix_lr < 0.0 or fallback_lr < 0.0:
+            params = params.parameters()
+        fallback_lr = lr if fallback_lr is None else fallback_lr
+        if lr < 0.0 or fallback_lr < 0.0:
             raise ValueError("learning rates must be non-negative")
         if not 0.0 <= momentum < 1.0:
             raise ValueError("momentum must be in [0, 1)")
@@ -467,7 +462,7 @@ class AnchorMuon(torch.optim.Optimizer):
             raise ValueError("soda_lambda_power must be positive")
         prepared = self._prepare_param_groups(
             params,
-            matrix_lr=matrix_lr,
+            lr=lr,
             fallback_lr=fallback_lr,
             momentum=momentum,
             fallback_betas=fallback_betas,
@@ -477,13 +472,10 @@ class AnchorMuon(torch.optim.Optimizer):
             pmuoneq_eps=pmuoneq_eps,
             normuon_beta2=normuon_beta2,
             normuon_eps=normuon_eps,
-            use_external_lr=use_external_lr,
             min_matrix_dim=min_matrix_dim,
-            matrix_filter=matrix_filter,
         )
         super().__init__(prepared, defaults={})
 
-        self.warmup_steps = int(warmup_steps)
         self.soda_lambda_scale = float(soda_lambda_scale)
         self.soda_lambda_power = float(soda_lambda_power)
         self._orthogonalizer = GramNewtonSchulz(epsilon=ns_epsilon, compute_dtype=ns_compute_dtype)
@@ -491,23 +483,21 @@ class AnchorMuon(torch.optim.Optimizer):
 
         for group in self.param_groups:
             group.setdefault("k", 0)
-            group.setdefault("warmup_steps", self.warmup_steps)
-            group.setdefault("base_lr", group["lr"])
 
     @classmethod
     def from_model(cls, model: torch.nn.Module, **kwargs: Any) -> "AnchorMuon":
-        """Construct the optimizer from ``model.named_parameters()``.
+        """Construct the optimizer from ``model.parameters()``.
 
         This is the least error-prone public API for normal training code.
         """
 
-        return cls(model.named_parameters(), **kwargs)
+        return cls(model.parameters(), **kwargs)
 
     @staticmethod
     def _prepare_param_groups(
         params: ParamsT | Iterable[tuple[str, torch.nn.Parameter]],
         *,
-        matrix_lr: float,
+        lr: float,
         fallback_lr: float,
         momentum: float,
         fallback_betas: tuple[float, float],
@@ -517,9 +507,7 @@ class AnchorMuon(torch.optim.Optimizer):
         pmuoneq_eps: float,
         normuon_beta2: float,
         normuon_eps: float,
-        use_external_lr: bool,
         min_matrix_dim: int,
-        matrix_filter: Callable[[str, torch.nn.Parameter], bool] | None,
     ) -> list[dict[str, Any]]:
         items = list(params)
         if not items:
@@ -532,7 +520,7 @@ class AnchorMuon(torch.optim.Optimizer):
         ):
             return build_param_groups(
                 items,  # type: ignore[arg-type]
-                matrix_lr=matrix_lr,
+                lr=lr,
                 fallback_lr=fallback_lr,
                 momentum=momentum,
                 fallback_betas=fallback_betas,
@@ -542,18 +530,14 @@ class AnchorMuon(torch.optim.Optimizer):
                 pmuoneq_eps=pmuoneq_eps,
                 normuon_beta2=normuon_beta2,
                 normuon_eps=normuon_eps,
-                use_external_lr=use_external_lr,
                 min_matrix_dim=min_matrix_dim,
-                matrix_filter=matrix_filter,
             )
         if isinstance(items[0], dict):
             groups = [dict(group) for group in items]  # type: ignore[arg-type]
             for group in groups:
                 group.setdefault("use_matrix_update", group.get("use_muon", False))
                 is_matrix = bool(group["use_matrix_update"])
-                group.setdefault("lr", matrix_lr if is_matrix else fallback_lr)
-                group.setdefault("base_lr", group["lr"])
-                group.setdefault("use_external_lr", use_external_lr)
+                group.setdefault("lr", lr if is_matrix else fallback_lr)
                 group.pop("weight_decay", None)
                 if is_matrix:
                     group.setdefault("momentum", momentum)
@@ -567,13 +551,6 @@ class AnchorMuon(torch.optim.Optimizer):
                     group.setdefault("betas", fallback_betas)
                     group.setdefault("eps", eps)
             return groups
-
-        warnings.warn(
-            "AnchorMuon received unnamed parameters. Pass a module or "
-            "model.named_parameters() so embeddings, heads, norms, and tied "
-            "weights can be routed safely.",
-            stacklevel=3,
-        )
 
         matrix_params: list[torch.Tensor] = []
         fallback_params: list[torch.Tensor] = []
@@ -596,15 +573,13 @@ class AnchorMuon(torch.optim.Optimizer):
                 {
                     "params": matrix_params,
                     "use_matrix_update": True,
-                    "lr": matrix_lr,
-                    "base_lr": matrix_lr,
+                    "lr": lr,
                     "momentum": momentum,
                     "pmuoneq_beta": pmuoneq_beta,
                     "row_gamma": row_gamma,
                     "pmuoneq_eps": pmuoneq_eps,
                     "normuon_beta2": normuon_beta2,
                     "normuon_eps": normuon_eps,
-                    "use_external_lr": use_external_lr,
                     "min_matrix_dim": min_matrix_dim,
                 }
             )
@@ -614,10 +589,8 @@ class AnchorMuon(torch.optim.Optimizer):
                     "params": fallback_params,
                     "use_matrix_update": False,
                     "lr": fallback_lr,
-                    "base_lr": fallback_lr,
                     "betas": fallback_betas,
                     "eps": eps,
-                    "use_external_lr": use_external_lr,
                 }
             )
         return groups
@@ -640,7 +613,6 @@ class AnchorMuon(torch.optim.Optimizer):
                     "index": index,
                     "use_matrix_update": bool(group.get("use_matrix_update", False)),
                     "lr": float(group.get("lr", 0.0)),
-                    "base_lr": float(group.get("base_lr", group.get("lr", 0.0))),
                     "param_count": len(params),
                     "numel": int(sum(p.numel() for p in params)),
                     "named": bool(names),
@@ -834,12 +806,7 @@ class AnchorMuon(torch.optim.Optimizer):
         for group in self.param_groups:
             k = int(group.get("k", 0))
             t = k + 1
-            warmup_steps = int(group.get("warmup_steps", self.warmup_steps))
-            if bool(group.get("use_external_lr", False)):
-                lr = float(group["lr"])
-            else:
-                lr = float(group["base_lr"]) * min(1.0, t / warmup_steps)
-                group["lr"] = lr
+            lr = float(group["lr"])
 
             if group.get("use_matrix_update", False):
                 group_stats = self._step_matrix_group(group, lr=lr, t=t)
@@ -860,7 +827,7 @@ class AnchorMuon(torch.optim.Optimizer):
 def build_param_groups(
     named_parameters: Iterable[tuple[str, torch.nn.Parameter]],
     *,
-    matrix_lr: float = 8e-3,
+    lr: float = 8e-3,
     fallback_lr: float | None = None,
     momentum: float = 0.95,
     fallback_betas: tuple[float, float] = (0.9, 0.95),
@@ -870,32 +837,26 @@ def build_param_groups(
     pmuoneq_eps: float = 1e-6,
     normuon_beta2: float = 0.93,
     normuon_eps: float = 1e-10,
-    use_external_lr: bool = False,
     min_matrix_dim: int = 2,
-    matrix_filter: Callable[[str, torch.nn.Parameter], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Split named parameters into matrix and fallback groups.
 
-    The default grouping uses effective tensor shape, not broad name categories,
-    for matrix routing. Singleton dimensions are ignored, so ``[1, 1, width]``
-    is a vector and ``[1, tokens, width]`` is a matrix. Biases and normalization
-    parameters are still kept in the fallback path by name.
+    Routing uses effective tensor shape only. Singleton dimensions are ignored,
+    so ``[1, 1, width]`` is a vector and ``[1, tokens, width]`` is a matrix.
+    Parameter names are retained only for group summaries and diagnostics.
 
-    Tied parameters are deduplicated by object identity. If any alias looks like
-    a norm or bias, the shared tensor is conservatively routed to the fallback
-    group; otherwise the effective shape decides.
+    Tied parameters are deduplicated by object identity. The effective shape of
+    the shared tensor decides the route regardless of aliases.
     """
 
     if min_matrix_dim < 1:
         raise ValueError("min_matrix_dim must be >= 1")
-    fallback_lr = matrix_lr if fallback_lr is None else fallback_lr
+    fallback_lr = lr if fallback_lr is None else fallback_lr
 
     matrix_params: list[torch.nn.Parameter] = []
     matrix_names: list[str] = []
-    matrix_aliases: list[list[str]] = []
     fallback_params: list[torch.nn.Parameter] = []
     fallback_names: list[str] = []
-    fallback_aliases: list[list[str]] = []
 
     unique: dict[int, tuple[torch.nn.Parameter, list[str]]] = {}
     for name, p in named_parameters:
@@ -908,21 +869,14 @@ def build_param_groups(
             unique[key][1].append(name)
 
     for _key, (p, names) in unique.items():
-        if matrix_filter is not None:
-            use_matrix = any(bool(matrix_filter(name, p)) for name in names)
-        else:
-            use_matrix = _is_matrix_like_parameter(p, min_matrix_dim=min_matrix_dim) and not any(
-                _is_default_fallback_name(name) for name in names
-            )
+        use_matrix = _is_matrix_like_parameter(p, min_matrix_dim=min_matrix_dim)
         display_name = "|".join(names)
         if use_matrix:
             matrix_params.append(p)
             matrix_names.append(display_name)
-            matrix_aliases.append(names)
         else:
             fallback_params.append(p)
             fallback_names.append(display_name)
-            fallback_aliases.append(names)
 
     groups: list[dict[str, Any]] = []
     if matrix_params:
@@ -930,17 +884,14 @@ def build_param_groups(
             {
                 "params": matrix_params,
                 "param_names": matrix_names,
-                "param_aliases": matrix_aliases,
                 "use_matrix_update": True,
-                "lr": matrix_lr,
-                "base_lr": matrix_lr,
+                "lr": lr,
                 "momentum": momentum,
                 "pmuoneq_beta": pmuoneq_beta,
                 "row_gamma": row_gamma,
                 "pmuoneq_eps": pmuoneq_eps,
                 "normuon_beta2": normuon_beta2,
                 "normuon_eps": normuon_eps,
-                "use_external_lr": use_external_lr,
                 "min_matrix_dim": min_matrix_dim,
             }
         )
@@ -949,22 +900,13 @@ def build_param_groups(
             {
                 "params": fallback_params,
                 "param_names": fallback_names,
-                "param_aliases": fallback_aliases,
                 "use_matrix_update": False,
                 "lr": fallback_lr,
-                "base_lr": fallback_lr,
                 "betas": fallback_betas,
                 "eps": eps,
-                "use_external_lr": use_external_lr,
             }
         )
     return groups
-
-
-# Backward-compatible implementation aliases. These are intentionally not in
-# __all__; new code should import AnchorMuon and build_param_groups.
-SodaPmuonEqNorMuon = AnchorMuon
-build_soda_pmuoneq_normuon_param_groups = build_param_groups
 
 
 __all__ = [
