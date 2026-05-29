@@ -36,6 +36,16 @@ class TwoMatrixNet(nn.Module):
         return self.classifier_head(F.gelu(self.right(F.gelu(self.left(x)))))
 
 
+class WideMatrixNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.wide = nn.Linear(16, 8, bias=False)
+        self.classifier_head = nn.Linear(8, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier_head(F.gelu(self.wide(x)))
+
+
 def test_param_group_builder_keeps_head_and_norm_in_fallback() -> None:
     model = TinyClassifier()
     groups = build_soda_pmuoneq_normuon_param_groups(model.named_parameters())
@@ -92,6 +102,55 @@ def test_optimizer_step_is_finite_and_creates_matrix_state() -> None:
     assert "pmuoneq_col_ema" in state
     assert "normuon_second_momentum" in state
     assert opt.last_stats["matrix_count"] >= 1
+
+
+def test_normuon_aspect_and_orientation_ablation_controls() -> None:
+    torch.manual_seed(13)
+    row_aspect = TinyClassifier()
+    row_noaspect = copy.deepcopy(row_aspect)
+    opt_aspect = SodaPmuonEqNorMuon(
+        build_soda_pmuoneq_normuon_param_groups(
+            row_aspect.named_parameters(),
+            matrix_lr=1e-3,
+            adam_lr=1e-4,
+            normuon_mode="row",
+            normuon_aspect_scale=True,
+        ),
+        warmup_steps=1,
+    )
+    opt_noaspect = SodaPmuonEqNorMuon(
+        build_soda_pmuoneq_normuon_param_groups(
+            row_noaspect.named_parameters(),
+            matrix_lr=1e-3,
+            adam_lr=1e-4,
+            normuon_mode="row",
+            normuon_aspect_scale=False,
+        ),
+        warmup_steps=1,
+    )
+    _run_step(row_aspect, opt_aspect, 0)
+    _run_step(row_noaspect, opt_noaspect, 0)
+    assert not torch.allclose(row_aspect.fc1.weight, row_noaspect.fc1.weight)
+
+    wide = WideMatrixNet()
+    opt_orient = SodaPmuonEqNorMuon(
+        build_soda_pmuoneq_normuon_param_groups(
+            wide.named_parameters(),
+            matrix_lr=1e-3,
+            adam_lr=1e-4,
+            normuon_mode="orientation",
+            normuon_aspect_scale=False,
+        ),
+        warmup_steps=1,
+    )
+    torch.manual_seed(10_001)
+    x = torch.randn(16, 16)
+    y = torch.randint(0, 4, (16,))
+    opt_orient.zero_grad(set_to_none=True)
+    F.cross_entropy(wide(x), y).backward()
+    opt_orient.step()
+    second = opt_orient.state[wide.wide.weight]["normuon_second_momentum"]
+    assert tuple(second.shape) == (1, wide.wide.weight.shape[1])
 
 
 def test_train_eval_are_noops_for_standalone_optimizer() -> None:

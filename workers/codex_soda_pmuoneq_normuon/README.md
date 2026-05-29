@@ -16,6 +16,13 @@ This folder contains my standalone optimizer contribution to the shared
   tuned AdamW baseline.
 - `results/cifar10_seed34000_curves.csv` - bin-level train/validation loss and
   speed metrics from the same run.
+- `experiments/run_cifar10_normuon_aspect_ablation.py` - launches the latest
+  AdamW vs NorMuon aspect-scaling ablation, one trial per visible GPU.
+- `experiments/plot_cifar10_normuon_results.py` - regenerates the loss,
+  accuracy, and speed figures from a result directory.
+- `results/cifar10_normuon_aspect_ablation_seed34000/` - latest result bundle
+  with metrics JSONL, summaries, logs, resolved commands, markdown report, and
+  PNG figures.
 
 ## Optimizer
 
@@ -28,7 +35,8 @@ SODA anchor pull
 + NorMuon row normalization
 ```
 
-The standalone file intentionally removes the previous ablation switches:
+The standalone file intentionally removes the old broad optimizer-family
+ablation switches:
 
 - no AMUSE / schedule-free branch,
 - no MiMuon branch,
@@ -52,6 +60,19 @@ The NorMuon step includes the tuned aspect-ratio multiplier
 `sqrt(max(1, rows / cols))` after Frobenius-norm restoration. That is a real
 layerwise step-size choice and is part of this recipe, so compare it separately
 from NorMuon implementations that preserve only the Frobenius norm.
+
+For peer-review compatibility, the optimizer exposes two narrow NorMuon
+ablation controls without changing the rest of the recipe:
+
+```python
+normuon_mode="row"              # default; row statistics for every matrix
+normuon_aspect_scale=True       # default; winning tuned aspect multiplier
+```
+
+The tested alternatives are `normuon_aspect_scale=False` and
+`normuon_mode="orientation"` with `normuon_aspect_scale=False`. They are useful
+for reproducing the ablation below, but the recommended/default recipe remains
+row-wise NorMuon with aspect scaling.
 
 ## Tuned Defaults
 
@@ -93,6 +114,47 @@ ViT-5 tiny / CIFAR-10, 50 epochs, DDP across 4 GPUs, global batch 512, seed
 The standalone optimizer preserved the prior quality advantage after stripping
 the ablation conditionals. It is slower than AdamW by about 1.37x step time on
 this setup, but reached substantially better validation loss and accuracy.
+
+## Latest NorMuon Aspect Ablation
+
+ViT-5 tiny / CIFAR-10, 50 epochs, seed `34000`, batch size 512 per trial. The
+runner launched one single-GPU trial per visible GPU, so all four GPUs were
+used concurrently. Full artifacts are in
+`results/cifar10_normuon_aspect_ablation_seed34000/`.
+
+| rank | optimizer | best val loss | best val acc | examples/s | mean step |
+|---:|---|---:|---:|---:|---:|
+| 1 | SODA-PMuonEq-NorMuon row + aspect | 0.4036 | 87.16% | 14,997 | 34.14 ms |
+| 2 | SODA-PMuonEq-NorMuon row | 0.4174 | 86.43% | 14,932 | 34.29 ms |
+| 3 | SODA-PMuonEq-NorMuon orientation | 0.4212 | 86.98% | 14,990 | 34.16 ms |
+| 4 | tuned AdamW baseline | 0.5476 | 83.03% | 27,075 | 18.91 ms |
+
+This run supports keeping the aspect multiplier in the default recipe. Removing
+it or switching to orientation-aware row/column statistics remained much better
+than AdamW, but both were worse than the default on best validation loss.
+
+Generated figures:
+
+- `results/cifar10_normuon_aspect_ablation_seed34000/figures/loss_curves.png`
+- `results/cifar10_normuon_aspect_ablation_seed34000/figures/accuracy_best_vs_adamw.png`
+- `results/cifar10_normuon_aspect_ablation_seed34000/figures/iteration_speed.png`
+
+Reproduce the run:
+
+```bash
+/home/catid/attractor/.venv/bin/python \
+  workers/codex_soda_pmuoneq_normuon/experiments/run_cifar10_normuon_aspect_ablation.py \
+  --epochs 50 --eval-bins 8 --batch-size 512 --num-workers 8 \
+  --output-dir workers/codex_soda_pmuoneq_normuon/results/cifar10_normuon_aspect_ablation_seed34000
+```
+
+Regenerate figures:
+
+```bash
+/home/catid/attractor/.venv/bin/python \
+  workers/codex_soda_pmuoneq_normuon/experiments/plot_cifar10_normuon_results.py \
+  workers/codex_soda_pmuoneq_normuon/results/cifar10_normuon_aspect_ablation_seed34000
+```
 
 ## Quick Test
 
