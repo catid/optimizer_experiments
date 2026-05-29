@@ -54,6 +54,14 @@ global step size:
 
     D_t = ||P_t||_F / ||Q_t||_F * Q_t
 
+An optional controlled ablation applies the peer-tuned tall-matrix aspect
+multiplier after Frobenius restoration:
+
+    D_t <- D_t * sqrt(max(1, rows / cols))
+
+This is intentionally a final update-magnitude change, not an input change to
+PMuonEq, GramNS, momentum, or the raw gradient path.
+
 The fast sequence is updated with the standard Muon scale:
 
     Z_{t+1} = SODA_anchor(Z_t) - lr * 0.2 * sqrt(max(m, n)) * D_t
@@ -240,6 +248,7 @@ def normuon_precondition(
     beta2: float = 0.9,
     eps: float = 1e-10,
     orientation: str = "row",
+    aspect_scale: bool = False,
 ) -> Tensor:
     """Apply NorMuon second-moment normalization after GramNS.
 
@@ -268,6 +277,9 @@ def normuon_precondition(
     scaled = work * torch.rsqrt(second_momentum.clamp_min(float(eps)).to(work.dtype))
     new_norm = scaled.norm(dim=(-2, -1), keepdim=True)
     scaled = scaled * (old_norm / new_norm.clamp_min(float(eps)))
+    if aspect_scale:
+        rows, cols = work.shape[-2], work.shape[-1]
+        scaled = scaled * math.sqrt(max(1.0, float(rows) / float(cols)))
     return scaled.to(original_dtype)
 
 
@@ -324,6 +336,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         normuon_beta2: float = 0.9,
         normuon_eps: float = 1e-10,
         normuon_orientation: str = "row",
+        normuon_aspect_scale: bool = False,
         sort_muon_params: bool = True,
     ) -> None:
         if not 0.0 < float(beta1) < 1.0:
@@ -363,6 +376,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         if normuon_orientation not in {"row", "auto", "column"}:
             raise ValueError("normuon_orientation must be 'row', 'auto', or 'column'")
         self.normuon_orientation = normuon_orientation
+        self.normuon_aspect_scale = bool(normuon_aspect_scale)
         self.train_mode = False
         self._last_stats: dict[str, float] = {}
 
@@ -388,6 +402,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
             normuon_beta2=self.normuon_beta2,
             normuon_eps=self.normuon_eps,
             normuon_orientation=self.normuon_orientation,
+            normuon_aspect_scale=self.normuon_aspect_scale,
         )
 
         groups = list(param_groups)
@@ -418,8 +433,9 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         return state
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:  # type: ignore[override]
-        self.train_mode = bool(state_dict.pop("train_mode", False))
-        super().load_state_dict(state_dict)
+        state_copy = dict(state_dict)
+        self.train_mode = bool(state_copy.pop("train_mode", False))
+        super().load_state_dict(state_copy)
 
     @torch.no_grad()
     def train(self) -> "EquiMuseNorMuon":
@@ -465,10 +481,12 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         ckp1_values: list[float] = []
         lr_values: list[float] = []
         soda_values: list[float] = []
+        aspect_enabled = False
         for group in self.param_groups:
             lr, ckp1, beta1, t = self._advance_group_schedule(group)
             soda_lambda = self._soda_lambda(group, t)
             if bool(group.get("use_muon", False)):
+                aspect_enabled = aspect_enabled or bool(group.get("normuon_aspect_scale", self.normuon_aspect_scale))
                 count = self._step_muon_group(group, lr, ckp1, beta1, soda_lambda)
                 muon_matrices += count
             else:
@@ -491,6 +509,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
             "equimuse_normuon_ckp1_mean": sum(ckp1_values) / denom,
             "equimuse_normuon_scheduled_lr_mean": sum(lr_values) / denom,
             "equimuse_normuon_soda_lambda_mean": sum(soda_values) / denom,
+            "equimuse_normuon_aspect_scale_enabled": float(aspect_enabled),
         }
         return loss
 
@@ -768,7 +787,6 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         )
 
     @staticmethod
-    @staticmethod
     def _normuon_effective_orientation(rows: int, cols: int, orientation: str) -> str:
         if orientation == "auto":
             return "row" if rows >= cols else "column"
@@ -803,6 +821,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
             beta2=float(group.get("normuon_beta2", self.normuon_beta2)),
             eps=float(group.get("normuon_eps", self.normuon_eps)),
             orientation=orientation,
+            aspect_scale=bool(group.get("normuon_aspect_scale", self.normuon_aspect_scale)),
         )
 
     def _normuon_bucket(self, bucket: list[dict[str, Any]], updates: Tensor, group: dict[str, Any]) -> Tensor:
@@ -819,6 +838,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
             beta2=float(group.get("normuon_beta2", self.normuon_beta2)),
             eps=float(group.get("normuon_eps", self.normuon_eps)),
             orientation=orientation,
+            aspect_scale=bool(group.get("normuon_aspect_scale", self.normuon_aspect_scale)),
         )
         for i, item in enumerate(bucket):
             item["state"][f"normuon_{effective}_second_moment"].copy_(moments[i])
@@ -865,6 +885,7 @@ def build_equimuse_normuon_param_groups(
     normuon_beta2: float = 0.9,
     normuon_eps: float = 1e-10,
     normuon_orientation: str = "row",
+    normuon_aspect_scale: bool = False,
 ) -> list[dict[str, Any]]:
     """Split model parameters into fallback and EquiMuse-NorMuon matrix groups."""
 
@@ -921,6 +942,7 @@ def build_equimuse_normuon_param_groups(
                 "normuon_beta2": float(normuon_beta2),
                 "normuon_eps": float(normuon_eps),
                 "normuon_orientation": normuon_orientation,
+                "normuon_aspect_scale": bool(normuon_aspect_scale),
             }
         )
     return groups

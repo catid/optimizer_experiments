@@ -20,6 +20,10 @@ selected recipe fixed and exposes only tuning hyperparameters.
   CIFAR-10 result summary.
 - `results/tables/equimuse_best_vs_adamw_curves.csv`: 8-bin loss/accuracy
   curves for the final comparison.
+- `results/tables/equimuse_feedback_final_results.csv`: peer-feedback
+  comparison including aspect scaling and the direct no-AMUSE SODA path.
+- `results/tables/equimuse_feedback_final_curves.csv`: corresponding 8-bin
+  curves for the peer-feedback comparison.
 - `results/figures/*.png`: validation-loss, train-loss, accuracy, and
   iteration-speed plots.
 
@@ -122,23 +126,33 @@ Tune in this order:
 
 ## Latest Result
 
-On the source workstation, the fixed ViT-5-Small/CIFAR-10 img224 harness used
+After peer feedback, the fixed ViT-5-Small/CIFAR-10 img224 harness was rerun on
 all 4 visible GPUs with DDP, seed `67890`, 1000 optimizer steps, and 8
 validation bins.
 
 | method | acc@1 | val loss | train loss | samples/s |
 | --- | ---: | ---: | ---: | ---: |
-| EquiMuse-NorMuon row | 65.96 | 1.0145 | 1.4699 | 3918 |
-| EquiMuse-NorMuon auto | 64.57 | 1.0387 | 1.4817 | 4214 |
-| AdamW baseline | 63.06 | 1.0891 | 1.5270 | 4167 |
+| Direct SODA-PMuonEq-NorMuon + aspect | 76.69 | 0.7269 | 1.2382 | 4009 |
+| Direct SODA-PMuonEq-NorMuon | 75.16 | 0.7740 | 1.2579 | 3949 |
+| EquiMuse-NorMuon row | 65.96 | 1.0144 | 1.4699 | 4053 |
+| EquiMuse-NorMuon row + aspect | 65.85 | 1.0019 | 1.4519 | 4027 |
+| EquiMuse-NorMuon auto + aspect | 65.72 | 1.0140 | 1.4547 | 4021 |
+| EquiMuse-NorMuon peer-gamma + aspect | 65.11 | 1.0302 | 1.4516 | 4030 |
+| AdamW baseline | 63.06 | 1.0891 | 1.5270 | 4280 |
 
-The row-wise selected recipe is the current quality winner in this single-seed
-run: +2.90 accuracy points and -0.0746 validation loss versus AdamW. The
-orientation-aware `"auto"` ablation is faster than row-wise NorMuon on this
-run, but gave up quality.
+The direct no-AMUSE SODA-PMuonEq-NorMuon path is the current quality winner in
+this single-seed run: +13.63 accuracy points and -0.3622 validation loss versus
+AdamW. Within schedule-free EquiMuse, aspect scaling improved validation loss
+but not accuracy; row/no-aspect remained the best EquiMuse accuracy. The direct
+path should be replicated across seeds before treating the large delta as final.
 
 Artifacts:
 
+- `results/tables/equimuse_feedback_final_results.csv`
+- `results/tables/equimuse_feedback_final_curves.csv`
+- `results/figures/equimuse_feedback_val_loss_curve.png`
+- `results/figures/equimuse_feedback_accuracy_curve.png`
+- `results/figures/equimuse_feedback_iteration_speed.png`
 - `results/figures/equimuse_best_vs_adamw_val_loss_curve.png`
 - `results/figures/equimuse_best_vs_adamw_train_loss_curve.png`
 - `results/figures/equimuse_best_vs_adamw_accuracy_curve.png`

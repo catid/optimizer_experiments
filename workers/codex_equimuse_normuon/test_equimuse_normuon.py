@@ -28,7 +28,7 @@ def _assign_grads(params_a: list[torch.nn.Parameter], params_b: list[torch.nn.Pa
         pb.grad = grad.clone()
 
 
-def _groups(params: list[torch.nn.Parameter], *, batch_muon: bool) -> list[dict]:
+def _groups(params: list[torch.nn.Parameter], *, batch_muon: bool, normuon_aspect_scale: bool = False) -> list[dict]:
     return [
         {
             "params": params[:2],
@@ -41,6 +41,7 @@ def _groups(params: list[torch.nn.Parameter], *, batch_muon: bool) -> list[dict]
             "pmuoneq_row_gamma": 0.15,
             "pmuoneq_col_gamma": 0.15,
             "normuon_beta2": 0.9,
+            "normuon_aspect_scale": normuon_aspect_scale,
             "batch_muon": batch_muon,
         },
         {
@@ -128,6 +129,54 @@ def test_normuon_auto_orientation_uses_columns_for_wide_matrix() -> None:
     assert torch.allclose(auto_out.norm(), update.norm(), atol=1e-6, rtol=1e-6)
 
 
+def test_normuon_aspect_scale_is_explicit_final_magnitude_change() -> None:
+    update = torch.arange(1.0, 13.0).reshape(6, 2)
+    no_aspect = normuon_precondition(update, torch.zeros(6, 1), beta2=0.9, orientation="row")
+    with_aspect = normuon_precondition(
+        update,
+        torch.zeros(6, 1),
+        beta2=0.9,
+        orientation="row",
+        aspect_scale=True,
+    )
+    aspect = (6.0 / 2.0) ** 0.5
+    assert torch.allclose(no_aspect.norm(), update.norm(), atol=1e-6, rtol=1e-6)
+    assert torch.allclose(with_aspect.norm(), update.norm() * aspect, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(with_aspect, no_aspect * aspect, atol=1e-6, rtol=1e-6)
+
+
+def test_batch_mode_matches_loop_mode_with_aspect_scale() -> None:
+    loop_params = _make_params()
+    batch_params = _clone_params(loop_params)
+    loop = EquiMuseNorMuon(
+        _groups(loop_params, batch_muon=False, normuon_aspect_scale=True),
+        beta1=0.6,
+        rho=0.5,
+        warmup_steps=2,
+        soda_anchor_scale=0.5,
+        batch_muon=False,
+        ns_dtype=torch.float32,
+    )
+    batch = EquiMuseNorMuon(
+        _groups(batch_params, batch_muon=True, normuon_aspect_scale=True),
+        beta1=0.6,
+        rho=0.5,
+        warmup_steps=2,
+        soda_anchor_scale=0.5,
+        batch_muon=True,
+        ns_dtype=torch.float32,
+    )
+    loop.train()
+    batch.train()
+    for step in range(5):
+        _assign_grads(loop_params, batch_params, step)
+        loop.step()
+        batch.step()
+    for a, b in zip(loop_params, batch_params, strict=True):
+        assert torch.allclose(a, b, atol=1e-6, rtol=1e-6)
+    assert batch.last_stats["equimuse_normuon_aspect_scale_enabled"] == 1.0
+
+
 def test_state_dict_roundtrip() -> None:
     params = _make_params()
     opt = EquiMuseNorMuon(_groups(params, batch_muon=True), beta1=0.6, warmup_steps=2)
@@ -143,6 +192,55 @@ def test_state_dict_roundtrip() -> None:
     other = EquiMuseNorMuon(_groups(_clone_params(params), batch_muon=True), beta1=0.6, warmup_steps=2)
     other.load_state_dict(loaded)
     assert other.train_mode is True
+    assert loaded["train_mode"] is True
+    second = EquiMuseNorMuon(_groups(_clone_params(params), batch_muon=True), beta1=0.6, warmup_steps=2)
+    second.load_state_dict(loaded)
+    assert second.train_mode is True
+
+
+def test_resume_parity_after_optimizer_load() -> None:
+    params = _make_params()
+    opt = EquiMuseNorMuon(
+        _groups(params, batch_muon=True, normuon_aspect_scale=True),
+        beta1=0.6,
+        warmup_steps=2,
+        ns_dtype=torch.float32,
+    )
+    opt.train()
+    for step in range(3):
+        for i, p in enumerate(params):
+            p.grad = torch.ones_like(p) * (0.02 + i * 0.01 + step * 0.005)
+        opt.step()
+
+    buffer = BytesIO()
+    torch.save({"params": [p.detach().clone() for p in params], "optimizer": opt.state_dict()}, buffer)
+    buffer.seek(0)
+    checkpoint = torch.load(buffer, weights_only=False)
+    resumed_params = [torch.nn.Parameter(p.clone()) for p in checkpoint["params"]]
+    resumed = EquiMuseNorMuon(
+        _groups(resumed_params, batch_muon=True, normuon_aspect_scale=True),
+        beta1=0.6,
+        warmup_steps=2,
+        ns_dtype=torch.float32,
+    )
+    resumed.load_state_dict(checkpoint["optimizer"])
+
+    for step in range(3, 7):
+        _assign_grads(params, resumed_params, step)
+        opt.step()
+        resumed.step()
+
+    for a, b in zip(params, resumed_params, strict=True):
+        assert torch.allclose(a, b, atol=1e-6, rtol=1e-6)
+        state_a = opt.state[a]
+        state_b = resumed.state[b]
+        assert state_a.keys() == state_b.keys()
+        for key, value_a in state_a.items():
+            value_b = state_b[key]
+            if torch.is_tensor(value_a):
+                assert torch.allclose(value_a, value_b, atol=1e-6, rtol=1e-6), key
+            else:
+                assert value_a == value_b
 
 
 def test_train_eval_return_self_and_checkpoint_roundtrips() -> None:
