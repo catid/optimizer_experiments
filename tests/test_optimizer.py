@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -49,6 +50,15 @@ class TwoMatrixNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.classifier_head(F.gelu(self.right(F.gelu(self.left(x)))))
+
+
+class SparseEmbeddingNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(16, 8, sparse=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.embedding(x).sum()
 
 
 def _run_step(model: nn.Module, opt: torch.optim.Optimizer, step: int) -> float:
@@ -114,6 +124,11 @@ def test_named_parameters_constructor_hides_grouping_from_training_code() -> Non
     fallback_names = set(opt.param_groups[1]["param_names"])
     assert "classifier_head.weight" in fallback_names
     assert "norm.weight" in fallback_names
+    summary = opt.group_summary()
+    assert summary[0]["use_matrix_update"] is True
+    assert summary[0]["param_count"] == 1
+    assert summary[1]["use_matrix_update"] is False
+    assert summary[1]["named"] is True
 
 
 def test_named_constructor_preserves_external_lr_flag() -> None:
@@ -147,9 +162,19 @@ def test_min_matrix_dim_keeps_tiny_matrices_in_fallback() -> None:
 
 def test_unnamed_parameter_constructor_deduplicates_shared_tensors() -> None:
     shared = nn.Parameter(torch.zeros(8, 8))
-    opt = SodaPmuonEqNorMuon([shared, shared], warmup_steps=2)
+    with pytest.warns(UserWarning, match="unnamed parameters"):
+        opt = SodaPmuonEqNorMuon([shared, shared], warmup_steps=2)
     assert len(opt.param_groups) == 1
     assert len(opt.param_groups[0]["params"]) == 1
+
+
+def test_sparse_gradients_fail_with_clear_error() -> None:
+    model = SparseEmbeddingNet()
+    opt = SodaPmuonEqNorMuon(model, warmup_steps=2)
+    loss = model(torch.tensor([1, 2, 3]))
+    loss.backward()
+    with pytest.raises(RuntimeError, match="does not support sparse gradients"):
+        opt.step()
 
 
 def test_default_recipe_matches_root_documented_winner() -> None:

@@ -36,6 +36,7 @@ for reuse in other projects. It exposes:
 from optimizer import SodaPmuonEqNorMuon
 
 optimizer = SodaPmuonEqNorMuon(model)
+print(optimizer.group_summary())
 ```
 
 The root file implements only the focused winner: SODA anchor updates,
@@ -43,6 +44,11 @@ row-only PMuonEq, Gram Newton-Schulz, and NorMuon. It intentionally does not
 include AMUSE, MiMuon, full PMuon, column PMuonEq, or aspect-scaling ablations.
 The param-group builder remains available for advanced custom routing, but
 normal training code should not need to construct optimizer groups by hand.
+Prefer passing a module or `model.named_parameters()` rather than
+`model.parameters()`, because names are needed to route embeddings, heads,
+normalization weights, and tied tensors safely. Sparse gradients are not
+supported; use dense embeddings or a separate sparse optimizer for those
+parameters.
 
 ### Default Hyperparameters
 

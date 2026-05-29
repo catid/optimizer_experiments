@@ -187,6 +187,7 @@ as a batch through PMuonEq, Gram Newton-Schulz, and NorMuon.
 from __future__ import annotations
 
 import math
+import warnings
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from typing import Any, TypeAlias
@@ -194,7 +195,7 @@ from typing import Any, TypeAlias
 import torch
 
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 try:
     from torch.optim.optimizer import ParamsT
@@ -420,6 +421,10 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
     scalars, and vectors in the fallback path while sending ordinary large
     matrices through PMuonEq/GramNS/NorMuon.
 
+    Call ``optimizer.group_summary()`` before long runs to audit this routing.
+    Passing unnamed ``model.parameters()`` is supported for compatibility, but
+    it disables name-based routing and will emit a warning.
+
     The defaults are intentionally usable. For a new workload, tune
     ``matrix_lr`` and ``row_gamma`` first; tune ``fallback_lr`` and
     ``normuon_beta2`` second; leave the remaining arguments fixed unless a
@@ -583,6 +588,13 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                     group.setdefault("eps", eps)
             return groups
 
+        warnings.warn(
+            "SodaPmuonEqNorMuon received unnamed parameters. Pass a module or "
+            "model.named_parameters() so embeddings, heads, norms, and tied "
+            "weights can be routed safely.",
+            stacklevel=3,
+        )
+
         matrix_params: list[torch.Tensor] = []
         fallback_params: list[torch.Tensor] = []
         seen_params: set[int] = set()
@@ -636,6 +648,27 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
 
     def eval(self) -> "SodaPmuonEqNorMuon":
         return self
+
+    def group_summary(self) -> list[dict[str, Any]]:
+        """Return a small serializable summary of optimizer parameter routing."""
+
+        summary: list[dict[str, Any]] = []
+        for index, group in enumerate(self.param_groups):
+            params = list(group["params"])
+            names = list(group.get("param_names", []))
+            summary.append(
+                {
+                    "index": index,
+                    "use_matrix_update": bool(group.get("use_matrix_update", False)),
+                    "lr": float(group.get("lr", 0.0)),
+                    "base_lr": float(group.get("base_lr", group.get("lr", 0.0))),
+                    "param_count": len(params),
+                    "numel": int(sum(p.numel() for p in params)),
+                    "named": bool(names),
+                    "param_names": names,
+                }
+            )
+        return summary
 
     def _soda_anchor(self, p: torch.Tensor) -> torch.Tensor:
         state = self.state[p]
@@ -725,6 +758,11 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             grad = p.grad
             if grad is None:
                 continue
+            if grad.is_sparse:
+                raise RuntimeError(
+                    "SodaPmuonEqNorMuon does not support sparse gradients. "
+                    "Use dense gradients for this parameter or a different optimizer for sparse embeddings."
+                )
             if grad.ndim < 2:
                 fallback_count += self._step_fallback_param(p, group, lr=lr, t=t)
                 continue
@@ -758,6 +796,11 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         grad = p.grad
         if grad is None:
             return 0
+        if grad.is_sparse:
+            raise RuntimeError(
+                "SodaPmuonEqNorMuon does not support sparse gradients. "
+                "Use dense gradients for this parameter or a different optimizer for sparse embeddings."
+            )
         state = self.state[p]
         exp_avg_sq = state.get("exp_avg_sq")
         if exp_avg_sq is None or exp_avg_sq.shape != p.shape or exp_avg_sq.device != p.device:
