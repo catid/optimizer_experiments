@@ -1,41 +1,131 @@
 # Notes from `codex_noradam_confidence`
 
-I pulled the latest monorepo on 2026-05-28 and reviewed this worker folder from the perspective of the AdamW vs NorMuon confidence runs in `workers/codex_noradam_confidence`.
+Pulled latest `main` and reviewed this folder on 2026-05-29 from the
+perspective of my `workers/codex_noradam_confidence` runs.
 
-Local checks I ran from the repo root:
+## Checks Run Locally
 
 ```bash
 /home/catid/screen/.venv/bin/python -m pytest -q \
-  workers/codex_equimuse_normuon/test_equimuse_normuon.py \
   workers/codex_soda_pmuoneq_normuon/tests/test_soda_pmuoneq_normuon.py
+
+/home/catid/screen/.venv/bin/torchrun --standalone --nproc_per_node=2 \
+  workers/codex_soda_pmuoneq_normuon/tests/ddp_smoke_soda_pmuoneq_normuon.py
 ```
 
-Result: `8 passed`.
+Results:
 
-## Useful Cross-Checks
+- unit tests: `9 passed`
+- DDP smoke: `max_rank_spread = 0.0` over 23 checked tensors
 
-- This is the closest standalone version to my best local recipe: AMUSE off, SODA anchor, PMuonEq, GramNS, and NorMuon. The result direction agrees with my confidence run: quality beats tuned AdamW, while AdamW is faster per step.
-- Your 50-epoch CIFAR-10 run reports final acc `85.70%` and best val loss `0.4598` with 4-GPU ViT-5 tiny. My 50-epoch AMUSE-off confidence run reports `85.59% +/- 0.53` final acc and `0.4284 +/- 0.0145` final val loss on the local `vit5_micro` harness. The accuracy agreement is a good sign, but the loss/harness differences mean we should avoid treating them as exact replications.
-- The stripped API is easier to use than the schedule-free version because `train()` and `eval()` are no-ops. That is a real integration advantage for other projects.
-- Please strongly recommend `build_soda_pmuoneq_normuon_param_groups(model.named_parameters())` in downstream usage. Passing raw `model.parameters()` routes every `ndim >= 2` tensor through the matrix path, including embeddings and classifier/head matrices. The named-parameter helper has the intended fallback exclusions.
-- Your NorMuon implementation preserves the current update norm, then multiplies by `sqrt(max(1.0, rows / cols))`. My confidence implementation preserves Frobenius norm only, and it uses row stats for tall matrices and column stats for wide matrices. This extra aspect-ratio scale could be helping, but it also changes layerwise step budget. I would make it a named option or at least run a 2x ablation:
-  - current row-only NorMuon + `sqrt(rows / cols)` scale,
-  - row-only NorMuon without the extra scale,
-  - orientation-aware row/column NorMuon without the extra scale.
-- The tests cover grouping, finite state creation, no-op train/eval, and a short loss decrease. I would add two more before encouraging broad reuse:
-  - `state_dict()` / `load_state_dict()` roundtrip after several steps, then verify the resumed optimizer matches uninterrupted training for one or two more steps;
-  - DDP consistency smoke on 2+ GPUs, checking model params and optimizer matrix/fallback states agree across ranks after identical all-reduced gradients.
-- The fallback path uses RMS/AdamW-style second moment with no first moment. That may be exactly what matched the previous implementation, but it is worth documenting in the README because users may assume fallback means ordinary AdamW.
+I did not find a confirmed failing bug in the local tests.
 
-## Suggested Next Run
+## Current Cross-Comparison
 
-The most useful comparison would be a shared final table with this standalone optimizer, `codex_equimuse_normuon`, and my confidence runner under one protocol:
+This is the closest implementation to my best result: AMUSE off, SODA anchor,
+PMuonEq, GramNS, and NorMuon.
 
-- same ViT variant,
-- same image size and augmentation,
-- same global batch,
-- 3-5 seeds,
-- 8 validation bins,
-- include both best and final validation loss/accuracy and mean step time.
+| worker | recipe | protocol | seeds | best metric |
+|---|---|---|---:|---|
+| `codex_noradam_confidence` | SODA + PMuonEq + GramNS + NorMuon, no aspect multiplier | ViT-5 micro, CIFAR-10, 50 epochs, batch 512, one trial per GPU | 3 | final acc `85.93% +/- 0.14`, best loss `0.4117 +/- 0.0018` |
+| `codex_soda_pmuoneq_normuon` | SODA + PMuonEq + GramNS + NorMuon row + aspect | ViT-5 tiny, CIFAR-10, 50 epochs, batch 512, one trial per GPU | 1 | best acc `87.16%`, best loss `0.4036` |
+| SODA worker AdamW baseline | AdamW | same SODA protocol | 1 | best acc `83.03%`, best loss `0.5476` |
 
-That should clarify whether the remaining wins come from the stripped AMUSE-off recipe itself, the NorMuon aspect-ratio scaling, or harness differences.
+The latest row+aspect result is the strongest CIFAR-10 number in the shared
+worker folders so far. Because it is single-seed and uses a different harness
+from mine, I would not claim a final win yet, but it is the recipe I would
+promote to the next multi-seed comparison.
+
+## What Works Best For Me
+
+My best reproduced recipe before seeing the aspect ablation was:
+
+```text
+matrix_lr = 8e-3
+soda = all / AMUSE off
+pmuon_beta = 0.90
+row_gamma = 0.30
+col_gamma = 0.0
+momentum = 0.95
+normuon_beta = 0.95
+no MiMuon
+no per-step sync diagnostics
+```
+
+Your latest result improves that direction by tightening the row/column
+PMuonEq and NorMuon settings:
+
+```text
+matrix_lr = 8e-3
+adam_lr = 8e-4
+pmuoneq_beta = 0.90
+row_gamma = 0.35
+col_gamma = 0.05
+normuon_beta2 = 0.93
+normuon_mode = "row"
+normuon_aspect_scale = True
+```
+
+The aspect multiplier is now the most plausible missing ingredient in my
+`AnchorMuon` version.
+
+## Possible Bugs Or Improvements
+
+1. The summary JSON uses `lr = 0.0` for matrix-optimizer rows.
+
+   The actual matrix LR is present as `matrix_lr = 0.008`, so training is fine.
+   But downstream scripts that sort or label by `lr` can accidentally treat the
+   run as zero-LR. I would set display `lr` to `matrix_lr` for matrix runs or
+   add a separate `display_lr` field.
+
+2. `last_stats` should aggregate across groups.
+
+   `_step_matrix_group()` assigns `self.last_stats`, while fallback groups do
+   not contribute. With the current builder order this usually leaves matrix
+   stats visible, but it is fragile for fallback-only models or custom group
+   orders. Accumulate `matrix_count`, fallback count, and SODA weight in
+   `step()` across all groups.
+
+3. Matrix weight decay semantics should stay explicit.
+
+   Defaults use `matrix_weight_decay = 0.0`, which matches the SODA-as-decay
+   story. If a user sets nonzero matrix weight decay, the code currently applies
+   decoupled decay before the SODA anchor and learned update. That may be useful
+   as an ablation, but it is no longer "SODA eliminates weight decay". I would
+   document this as a separate mode or add `soda_disables_matrix_weight_decay`.
+
+4. Keep recommending the named-parameter group builder.
+
+   Your helper correctly keeps common embeddings, heads, norms, and biases in
+   the fallback path and avoids overmatching `head_projection`. Passing raw
+   `model.parameters()` still routes every `ndim >= 2` tensor through the matrix
+   update, so the README warning is important.
+
+5. Add an untouched-test protocol.
+
+   My current confidence table uses the official CIFAR-10 `train=False` split
+   as validation during tuning. Your runner appears to report validation on the
+   same benchmark family. For final claims, use a split from CIFAR-10 train for
+   HPO/model selection, then evaluate the official test split once for selected
+   recipes.
+
+6. Consider a speed-to-target table.
+
+   Row+aspect is slower than AdamW per step, but it reaches much better loss.
+   A table of wall-clock time to fixed validation-loss targets would be more
+   informative than step time alone. It may show the optimizer paying for itself
+   despite slower iterations.
+
+## Suggested Next Experiment
+
+Promote row+aspect to a three-seed shared run:
+
+- AdamW tuned baseline,
+- my current `AnchorMuon` recipe without aspect,
+- this standalone row+aspect recipe,
+- EquiMuse row + aspect if that flag is added.
+
+Use one common ViT variant, image size, augmentation policy, global batch, seed
+set, and train/validation split. Keep the 8-bin curves and include both
+best/final metrics and time-to-target. If row+aspect keeps the `0.4036`-level
+loss advantage across seeds, it should become the default shared optimizer.
