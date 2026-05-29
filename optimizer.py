@@ -75,11 +75,6 @@ For a matrix parameter ``W_t`` with gradient ``G_t``:
        W_t <- (1 - lambda_t) W_t + lambda_t W_0
        W_{t+1} = W_t - lr_t N_t
 
-   SODA can be enabled separately for matrix and fallback groups with
-   ``matrix_soda`` and ``fallback_soda``. The default keeps the golden behavior:
-   SODA is on for both groups. Setting ``fallback_soda=False`` is the matrix-only
-   ablation used to test whether non-matrix anchor regularization matters.
-
 Fallback parameters
 ===================
 
@@ -441,8 +436,6 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         warmup_steps: int = 80,
         soda_lambda_scale: float = 1.0,
         soda_lambda_power: float = 1.0,
-        matrix_soda: bool = True,
-        fallback_soda: bool = True,
         pmuoneq_beta: float = 0.90,
         row_gamma: float = 0.35,
         pmuoneq_eps: float = 1e-6,
@@ -477,8 +470,8 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             raise ValueError("fallback_weight_decay must be non-negative")
         if min_matrix_dim < 1:
             raise ValueError("min_matrix_dim must be >= 1")
-        if soda_lambda_scale < 0.0:
-            raise ValueError("soda_lambda_scale must be non-negative")
+        if soda_lambda_scale <= 0.0:
+            raise ValueError("soda_lambda_scale must be positive; SODA is always enabled")
         if soda_lambda_power <= 0.0:
             raise ValueError("soda_lambda_power must be positive")
         prepared = self._prepare_param_groups(
@@ -497,8 +490,6 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             use_external_lr=use_external_lr,
             min_matrix_dim=min_matrix_dim,
             matrix_filter=matrix_filter,
-            matrix_soda=bool(matrix_soda),
-            fallback_soda=bool(fallback_soda),
         )
         super().__init__(prepared, defaults={})
 
@@ -540,8 +531,6 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         use_external_lr: bool,
         min_matrix_dim: int,
         matrix_filter: Callable[[str, torch.nn.Parameter], bool] | None,
-        matrix_soda: bool,
-        fallback_soda: bool,
     ) -> list[dict[str, Any]]:
         items = list(params)
         if not items:
@@ -568,8 +557,6 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                 use_external_lr=use_external_lr,
                 min_matrix_dim=min_matrix_dim,
                 matrix_filter=matrix_filter,
-                matrix_soda=matrix_soda,
-                fallback_soda=fallback_soda,
             )
         if isinstance(items[0], dict):
             groups = [dict(group) for group in items]  # type: ignore[arg-type]
@@ -581,8 +568,6 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                 group.setdefault("use_external_lr", use_external_lr)
                 if is_matrix:
                     group.setdefault("weight_decay", 0.0)
-                    group.setdefault("use_soda", matrix_soda)
-                    group.setdefault("fallback_use_soda", fallback_soda)
                     group.setdefault("momentum", momentum)
                     group.setdefault("pmuoneq_beta", pmuoneq_beta)
                     group.setdefault("row_gamma", row_gamma)
@@ -592,7 +577,6 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                     group.setdefault("min_matrix_dim", min_matrix_dim)
                 else:
                     group.setdefault("weight_decay", fallback_weight_decay)
-                    group.setdefault("use_soda", fallback_soda)
                     group.setdefault("betas", fallback_betas)
                     group.setdefault("eps", eps)
             return groups
@@ -636,8 +620,6 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                     "normuon_eps": normuon_eps,
                     "use_external_lr": use_external_lr,
                     "min_matrix_dim": min_matrix_dim,
-                    "use_soda": matrix_soda,
-                    "fallback_use_soda": fallback_soda,
                 }
             )
         if fallback_params:
@@ -651,7 +633,6 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                     "betas": fallback_betas,
                     "eps": eps,
                     "use_external_lr": use_external_lr,
-                    "use_soda": fallback_soda,
                 }
             )
         return groups
@@ -692,9 +673,6 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
 
     def _soda_weight(self, t: int) -> float:
         return min(1.0, self.soda_lambda_scale / float(t + 1) ** self.soda_lambda_power)
-
-    def _group_soda_weight(self, group: dict[str, Any], t: int, *, key: str = "use_soda") -> float:
-        return self._soda_weight(t) if bool(group.get(key, True)) else 0.0
 
     def _pre_matrix_source(self, p: torch.Tensor, grad: torch.Tensor, momentum_beta: float) -> tuple[torch.Tensor, torch.Tensor]:
         state = self.state[p]
@@ -780,13 +758,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                     "Use dense gradients for this parameter or a different optimizer for sparse embeddings."
                 )
             if not _is_matrix_like_parameter(grad, min_matrix_dim=int(group.get("min_matrix_dim", 2))):
-                fallback_count += self._step_fallback_param(
-                    p,
-                    group,
-                    lr=lr,
-                    t=t,
-                    soda_weight=self._group_soda_weight(group, t, key="fallback_use_soda"),
-                )
+                fallback_count += self._step_fallback_param(p, group, lr=lr, t=t)
                 continue
             anchor = self._soda_anchor(p)
             source, grad_matrix = self._pre_matrix_source(p, grad, beta_m)
@@ -796,14 +768,14 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             return {
                 "matrix_count": 0.0,
                 "fallback_count": float(fallback_count),
-                "soda_weight": float(self._group_soda_weight(group, t)),
+                "soda_weight": float(self._soda_weight(t)),
             }
 
         buckets: dict[tuple[torch.device, torch.Size], list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]] = defaultdict(list)
         for entry in entries:
             buckets[(entry[2].device, entry[2].shape)].append(entry)
 
-        soda_weight = self._group_soda_weight(group, t)
+        soda_weight = self._soda_weight(t)
         matrix_count = 0
         for bucket_entries in buckets.values():
             updates = self._transform_matrix_bucket(bucket_entries, group)
@@ -825,7 +797,6 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         *,
         lr: float,
         t: int,
-        soda_weight: float | None = None,
     ) -> int:
         grad = p.grad
         if grad is None:
@@ -851,9 +822,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         weight_decay = float(group.get("weight_decay", 0.0))
         if weight_decay:
             update = update + p.detach().to(torch.float32) * weight_decay
-        if soda_weight is None:
-            soda_weight = self._group_soda_weight(group, t)
-        p.lerp_(end=self._soda_anchor(p), weight=float(soda_weight))
+        p.lerp_(end=self._soda_anchor(p), weight=self._soda_weight(t))
         p.add_(update.to(p.dtype), alpha=-lr)
         return 1
 
@@ -864,7 +833,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         return {
             "matrix_count": 0.0,
             "fallback_count": float(fallback_count),
-            "soda_weight": float(self._group_soda_weight(group, t)),
+            "soda_weight": float(self._soda_weight(t)),
         }
 
     @torch.no_grad()
@@ -923,8 +892,6 @@ def build_soda_pmuoneq_normuon_param_groups(
     use_external_lr: bool = False,
     min_matrix_dim: int = 2,
     matrix_filter: Callable[[str, torch.nn.Parameter], bool] | None = None,
-    matrix_soda: bool = True,
-    fallback_soda: bool = True,
 ) -> list[dict[str, Any]]:
     """Split named parameters into matrix and fallback groups.
 
@@ -995,8 +962,6 @@ def build_soda_pmuoneq_normuon_param_groups(
                 "normuon_eps": normuon_eps,
                 "use_external_lr": use_external_lr,
                 "min_matrix_dim": min_matrix_dim,
-                "use_soda": matrix_soda,
-                "fallback_use_soda": fallback_soda,
             }
         )
     if fallback_params:
@@ -1012,7 +977,6 @@ def build_soda_pmuoneq_normuon_param_groups(
                 "betas": fallback_betas,
                 "eps": eps,
                 "use_external_lr": use_external_lr,
-                "use_soda": fallback_soda,
             }
         )
     return groups
