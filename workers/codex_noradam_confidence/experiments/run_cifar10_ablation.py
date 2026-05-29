@@ -39,6 +39,7 @@ import optimizer as root_optimizer
 from golden_soda_pmuoneq_normuon import GoldenMuon
 from optim_anchormuon import AnchorMuon
 from optim_factory import _anchor_param_groups
+from optim_sfplus import SFPlusAnchorMuon
 
 
 @dataclass
@@ -63,6 +64,18 @@ class TrialConfig:
     normuon_aspect_scale: bool = False
     root_grouping: str = "anchor"
     root_normuon_mode: str = "row"
+    sfplus_polyak: bool = False
+    sfplus_c_warmup_enabled: bool = False
+    sfplus_beta_anneal: bool = False
+    sfplus_adamc_decay: bool = False
+    sfplus_inner_momentum: bool = False
+    sfplus_beta1: float = 0.90
+    sfplus_beta1_max: float = 0.965
+    sfplus_beta1_anneal_steps: int = 0
+    sfplus_polyak_beta: float = 0.0
+    sfplus_c_warmup: int = 0
+    sfplus_r: float = 0.0
+    sfplus_weight_lr_power: float = 2.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,6 +101,7 @@ def parse_args() -> argparse.Namespace:
             "root_normuon_ablation",
             "root_soda_ablation",
             "root_lr_schedule_sweep",
+            "sfplus_combo20",
         ],
     )
     parser.add_argument("--only", default="", help="Regex filter for trial names")
@@ -414,6 +428,65 @@ def trial_grid(preset: str) -> list[TrialConfig]:
             ))
     if preset == "root_lr_schedule_sweep":
         return root_lr_schedule_sweep
+    if preset == "sfplus_combo20":
+        trials = [
+            TrialConfig(
+                "adamw_cosine_lr0.004_wd0.001",
+                "adamw",
+                4e-3,
+                lr_schedule="cosine",
+                weight_decay=0.001,
+            ),
+            TrialConfig(
+                "root_named_wsd_lr0.012_rg0.35_pb0.9_nb0.93",
+                "root",
+                1.2e-2,
+                lr_schedule="wsd",
+                soda="all",
+                row_gamma=0.35,
+                pmuon_beta=0.90,
+                momentum=0.95,
+                normuon=True,
+                normuon_beta=0.93,
+                amuse=False,
+                root_grouping="named",
+                root_normuon_mode="row",
+            ),
+        ]
+        # Exhaustive on/off combinations of five SF+ mechanisms:
+        # P=Polyak LR, C=c_warmup, B=beta anneal, D=AdamC decay, M=inner momentum.
+        # Polyak and non-Polyak variants require different base-LR scales because
+        # Polyak supplies an online scalar while non-Polyak uses lr directly.
+        toggles = ["P", "C", "B", "D", "M"]
+        for mask in range(32):
+            enabled = {letter: bool(mask & (1 << idx)) for idx, letter in enumerate(toggles)}
+            code = "".join(letter if enabled[letter] else letter.lower() for letter in toggles)
+            trials.append(TrialConfig(
+                f"sfplus_{code}_lr{'3' if enabled['P'] else '0.008'}_wd2",
+                "sfplus",
+                3.0 if enabled["P"] else 8e-3,
+                lr_schedule="constant",
+                weight_decay=2.0,
+                soda="none",
+                row_gamma=0.35,
+                col_gamma=0.0,
+                pmuon_beta=0.90,
+                momentum=0.95,
+                normuon=True,
+                normuon_beta=0.93,
+                amuse=False,
+                sfplus_polyak=enabled["P"],
+                sfplus_c_warmup_enabled=enabled["C"],
+                sfplus_beta_anneal=enabled["B"],
+                sfplus_adamc_decay=enabled["D"],
+                sfplus_inner_momentum=enabled["M"],
+                sfplus_beta1=0.90,
+                sfplus_beta1_max=0.965,
+                sfplus_polyak_beta=0.0,
+                sfplus_r=0.0,
+                sfplus_weight_lr_power=2.0,
+            ))
+        return trials
     feedback = [
         TrialConfig("adamw_cosine_lr0.004_wd0.001", "adamw", 4e-3, lr_schedule="cosine", weight_decay=0.001),
     ]
@@ -515,6 +588,9 @@ def trial_grid(preset: str) -> list[TrialConfig]:
 
 
 def trial_family(cfg: TrialConfig) -> str:
+    if cfg.optimizer == "sfplus":
+        match = re.search(r"sfplus_([PCBDMpcbdm]{5})", cfg.name)
+        return f"sfplus_{match.group(1)}" if match else "sfplus"
     if cfg.optimizer == "root":
         return f"root_{cfg.root_grouping}_{cfg.root_normuon_mode}_{cfg.soda}"
     if cfg.optimizer == "golden":
@@ -796,6 +872,34 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             normuon_beta=cfg.normuon_beta,
             normuon_aspect_scale=cfg.normuon_aspect_scale,
         )
+    if cfg.optimizer == "sfplus":
+        if not cfg.pmuon_eq or not cfg.normuon:
+            raise ValueError("sfplus preset expects PMuonEq + NorMuon matrix direction")
+        return SFPlusAnchorMuon(
+            _anchor_param_groups(model, cfg.weight_decay),
+            lr=cfg.lr,
+            betas=(0.9, 0.95),
+            sfplus_beta1=cfg.sfplus_beta1,
+            sfplus_beta1_max=cfg.sfplus_beta1_max,
+            sfplus_beta1_anneal_steps=cfg.sfplus_beta1_anneal_steps,
+            sfplus_polyak_beta=cfg.sfplus_polyak_beta,
+            sfplus_c_warmup=cfg.sfplus_c_warmup,
+            sfplus_r=cfg.sfplus_r,
+            sfplus_weight_lr_power=cfg.sfplus_weight_lr_power,
+            sfplus_polyak=cfg.sfplus_polyak,
+            sfplus_c_warmup_enabled=cfg.sfplus_c_warmup_enabled,
+            sfplus_beta_anneal=cfg.sfplus_beta_anneal,
+            sfplus_adamc_decay=cfg.sfplus_adamc_decay,
+            sfplus_inner_momentum=cfg.sfplus_inner_momentum,
+            weight_decay=cfg.weight_decay,
+            momentum=cfg.momentum,
+            pmuon_beta=cfg.pmuon_beta,
+            row_gamma=cfg.row_gamma,
+            col_gamma=cfg.col_gamma,
+            normuon_beta=cfg.normuon_beta,
+            ns_steps=int(getattr(args, "anchor_ns_steps", 5)),
+            min_matrix_dim=int(getattr(args, "anchor_min_matrix_dim", 2)),
+        )
     if cfg.optimizer == "root":
         if cfg.soda != "all":
             raise ValueError("root optimizer always uses all-parameter SODA; set soda='all'")
@@ -907,13 +1011,18 @@ def run_worker(args: argparse.Namespace) -> None:
     device = torch.device("cuda:0")
 
     train_loader, val_loader, test_loader, dataset_info = cifar10_loaders(args)
+    total_steps = args.epochs * len(train_loader)
+    if args.max_steps > 0:
+        total_steps = min(total_steps, int(args.max_steps))
+    if cfg.optimizer == "sfplus":
+        if cfg.sfplus_c_warmup_enabled and cfg.sfplus_c_warmup <= 0:
+            cfg.sfplus_c_warmup = int(args.warmup_steps)
+        if cfg.sfplus_beta_anneal and cfg.sfplus_beta1_anneal_steps <= 0:
+            cfg.sfplus_beta1_anneal_steps = int(total_steps)
     model = create_model(args.model, pretrained=False, num_classes=10, img_size=32, drop_path_rate=0.05)
     model.to(device=device, memory_format=torch.channels_last)
     optimizer = make_optimizer(model, cfg, args)
     criterion = nn.CrossEntropyLoss()
-    total_steps = args.epochs * len(train_loader)
-    if args.max_steps > 0:
-        total_steps = min(total_steps, int(args.max_steps))
     eval_steps = selected_eval_steps(total_steps, args.eval_bins)
     global_step = 0
     total_examples_seen = 0
@@ -962,7 +1071,10 @@ def run_worker(args: argparse.Namespace) -> None:
                     logits = model(images)
                     loss = criterion(logits, targets)
                 loss.backward()
-                optimizer.step()
+                if cfg.optimizer == "sfplus":
+                    optimizer.step(function_value=float(loss.detach().cpu()))
+                else:
+                    optimizer.step()
                 if args.sync_step_timing and torch.cuda.is_available():
                     torch.cuda.synchronize()
                 step_ms = (time.perf_counter() - step_start) * 1000.0
@@ -1090,6 +1202,18 @@ def run_worker(args: argparse.Namespace) -> None:
         "normuon_aspect_scale": cfg.normuon_aspect_scale,
         "root_grouping": cfg.root_grouping,
         "root_normuon_mode": cfg.root_normuon_mode,
+        "sfplus_polyak": cfg.sfplus_polyak,
+        "sfplus_c_warmup_enabled": cfg.sfplus_c_warmup_enabled,
+        "sfplus_beta_anneal": cfg.sfplus_beta_anneal,
+        "sfplus_adamc_decay": cfg.sfplus_adamc_decay,
+        "sfplus_inner_momentum": cfg.sfplus_inner_momentum,
+        "sfplus_beta1": cfg.sfplus_beta1,
+        "sfplus_beta1_max": cfg.sfplus_beta1_max,
+        "sfplus_beta1_anneal_steps": cfg.sfplus_beta1_anneal_steps,
+        "sfplus_polyak_beta": cfg.sfplus_polyak_beta,
+        "sfplus_c_warmup": cfg.sfplus_c_warmup,
+        "sfplus_r": cfg.sfplus_r,
+        "sfplus_weight_lr_power": cfg.sfplus_weight_lr_power,
         "avg_step_ms": 1000.0 * total_train_seconds / max(global_step, 1),
         "overall_examples_per_sec": total_examples_seen / max(total_train_seconds, 1e-9),
         "elapsed_sec": time.perf_counter() - started,
@@ -1249,6 +1373,18 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
             normuon_aspect_scale=parse_bool(row.get("normuon_aspect_scale", False)),
             root_grouping=str(row.get("root_grouping", "anchor")),
             root_normuon_mode=str(row.get("root_normuon_mode", "row")),
+            sfplus_polyak=parse_bool(row.get("sfplus_polyak", False)),
+            sfplus_c_warmup_enabled=parse_bool(row.get("sfplus_c_warmup_enabled", False)),
+            sfplus_beta_anneal=parse_bool(row.get("sfplus_beta_anneal", False)),
+            sfplus_adamc_decay=parse_bool(row.get("sfplus_adamc_decay", False)),
+            sfplus_inner_momentum=parse_bool(row.get("sfplus_inner_momentum", False)),
+            sfplus_beta1=float(row.get("sfplus_beta1", 0.90)),
+            sfplus_beta1_max=float(row.get("sfplus_beta1_max", 0.965)),
+            sfplus_beta1_anneal_steps=int(float(row.get("sfplus_beta1_anneal_steps", 0))),
+            sfplus_polyak_beta=float(row.get("sfplus_polyak_beta", 0.0)),
+            sfplus_c_warmup=int(float(row.get("sfplus_c_warmup", 0))),
+            sfplus_r=float(row.get("sfplus_r", 0.0)),
+            sfplus_weight_lr_power=float(row.get("sfplus_weight_lr_power", 2.0)),
         )
         fam = trial_family(cfg)
         current = by_family.get(fam)
@@ -1277,6 +1413,10 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
                 if trial.startswith("adamw_"):
                     schedule = "cosine" if "cosine" in trial else "schedule"
                     return f"AdamW {schedule}{seed_suffix}"
+                if trial.startswith("sfplus_"):
+                    match = re.search(r"sfplus_([PCBDMpcbdm]{5})", trial)
+                    code = match.group(1) if match else trial[len("sfplus_"):].split("_", 1)[0]
+                    return f"SF+ {code}{seed_suffix}"
                 if trial.startswith("root_named_"):
                     rest = trial[len("root_named_"):]
                     schedule = rest.split("_", 1)[0]
@@ -1400,6 +1540,18 @@ def summaries_to_trials(rows: Iterable[dict]) -> list[TrialConfig]:
             normuon_aspect_scale=parse_bool(row.get("normuon_aspect_scale", False)),
             root_grouping=str(row.get("root_grouping", "anchor")),
             root_normuon_mode=str(row.get("root_normuon_mode", "row")),
+            sfplus_polyak=parse_bool(row.get("sfplus_polyak", False)),
+            sfplus_c_warmup_enabled=parse_bool(row.get("sfplus_c_warmup_enabled", False)),
+            sfplus_beta_anneal=parse_bool(row.get("sfplus_beta_anneal", False)),
+            sfplus_adamc_decay=parse_bool(row.get("sfplus_adamc_decay", False)),
+            sfplus_inner_momentum=parse_bool(row.get("sfplus_inner_momentum", False)),
+            sfplus_beta1=float(row.get("sfplus_beta1", 0.90)),
+            sfplus_beta1_max=float(row.get("sfplus_beta1_max", 0.965)),
+            sfplus_beta1_anneal_steps=int(float(row.get("sfplus_beta1_anneal_steps", 0))),
+            sfplus_polyak_beta=float(row.get("sfplus_polyak_beta", 0.0)),
+            sfplus_c_warmup=int(float(row.get("sfplus_c_warmup", 0))),
+            sfplus_r=float(row.get("sfplus_r", 0.0)),
+            sfplus_weight_lr_power=float(row.get("sfplus_weight_lr_power", 2.0)),
         ))
     return trials
 

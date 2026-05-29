@@ -16,6 +16,8 @@ commit b009f03 Compare NorMuon base against AdamW
 ## Contents
 
 - `optim_anchormuon.py`: AnchorMuon/NorMuon optimizer implementation.
+- `optim_sfplus.py`: experimental ScheduleFree+ outer-loop wrapper used only
+  for the exhaustive toggle sweep below.
 - `golden_soda_pmuoneq_normuon.py`: stripped standalone golden optimizer
   implementing only the winning direct SODA + PMuonEq + GramNS + NorMuon path.
 - `optim_factory.py`: ViT-5 optimizer factory hook.
@@ -38,6 +40,8 @@ commit b009f03 Compare NorMuon base against AdamW
 - `results/root_lr_schedule_sweep_20260529/`: trainer-side LR schedule study
   for root `optimizer.py`; 12-epoch HPO per schedule followed by 50-epoch
   schedule-winner replay.
+- `results/sfplus_combo20_20260529/`: 20-epoch exhaustive ScheduleFree+
+  mechanism-combination sweep around the AnchorMuon matrix direction.
 
 ## Main Result
 
@@ -73,6 +77,55 @@ Latest diagrams:
   `results/root_lr_schedule_sweep_20260529/final50_schedule_winners/val_acc.png`
 - Latest LR-schedule iteration speed:
   `results/root_lr_schedule_sweep_20260529/final50_schedule_winners/step_time_ms_bar.png`
+
+### ScheduleFree+ Combination Sweep
+
+This study tested all 32 combinations of five ScheduleFree+ mechanisms wrapped
+around the current PMuonEq + GramNS + NorMuon matrix direction:
+
+- `P`: Polyak-style online LR multiplier
+- `C`: `c_t` warmup
+- `B`: beta annealing
+- `D`: AdamC-style decay
+- `M`: inner optimizer momentum
+
+Protocol: `vit5_micro`, CIFAR-10 45k/5k train/validation split, official
+10k test evaluated at the end, batch size 512, 20 epochs, seed `123`, BF16
+autocast, channels-last tensors, 16 dataloader workers, and two GPUs scheduled
+one trial per GPU.
+
+Top rows from the 20-epoch run:
+
+| Rank | Trial | Val acc | Test acc | Val loss | Test loss | Step |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | `root_named_wsd_lr0.012_rg0.35_pb0.9_nb0.93` | 84.92% | 84.41% | 0.4267 | 0.4598 | 17.26 ms |
+| 2 | `sfplus_PCbDM_lr3_wd2` | 80.84% | 80.46% | 0.5665 | 0.5780 | 22.99 ms |
+| 3 | `sfplus_PCBdM_lr3_wd2` | 79.94% | 79.23% | 0.5878 | 0.6098 | 23.00 ms |
+| 4 | `sfplus_PCBDM_lr3_wd2` | 79.84% | 79.48% | 0.5794 | 0.6017 | 22.44 ms |
+| 5 | `sfplus_PCbdM_lr3_wd2` | 79.72% | 79.49% | 0.5817 | 0.5954 | 22.92 ms |
+| 6 | `adamw_cosine_lr0.004_wd0.001` | 73.44% | 72.58% | 0.7566 | 0.7796 | 11.60 ms |
+
+Toggle marginals over SF+ rows:
+
+| Toggle | On mean val acc | Off mean val acc | Delta |
+|---|---:|---:|---:|
+| Polyak LR | 74.47% | 75.20% | -0.72 |
+| `c_t` warmup | 75.31% | 74.37% | +0.94 |
+| beta annealing | 74.67% | 75.00% | -0.34 |
+| AdamC decay | 74.97% | 74.70% | +0.27 |
+| inner momentum | 78.95% | 70.73% | +8.22 |
+
+Conclusion: SF+ did not produce a new winner in this proxy. The best SF+ row
+was substantially better than AdamW but still trailed AnchorMuon WSD by 4.08
+validation points and 3.95 official test points. The only large positive SF+
+toggle was inner momentum; no-inner-momentum combinations are not worth more
+training in this harness.
+
+Full table and plots:
+`results/sfplus_combo20_20260529/e20/summary.md`,
+`results/sfplus_combo20_20260529/e20/val_acc.png`,
+`results/sfplus_combo20_20260529/e20/val_loss.png`, and
+`results/sfplus_combo20_20260529/e20/step_time_ms_bar.png`.
 
 ### Latest Root LR Schedule Sweep
 
