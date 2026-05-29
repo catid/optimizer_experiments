@@ -1,5 +1,76 @@
 # SODA-PMuonEq-NorMuon Summary
 
+## Best Confirmed Version
+
+The best confirmed version in this folder is exactly:
+
+```text
+trial id:  row_aspect_mlr0.008_rg0.35_cg0.05_nb0.93
+optimizer: SodaPmuonEqNorMuon
+mode:      row-wise NorMuon + aspect scaling
+```
+
+Use this recipe when referring to the reported best result:
+
+```python
+SodaPmuonEqNorMuon(
+    params,
+    matrix_lr=8e-3,
+    adam_lr=8e-4,
+    momentum=0.95,
+    pmuoneq_beta=0.90,
+    row_gamma=0.35,
+    col_gamma=0.05,
+    normuon_beta2=0.93,
+    normuon_mode="row",
+    normuon_aspect_scale=True,
+    matrix_weight_decay=0.0,
+    adam_weight_decay=0.05,
+    warmup_steps=10,
+)
+```
+
+It was the best by mean final validation loss on the following workload:
+
+| field | value |
+|---|---|
+| model | `vit5_tiny` from the local ViT-5 registration |
+| model size | 2,691,274 trainable parameters |
+| architecture shape | 32x32 input, patch size 4, hidden size 192, 6 transformer blocks, MLP hidden size 768, 10-class head |
+| dataset | CIFAR-10, 50,000 train images and 10,000 validation/test images |
+| augmentation | train: random crop 32 with padding 4, random horizontal flip, CIFAR normalization; eval: CIFAR normalization |
+| training length | 50 epochs, 4,850 optimizer steps |
+| batch size | 512 images per single-GPU trial |
+| run mode | one independent single-GPU trial per visible GPU; this final comparison used all four GPUs for parallel trials, not DDP |
+| precision/layout | CUDA bf16 autocast, channels-last model/input layout, TF32 enabled |
+| eval schedule | 8 evenly spaced validation bins plus final summary |
+| seeds | `34000`, `456`, `789` |
+| baseline | tuned fused AdamW, `lr=2.5e-3`, `weight_decay=0.005`, same model/data/steps/eval |
+
+Aggregate result for that exact version:
+
+```text
+final val loss: 0.3975 +/- 0.0150
+best val loss:  0.3935 +/- 0.0119
+final val acc:  87.44% +/- 0.43%
+throughput:     14,816 images/s
+step time:      34.56 ms
+```
+
+The tuned AdamW baseline on the same workload reached:
+
+```text
+final val loss: 0.5868 +/- 0.0289
+best val loss:  0.5614 +/- 0.0191
+final val acc:  82.56% +/- 0.89%
+throughput:     26,441 images/s
+step time:      19.37 ms
+```
+
+Scope caveat: this is a CIFAR-10 / ViT-5 tiny result. It should not be quoted
+as the best recipe for larger ViTs, language models, or different batch-size
+regimes until those workloads are tuned and confirmed separately.
+
 ## Algorithm
 
 The standalone optimizer in this folder is a quality-first matrix optimizer for
@@ -61,6 +132,8 @@ decay.
 
 ## Tuned Recipe
 
+This section repeats the best confirmed recipe for implementation convenience.
+
 ```python
 SodaPmuonEqNorMuon(
     params,
@@ -83,10 +156,12 @@ SodaPmuonEqNorMuon(
 
 Latest peer-feedback comparison:
 
-- Model/data: ViT-5 tiny on CIFAR-10.
-- Training: 50 epochs, batch size 512, bf16 autocast.
-- Hardware: one single-GPU trial per visible GPU, all four GPUs used
-  concurrently.
+- Model/data: `vit5_tiny` on CIFAR-10.
+- Model size: 2,691,274 trainable parameters.
+- Training: 50 epochs, 4,850 steps, batch size 512 per single-GPU trial,
+  bf16 autocast, channels-last layout, TF32 enabled.
+- Hardware/run mode: one single-GPU trial per visible GPU, all four GPUs used
+  concurrently for the final comparison. This was not DDP.
 - Seeds: `34000`, `456`, `789`.
 - Baseline: tuned AdamW, `lr=2.5e-3`, `weight_decay=0.005`.
 

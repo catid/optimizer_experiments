@@ -36,6 +36,19 @@ For the compact handoff version of the algorithm and final table, start with
 `ALGORITHM_RESULTS.md`. The rest of this README keeps the longer experiment
 history and reproduction commands.
 
+Best confirmed version:
+
+```text
+trial id: row_aspect_mlr0.008_rg0.35_cg0.05_nb0.93
+model:    vit5_tiny, 2,691,274 trainable parameters
+data:     CIFAR-10, full 50k train / 10k eval split
+training: 50 epochs, 4,850 steps, batch size 512 per single-GPU trial
+result:   final val loss 0.3975 +/- 0.0150, final val acc 87.44% +/- 0.43%
+```
+
+The final comparison ran one independent single-GPU trial per visible GPU and
+used all four GPUs concurrently for throughput. It was not a DDP training run.
+
 ## Optimizer
 
 The optimizer is the tuned local recipe:
@@ -87,6 +100,10 @@ for reproducing the ablation below, but the recommended/default recipe remains
 row-wise NorMuon with aspect scaling.
 
 ## Tuned Defaults
+
+These defaults correspond to the best confirmed version
+`row_aspect_mlr0.008_rg0.35_cg0.05_nb0.93` on ViT-5 tiny / CIFAR-10 with batch
+size 512 and 50 epochs.
 
 ```python
 SodaPmuonEqNorMuon(
@@ -153,7 +170,10 @@ for matrix optimizers, made matrix weight decay explicitly disabled by SODA by
 default, and aggregated optimizer stats across parameter groups.
 
 The follow-up includes a 12-epoch tuning pass plus 50-epoch confirmation on
-seeds `34000`, `456`, and `789`. Full artifacts are in
+seeds `34000`, `456`, and `789`. It used `vit5_tiny` with 2,691,274 trainable
+parameters, CIFAR-10 full train/eval splits, batch size 512 per single-GPU
+trial, 4,850 optimizer steps, bf16 autocast, channels-last layout, TF32 enabled,
+and 8 validation bins. Full artifacts are in
 `results/cifar10_peer_feedback_final50_aggregate/`.
 
 | rank | optimizer | final val loss | best val loss | final val acc | examples/s | mean step |

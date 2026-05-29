@@ -7,6 +7,15 @@ removes the ablation switches from ``sodamuse_eq.py``:
 For a compact handoff summary with the final comparison table, see
 ``ALGORITHM_RESULTS.md`` in this folder.
 
+Best confirmed workload/version:
+
+    trial id: row_aspect_mlr0.008_rg0.35_cg0.05_nb0.93
+    model:    vit5_tiny, 2,691,274 trainable parameters
+    dataset:  CIFAR-10, full 50k train / 10k eval split
+    training: 50 epochs, 4,850 steps, batch size 512 per single-GPU trial
+    result:   final val loss 0.3975 +/- 0.0150,
+              final val acc 87.44% +/- 0.43%
+
     no AMUSE / schedule-free train-eval sequence
     no MiMuon branch
     no optional PMuonEq disable path
