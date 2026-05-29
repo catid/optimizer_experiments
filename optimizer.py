@@ -19,20 +19,24 @@ The current best-supported recipe comes from the cleanest cross-worker evidence:
 a proper CIFAR-10 train/validation/test split with the official test split
 evaluated only once at the end:
 
-    trial id: normuon_mlr0.008_rg0.35_cg0_mom0.95_pb0.9_nb0.93
+    trial id: root_named_wsd_lr0.012_rg0.35_pb0.9_nb0.93
     model:    vit5_micro, 458,858 trainable parameters
     data:     CIFAR-10 45k train / 5k validation / official 10k test
-    training: 50 epochs, 4,350 steps, batch size 512
+    training: 50 epochs, 4,350 steps, batch size 512, trainer-side WSD LR
     seeds:    123, 456, 789
 
-    official test loss: 0.4607 +/- 0.0196
-    official test acc:  84.77% +/- 0.65
-    step time:          19.95 ms
+    official test loss: 0.4084 +/- 0.0035
+    official test acc:  87.80% +/- 0.21
+    step time:          16.57 ms
 
 The aspect-scaled variant was close and sometimes won on other CIFAR proxies,
 but no-aspect won the cleanest official-test protocol. This root file keeps
 the no-aspect variant only. If aspect or column gamma is needed for an ablation,
 use the older ``soda_pmuoneq_normuon.py`` research file instead.
+
+An optional fallback first-moment path was also tested. It slightly improved a
+12-epoch proxy but did not beat the default in the 3-seed 50-epoch replay, so
+``fallback_inner_momentum`` remains disabled by default.
 
 Matrix update math
 ==================
@@ -88,6 +92,12 @@ this standalone file.
        v_t = beta_2 v_{t-1} + (1 - beta_2) g_t^2
        update = g_t / sqrt(v_t / (1 - beta_2^t) + eps)
 
+If ``fallback_inner_momentum=True`` is explicitly enabled, the fallback path
+uses a bias-corrected first moment in the numerator:
+
+       m_t = beta_1 m_{t-1} + (1 - beta_1) g_t
+       update = (m_t / (1 - beta_1^t)) / sqrt(v_t / (1 - beta_2^t) + eps)
+
 There is no ordinary weight decay path in this standalone optimizer. SODA is the
 only regularization mechanism applied by AnchorMuon.
 
@@ -104,14 +114,16 @@ nearby aspect/column/MiMuon ablations. New projects should start with:
     pmuoneq_beta    = 0.90
     row_gamma       = 0.35
     normuon_beta2   = 0.93
-    trainer schedule = 80-step warmup + constant LR
+    trainer schedule = 80-step warmup + WSD
 
 Do not tune everything at once. Treat the knobs in three tiers:
 
     Tier 1, tune first:
         lr
             Main quality/speed knob for matrix weights. Try
-            {0.004, 0.006, 0.008} for language models or smaller ViTs.
+            {0.010, 0.012, 0.014} for this ViT-5 CIFAR-10 harness. For
+            language models, start lower and compare against the actual LM
+            baseline optimizer.
 
         row_gamma
             Strength of row-wise PMuonEq reliability scaling before GramNS.
@@ -133,7 +145,8 @@ Do not tune everything at once. Treat the knobs in three tiers:
             AnchorMuon intentionally does not own this. Training code should
             update param-group ``lr`` values for warmup, WSD, cosine, or any
             other schedule. The strongest reproduced CIFAR recipe used an
-            80-step warmup plus constant LR.
+            80-step warmup plus WSD schedule with final scale 0.1 and decay
+            fraction 0.2.
 
         min_matrix_dim
             Safety threshold for the spectral path. A 2D parameter must have
@@ -148,7 +161,14 @@ Do not tune everything at once. Treat the knobs in three tiers:
             EMA coefficient for row gradient-power estimates.
 
         fallback_betas = (0.9, 0.95)
-            RMS/AdamW-style fallback second-moment defaults.
+            RMS/AdamW-style fallback defaults. The first value is used only
+            when fallback_inner_momentum is enabled; otherwise fallback params
+            use the historical RMS-only path.
+
+        fallback_inner_momentum = False
+            Optional experimental first-moment update for scalar/vector
+            fallback parameters. Matrix parameters already use inner momentum
+            through the Muon/Nesterov source above.
 
         soda_lambda_scale = 1.0, soda_lambda_power = 1.0
             SODA anchor pull schedule. Changing these changes the regularizer,
@@ -216,7 +236,7 @@ from typing import Any, TypeAlias
 import torch
 
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 try:
     from torch.optim.optimizer import ParamsT
@@ -425,6 +445,7 @@ class AnchorMuon(torch.optim.Optimizer):
         fallback_lr: float | None = None,
         momentum: float = 0.95,
         fallback_betas: tuple[float, float] = (0.9, 0.95),
+        fallback_inner_momentum: bool = False,
         eps: float = 1e-8,
         soda_lambda_scale: float = 1.0,
         soda_lambda_power: float = 1.0,
@@ -466,6 +487,7 @@ class AnchorMuon(torch.optim.Optimizer):
             fallback_lr=fallback_lr,
             momentum=momentum,
             fallback_betas=fallback_betas,
+            fallback_inner_momentum=fallback_inner_momentum,
             eps=eps,
             pmuoneq_beta=pmuoneq_beta,
             row_gamma=row_gamma,
@@ -501,6 +523,7 @@ class AnchorMuon(torch.optim.Optimizer):
         fallback_lr: float,
         momentum: float,
         fallback_betas: tuple[float, float],
+        fallback_inner_momentum: bool,
         eps: float,
         pmuoneq_beta: float,
         row_gamma: float,
@@ -524,6 +547,7 @@ class AnchorMuon(torch.optim.Optimizer):
                 fallback_lr=fallback_lr,
                 momentum=momentum,
                 fallback_betas=fallback_betas,
+                fallback_inner_momentum=fallback_inner_momentum,
                 eps=eps,
                 pmuoneq_beta=pmuoneq_beta,
                 row_gamma=row_gamma,
@@ -549,6 +573,7 @@ class AnchorMuon(torch.optim.Optimizer):
                     group.setdefault("min_matrix_dim", min_matrix_dim)
                 else:
                     group.setdefault("betas", fallback_betas)
+                    group.setdefault("fallback_inner_momentum", fallback_inner_momentum)
                     group.setdefault("eps", eps)
             return groups
 
@@ -590,6 +615,7 @@ class AnchorMuon(torch.optim.Optimizer):
                     "use_matrix_update": False,
                     "lr": fallback_lr,
                     "betas": fallback_betas,
+                    "fallback_inner_momentum": fallback_inner_momentum,
                     "eps": eps,
                 }
             )
@@ -769,13 +795,22 @@ class AnchorMuon(torch.optim.Optimizer):
             exp_avg_sq = state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
             state["step"] = 0
         state["step"] = int(state.get("step", 0)) + 1
-        _beta1, beta2 = group.get("betas", (0.9, 0.999))
+        beta1, beta2 = group.get("betas", (0.9, 0.999))
         eps = float(group.get("eps", 1e-8))
         g = grad.detach().to(torch.float32)
+        if bool(group.get("fallback_inner_momentum", False)):
+            exp_avg = state.get("exp_avg")
+            if exp_avg is None or exp_avg.shape != p.shape or exp_avg.device != p.device:
+                exp_avg = state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+            exp_avg.mul_(float(beta1)).add_(g, alpha=1.0 - float(beta1))
+            step_for_bias = int(state["step"])
+            update_numer = exp_avg / max(1.0 - float(beta1) ** step_for_bias, 1e-16)
+        else:
+            update_numer = g
         exp_avg_sq.mul_(float(beta2)).addcmul_(g, g, value=1.0 - float(beta2))
         step = int(state["step"])
         denom = (exp_avg_sq / max(1.0 - float(beta2) ** step, 1e-16)).sqrt().add_(eps)
-        update = g / denom
+        update = update_numer / denom
         p.lerp_(end=self._soda_anchor(p), weight=self._soda_weight(t))
         p.add_(update.to(p.dtype), alpha=-lr)
         return 1
@@ -831,6 +866,7 @@ def build_param_groups(
     fallback_lr: float | None = None,
     momentum: float = 0.95,
     fallback_betas: tuple[float, float] = (0.9, 0.95),
+    fallback_inner_momentum: bool = False,
     eps: float = 1e-8,
     pmuoneq_beta: float = 0.90,
     row_gamma: float = 0.35,
@@ -903,6 +939,7 @@ def build_param_groups(
                 "use_matrix_update": False,
                 "lr": fallback_lr,
                 "betas": fallback_betas,
+                "fallback_inner_momentum": fallback_inner_momentum,
                 "eps": eps,
             }
         )

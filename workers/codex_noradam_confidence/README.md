@@ -42,13 +42,16 @@ commit b009f03 Compare NorMuon base against AdamW
   schedule-winner replay.
 - `results/sfplus_combo20_20260529/`: 20-epoch exhaustive ScheduleFree+
   mechanism-combination sweep around the AnchorMuon matrix direction.
+- `results/root_inner_momentum_push_20260529/`: fallback-inner-momentum HPO
+  on top of the best WSD recipe plus 3-seed 50-epoch replay against AdamW and
+  the no-inner-momentum WSD control.
 
 ## Main Result
 
 Latest result summary:
 `ALGORITHM_RESULTS.md` and `results/cifar10_proper_split_20260529/summary.md`.
 
-Best observed single-seed version to cite:
+Best current version to cite:
 
 ```text
 root_named_wsd_lr0.012_rg0.35_pb0.9_nb0.93
@@ -57,14 +60,15 @@ root_named_wsd_lr0.012_rg0.35_pb0.9_nb0.93
 This is root `AnchorMuon` with SODA + row-only PMuonEq + five-step GramNS +
 NorMuon, AMUSE off, trainer-side 80-step warmup and WSD schedule. It was
 evaluated on `vit5_micro` with CIFAR-10 45k/5k train/validation split, official
-10k test evaluated at the end, batch size 512, 50 epochs, seed `123`, BF16
-autocast, channels-last tensors, and 16 dataloader workers. It is currently the
-best observed single-seed result: `87.67%` official test accuracy, compared
-with `79.55%` for the tuned AdamW cosine baseline in the same replay.
+10k test evaluated at the end, batch size 512, 50 epochs, seeds
+`123,456,789`, BF16 autocast, channels-last tensors, and 16 dataloader workers.
+It is currently the best three-seed result: `87.80% +/- 0.21` official test
+accuracy, compared with `79.32% +/- 0.17` for the tuned AdamW cosine baseline
+in the same replay.
 
-The previous strongest multi-seed evidence is still the no-aspect constant-LR
-recipe `normuon_mlr0.008_rg0.35_cg0_mom0.95_pb0.9_nb0.93`, which reached
-`84.77% +/- 0.65` official test accuracy over seeds `123,456,789`.
+The fallback-inner-momentum add-on produced a small 12-epoch HPO win, but did
+not survive the 50-epoch replay. Keep `fallback_inner_momentum=False` for the
+recommended recipe.
 
 Latest diagrams:
 
@@ -77,6 +81,38 @@ Latest diagrams:
   `results/root_lr_schedule_sweep_20260529/final50_schedule_winners/val_acc.png`
 - Latest LR-schedule iteration speed:
   `results/root_lr_schedule_sweep_20260529/final50_schedule_winners/step_time_ms_bar.png`
+- Latest fallback-inner-momentum validation accuracy:
+  `results/root_inner_momentum_push_20260529/final50_multiseed/val_acc.png`
+
+### Fallback Inner Momentum Push
+
+This study added an opt-in first-moment accumulator only for fallback
+scalar/vector tensors in root `optimizer.py`. Matrix parameters were unchanged:
+they already use the Muon/Nesterov-style inner momentum source.
+
+HPO selected a fallback-inner-momentum row at 12 epochs:
+`lr=0.014`, `row_gamma=0.35`, `pmuoneq_beta=0.90`, `momentum=0.95`,
+`normuon_beta=0.93`, `fallback_beta1=0.85`. It reached `80.18%` validation
+accuracy, narrowly above the no-inner-momentum WSD control at `80.08%`.
+
+The 50-epoch replay reversed that small proxy gain:
+
+| Run | Final val loss | Best val loss | Final val acc | Best val acc | Official test loss | Official test acc | Step time | Throughput |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| AnchorMuon WSD, no fallback inner momentum | 0.3886 +/- 0.0122 | 0.3747 +/- 0.0025 | 88.18% +/- 0.41 | 88.35% +/- 0.29 | 0.4084 +/- 0.0035 | 87.80% +/- 0.21 | 16.57 ms | 30.9k ex/s |
+| AnchorMuon WSD + fallback inner momentum | 0.3975 +/- 0.0021 | 0.3766 +/- 0.0093 | 88.17% +/- 0.14 | 88.23% +/- 0.19 | 0.4160 +/- 0.0061 | 87.73% +/- 0.43 | 16.97 ms | 30.2k ex/s |
+| AdamW cosine baseline | 0.6164 +/- 0.0024 | 0.6027 +/- 0.0024 | 79.71% +/- 0.20 | 79.96% +/- 0.38 | 0.6301 +/- 0.0052 | 79.32% +/- 0.17 | 11.43 ms | 44.8k ex/s |
+
+Conclusion: fallback inner momentum is not part of the current best recipe.
+The implementation remains available behind `fallback_inner_momentum=True` for
+future workloads.
+
+Full table and plots:
+`results/root_inner_momentum_push_20260529/summary.md`,
+`results/root_inner_momentum_push_20260529/final50_multiseed/val_acc.png`,
+`results/root_inner_momentum_push_20260529/final50_multiseed/val_loss.png`,
+and
+`results/root_inner_momentum_push_20260529/final50_multiseed/step_time_ms_bar.png`.
 
 ### ScheduleFree+ Combination Sweep
 

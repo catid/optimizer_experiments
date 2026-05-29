@@ -64,6 +64,9 @@ class TrialConfig:
     normuon_aspect_scale: bool = False
     root_grouping: str = "anchor"
     root_normuon_mode: str = "row"
+    fallback_inner_momentum: bool = False
+    fallback_beta1: float = 0.90
+    fallback_beta2: float = 0.95
     sfplus_polyak: bool = False
     sfplus_c_warmup_enabled: bool = False
     sfplus_beta_anneal: bool = False
@@ -101,6 +104,7 @@ def parse_args() -> argparse.Namespace:
             "root_normuon_ablation",
             "root_soda_ablation",
             "root_lr_schedule_sweep",
+            "root_inner_momentum_push",
             "sfplus_combo20",
         ],
     )
@@ -428,6 +432,91 @@ def trial_grid(preset: str) -> list[TrialConfig]:
             ))
     if preset == "root_lr_schedule_sweep":
         return root_lr_schedule_sweep
+    if preset == "root_inner_momentum_push":
+        trials = [
+            TrialConfig("adamw_cosine_lr0.004_wd0.001", "adamw", 4e-3, lr_schedule="cosine", weight_decay=0.001),
+            TrialConfig(
+                "root_named_wsd_lr0.012_rg0.35_pb0.9_nb0.93_fim0",
+                "root",
+                1.2e-2,
+                lr_schedule="wsd",
+                soda="all",
+                row_gamma=0.35,
+                pmuon_beta=0.90,
+                momentum=0.95,
+                normuon=True,
+                normuon_beta=0.93,
+                amuse=False,
+                root_grouping="named",
+                root_normuon_mode="row",
+                fallback_inner_momentum=False,
+            ),
+        ]
+        # Isolated add-on to the current winner: keep the AnchorMuon WSD matrix
+        # recipe intact and add first-moment momentum only to fallback
+        # scalar/vector parameters. The matrix path already uses momentum.
+        for lr in [1.0e-2, 1.2e-2, 1.4e-2, 1.6e-2]:
+            for fallback_beta1 in [0.50, 0.70, 0.85, 0.90, 0.95]:
+                trials.append(TrialConfig(
+                    f"root_fim_wsd_lr{lr:g}_rg0.35_pb0.9_nb0.93_fb{fallback_beta1:g}",
+                    "root",
+                    lr,
+                    lr_schedule="wsd",
+                    soda="all",
+                    row_gamma=0.35,
+                    pmuon_beta=0.90,
+                    momentum=0.95,
+                    normuon=True,
+                    normuon_beta=0.93,
+                    amuse=False,
+                    root_grouping="named",
+                    root_normuon_mode="row",
+                    fallback_inner_momentum=True,
+                    fallback_beta1=fallback_beta1,
+                    fallback_beta2=0.95,
+                ))
+        for lr in [1.2e-2, 1.4e-2]:
+            for row_gamma in [0.30, 0.40]:
+                for fallback_beta1 in [0.85, 0.90, 0.95]:
+                    trials.append(TrialConfig(
+                        f"root_fim_wsd_lr{lr:g}_rg{row_gamma:g}_pb0.9_nb0.93_fb{fallback_beta1:g}",
+                        "root",
+                        lr,
+                        lr_schedule="wsd",
+                        soda="all",
+                        row_gamma=row_gamma,
+                        pmuon_beta=0.90,
+                        momentum=0.95,
+                        normuon=True,
+                        normuon_beta=0.93,
+                        amuse=False,
+                        root_grouping="named",
+                        root_normuon_mode="row",
+                        fallback_inner_momentum=True,
+                        fallback_beta1=fallback_beta1,
+                        fallback_beta2=0.95,
+                    ))
+        for momentum in [0.90, 0.93, 0.97]:
+            for fallback_beta1 in [0.85, 0.90, 0.95]:
+                trials.append(TrialConfig(
+                    f"root_fim_wsd_lr0.012_rg0.35_mom{momentum:g}_pb0.9_nb0.93_fb{fallback_beta1:g}",
+                    "root",
+                    1.2e-2,
+                    lr_schedule="wsd",
+                    soda="all",
+                    row_gamma=0.35,
+                    pmuon_beta=0.90,
+                    momentum=momentum,
+                    normuon=True,
+                    normuon_beta=0.93,
+                    amuse=False,
+                    root_grouping="named",
+                    root_normuon_mode="row",
+                    fallback_inner_momentum=True,
+                    fallback_beta1=fallback_beta1,
+                    fallback_beta2=0.95,
+                ))
+        return trials
     if preset == "sfplus_combo20":
         trials = [
             TrialConfig(
@@ -840,7 +929,8 @@ def root_anchor_param_groups(model: nn.Module, cfg: TrialConfig) -> list[dict]:
             "pmuoneq_eps": 1e-6,
             "normuon_beta2": cfg.normuon_beta,
             "normuon_eps": 1e-10,
-            "betas": (0.9, 0.95),
+            "fallback_inner_momentum": cfg.fallback_inner_momentum,
+            "betas": (cfg.fallback_beta1, cfg.fallback_beta2),
             "eps": 1e-8,
         })
         if cfg.soda == "all":
@@ -1202,6 +1292,9 @@ def run_worker(args: argparse.Namespace) -> None:
         "normuon_aspect_scale": cfg.normuon_aspect_scale,
         "root_grouping": cfg.root_grouping,
         "root_normuon_mode": cfg.root_normuon_mode,
+        "fallback_inner_momentum": cfg.fallback_inner_momentum,
+        "fallback_beta1": cfg.fallback_beta1,
+        "fallback_beta2": cfg.fallback_beta2,
         "sfplus_polyak": cfg.sfplus_polyak,
         "sfplus_c_warmup_enabled": cfg.sfplus_c_warmup_enabled,
         "sfplus_beta_anneal": cfg.sfplus_beta_anneal,
@@ -1373,6 +1466,9 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
             normuon_aspect_scale=parse_bool(row.get("normuon_aspect_scale", False)),
             root_grouping=str(row.get("root_grouping", "anchor")),
             root_normuon_mode=str(row.get("root_normuon_mode", "row")),
+            fallback_inner_momentum=parse_bool(row.get("fallback_inner_momentum", False)),
+            fallback_beta1=float(row.get("fallback_beta1", 0.90)),
+            fallback_beta2=float(row.get("fallback_beta2", 0.95)),
             sfplus_polyak=parse_bool(row.get("sfplus_polyak", False)),
             sfplus_c_warmup_enabled=parse_bool(row.get("sfplus_c_warmup_enabled", False)),
             sfplus_beta_anneal=parse_bool(row.get("sfplus_beta_anneal", False)),
@@ -1540,6 +1636,9 @@ def summaries_to_trials(rows: Iterable[dict]) -> list[TrialConfig]:
             normuon_aspect_scale=parse_bool(row.get("normuon_aspect_scale", False)),
             root_grouping=str(row.get("root_grouping", "anchor")),
             root_normuon_mode=str(row.get("root_normuon_mode", "row")),
+            fallback_inner_momentum=parse_bool(row.get("fallback_inner_momentum", False)),
+            fallback_beta1=float(row.get("fallback_beta1", 0.90)),
+            fallback_beta2=float(row.get("fallback_beta2", 0.95)),
             sfplus_polyak=parse_bool(row.get("sfplus_polyak", False)),
             sfplus_c_warmup_enabled=parse_bool(row.get("sfplus_c_warmup_enabled", False)),
             sfplus_beta_anneal=parse_bool(row.get("sfplus_beta_anneal", False)),

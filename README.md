@@ -10,20 +10,45 @@ implementation:
 **Algorithm:** SODA anchor updates on all parameter groups, row-only PMuonEq,
 five-step Gram Newton-Schulz, and NorMuon. Matrix weights use SODA instead of
 ordinary weight decay. Fallback tensors also receive the SODA anchor update and
-do not have a separate decay knob. AMUSE, MiMuon, full PMuon, column PMuonEq,
-and post-NorMuon aspect scaling are disabled.
+do not have a separate decay knob. Fallback inner momentum was tested as an
+opt-in add-on and is not part of the recommended recipe. AMUSE, MiMuon, full
+PMuon, column PMuonEq, and post-NorMuon aspect scaling are disabled.
 
-**Latest schedule validation:** ViT-5 micro on CIFAR-10, 45k train / 5k
+**Latest multi-seed validation:** ViT-5 micro on CIFAR-10, 45k train / 5k
 validation split from the official training set, official 10k test split
-evaluated only at the end, batch size 512, 50 epochs, seed `123`, BF16
-autocast, channels-last tensors, 16 dataloader workers. Learning-rate schedules
-were owned by the trainer. A 12-epoch HPO picked the best LR for each schedule,
-then only those schedule winners were replayed for 50 epochs.
+evaluated only at the end, batch size 512, 50 epochs, seeds `123,456,789`,
+BF16 autocast, channels-last tensors, and 16 dataloader workers. Learning-rate
+schedules were owned by the trainer. A 12-epoch HPO tested fallback inner
+momentum on top of the best WSD recipe, then replayed AdamW, the current WSD
+recipe, and the tuned fallback-inner-momentum variant for 50 epochs.
 
 The best observed recipe is root `AnchorMuon` with trainer-side 80-step warmup
 and WSD schedule: `lr=0.012`, `lr_final_scale=0.1`,
 `wsd_decay_frac=0.2`, `row_gamma=0.35`, `pmuoneq_beta=0.90`,
-`normuon_beta2=0.93`.
+`normuon_beta2=0.93`, and `fallback_inner_momentum=False`.
+
+| Recipe | Official test acc | Official test loss | Final val acc | Final val loss | Best val acc | Best val loss | Step time | Examples/sec |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| AnchorMuon WSD, no fallback inner momentum | 87.80% +/- 0.21 | 0.4084 +/- 0.0035 | 88.18% +/- 0.41 | 0.3886 +/- 0.0122 | 88.35% +/- 0.29 | 0.3747 +/- 0.0025 | 16.57 ms | 30.9k |
+| AnchorMuon WSD + fallback inner momentum | 87.73% +/- 0.43 | 0.4160 +/- 0.0061 | 88.17% +/- 0.14 | 0.3975 +/- 0.0021 | 88.23% +/- 0.19 | 0.3766 +/- 0.0093 | 16.97 ms | 30.2k |
+| AdamW baseline | 79.32% +/- 0.17 | 0.6301 +/- 0.0052 | 79.71% +/- 0.20 | 0.6164 +/- 0.0024 | 79.96% +/- 0.38 | 0.6027 +/- 0.0024 | 11.43 ms | 44.8k |
+
+Result bundle:
+`workers/codex_noradam_confidence/results/root_inner_momentum_push_20260529/`.
+The final 50-epoch multi-seed plots are in
+`final50_multiseed/val_loss.png`, `val_acc.png`, and
+`step_time_ms_bar.png`.
+
+![Validation accuracy curves for fallback-inner-momentum replay](workers/codex_noradam_confidence/results/root_inner_momentum_push_20260529/final50_multiseed/val_acc.png)
+
+**Previous single-seed schedule validation:** ViT-5 micro on the same CIFAR-10
+45k/5k split, official test at the end, batch size 512, 50 epochs, seed `123`,
+BF16 autocast, channels-last tensors, and 16 dataloader workers. A 12-epoch HPO
+picked the best LR for each trainer-side schedule, then only those schedule
+winners were replayed for 50 epochs.
+
+That sweep's best single-seed recipe was root `AnchorMuon` with trainer-side
+80-step warmup and WSD schedule:
 
 | Recipe | Schedule | Official test acc | Official test loss | Final val acc | Final val loss | Best val acc | Best val loss | Step time | Examples/sec |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -59,9 +84,9 @@ recipe at `lr=8e-3` over seeds `123,456,789`.
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Root `optimizer.py` default | 84.94% | 0.4501 | 85.72% | 0.4286 | 86.03% | 0.4129 | 16.57 ms | 30.9k |
 
-The strongest multi-seed evidence lives in `workers/codex_noradam_confidence`
-and used the same core recipe in the research runner. That package is useful
-for confidence intervals and ablation context:
+Earlier multi-seed constant-LR evidence lives in
+`workers/codex_noradam_confidence` and used the same core recipe in the
+research runner. That package is useful for ablation context:
 
 | Recipe | Official test acc | Official test loss | Final val acc | Final val loss | Step time |
 |---|---:|---:|---:|---:|---:|
@@ -132,7 +157,8 @@ experiments:
 | `min_matrix_dim` | `2` | Rarely | Keeps tiny effective matrices out of the spectral path. |
 | `momentum` | `0.95` | Usually no | Momentum for the matrix source update. |
 | `pmuoneq_beta` | `0.90` | Usually no | EMA for row gradient-power estimates. |
-| `fallback_betas` | `(0.9, 0.95)` | Usually no | RMS/AdamW-style fallback moments. |
+| `fallback_betas` | `(0.9, 0.95)` | Usually no | RMS/AdamW-style fallback moments. The first value is used only if `fallback_inner_momentum=True`. |
+| `fallback_inner_momentum` | `False` | Usually no | Optional first-moment update for fallback scalar/vector tensors. A 12-epoch proxy looked slightly better, but the 3-seed 50-epoch replay did not beat the default. |
 | `soda_lambda_scale`, `soda_lambda_power` | `1.0`, `1.0` | Usually no | SODA anchor schedule; changing this changes the regularizer. |
 | `eps` values and `ns_compute_dtype` | internal defaults | No | Numerical and profiling knobs. |
 
