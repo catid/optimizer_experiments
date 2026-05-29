@@ -773,7 +773,6 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             if cfg.root_normuon_mode == "orientation"
             else root_optimizer.SodaPmuonEqNorMuon
         )
-        fallback_weight_decay = 0.0
         params = root_anchor_param_groups(model, cfg) if cfg.root_grouping == "anchor" else model.named_parameters()
         return opt_cls(
             params,
@@ -785,7 +784,6 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             row_gamma=cfg.row_gamma,
             normuon_beta2=cfg.normuon_beta,
             fallback_betas=(0.9, 0.95),
-            fallback_weight_decay=fallback_weight_decay,
             soda_lambda_scale=1.0,
             min_matrix_dim=int(getattr(args, "anchor_min_matrix_dim", 2)),
         )
