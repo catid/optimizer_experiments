@@ -65,6 +65,11 @@ class TrialConfig:
     normuon_aspect_scale: bool = False
     root_grouping: str = "anchor"
     root_normuon_mode: str = "row"
+    fallback_mode: str = "rms"
+    fallback_lr_mult: float = 1.0
+    fallback_beta1: float = 0.90
+    fallback_beta2: float = 0.95
+    fallback_weight_decay: float = 0.0
     sfplus_polyak: bool = False
     sfplus_c_warmup_enabled: bool = False
     sfplus_beta_anneal: bool = False
@@ -102,6 +107,7 @@ def parse_args() -> argparse.Namespace:
             "root_normuon_ablation",
             "root_soda_ablation",
             "root_lr_schedule_sweep",
+            "root_fallback_modes",
             "sfplus_combo20",
             "component_ablation",
         ],
@@ -430,6 +436,76 @@ def trial_grid(preset: str) -> list[TrialConfig]:
             ))
     if preset == "root_lr_schedule_sweep":
         return root_lr_schedule_sweep
+    if preset == "root_fallback_modes":
+        trials = [
+            TrialConfig(
+                "fallback_rms_control_wsd_lr0.012_flr1_b2_0.95",
+                "root",
+                1.2e-2,
+                lr_schedule="wsd",
+                soda="all",
+                row_gamma=0.35,
+                pmuon_beta=0.90,
+                momentum=0.95,
+                normuon=True,
+                normuon_beta=0.93,
+                amuse=False,
+                root_grouping="named",
+                root_normuon_mode="row",
+                fallback_mode="rms",
+                fallback_lr_mult=1.0,
+                fallback_beta1=0.90,
+                fallback_beta2=0.95,
+            ),
+        ]
+        for mode in ["atan2", "adamc"]:
+            for lr in [0.010, 0.012, 0.014]:
+                for fallback_lr_mult in [0.5, 1.0, 2.0]:
+                    for beta2 in [0.95, 0.99]:
+                        trials.append(TrialConfig(
+                            (
+                                f"fallback_{mode}_wsd_lr{lr:g}"
+                                f"_flr{fallback_lr_mult:g}_b2{beta2:g}"
+                            ),
+                            "root",
+                            lr,
+                            lr_schedule="wsd",
+                            soda="all",
+                            row_gamma=0.35,
+                            pmuon_beta=0.90,
+                            momentum=0.95,
+                            normuon=True,
+                            normuon_beta=0.93,
+                            amuse=False,
+                            root_grouping="named",
+                            root_normuon_mode="row",
+                            fallback_mode=mode,
+                            fallback_lr_mult=fallback_lr_mult,
+                            fallback_beta1=0.90,
+                            fallback_beta2=beta2,
+                        ))
+        for wd in [0.1, 1.0]:
+            trials.append(TrialConfig(
+                f"fallback_adamc_wd{wd:g}_wsd_lr0.012_flr1_b2_0.95",
+                "root",
+                1.2e-2,
+                lr_schedule="wsd",
+                soda="all",
+                row_gamma=0.35,
+                pmuon_beta=0.90,
+                momentum=0.95,
+                normuon=True,
+                normuon_beta=0.93,
+                amuse=False,
+                root_grouping="named",
+                root_normuon_mode="row",
+                fallback_mode="adamc",
+                fallback_lr_mult=1.0,
+                fallback_beta1=0.90,
+                fallback_beta2=0.95,
+                fallback_weight_decay=wd,
+            ))
+        return trials
     if preset == "sfplus_combo20":
         trials = [
             TrialConfig(
@@ -737,6 +813,8 @@ def trial_family(cfg: TrialConfig) -> str:
         match = re.search(r"sfplus_([PCBDMpcbdm]{5})", cfg.name)
         return f"sfplus_{match.group(1)}" if match else "sfplus"
     if cfg.optimizer == "root":
+        if cfg.name.startswith("fallback_") or "fallback_rms" in cfg.name or cfg.fallback_mode != "rms":
+            return f"root_fallback_{cfg.fallback_mode}"
         return f"root_{cfg.root_grouping}_{cfg.root_normuon_mode}_{cfg.soda}"
     if cfg.optimizer == "golden":
         return "golden_normuon"
@@ -985,7 +1063,9 @@ def root_anchor_param_groups(model: nn.Module, cfg: TrialConfig) -> list[dict]:
             "pmuoneq_eps": 1e-6,
             "normuon_beta2": cfg.normuon_beta,
             "normuon_eps": 1e-10,
-            "betas": (0.9, 0.95),
+            "fallback_mode": cfg.fallback_mode,
+            "betas": (cfg.fallback_beta1, cfg.fallback_beta2),
+            "fallback_weight_decay": cfg.fallback_weight_decay,
             "eps": 1e-8,
         })
         if cfg.soda == "all":
@@ -1064,12 +1144,14 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
         return opt_cls(
             params,
             lr=cfg.lr,
-            fallback_lr=cfg.lr,
+            fallback_lr=cfg.lr * cfg.fallback_lr_mult,
+            fallback_mode=cfg.fallback_mode,
             momentum=cfg.momentum,
             pmuoneq_beta=cfg.pmuon_beta,
             row_gamma=cfg.row_gamma,
             normuon_beta2=cfg.normuon_beta,
-            fallback_betas=(0.9, 0.95),
+            fallback_betas=(cfg.fallback_beta1, cfg.fallback_beta2),
+            fallback_weight_decay=cfg.fallback_weight_decay,
             soda_lambda_scale=1.0,
             min_matrix_dim=int(getattr(args, "anchor_min_matrix_dim", 2)),
         )
@@ -1349,6 +1431,11 @@ def run_worker(args: argparse.Namespace) -> None:
         "normuon_aspect_scale": cfg.normuon_aspect_scale,
         "root_grouping": cfg.root_grouping,
         "root_normuon_mode": cfg.root_normuon_mode,
+        "fallback_mode": cfg.fallback_mode,
+        "fallback_lr_mult": cfg.fallback_lr_mult,
+        "fallback_beta1": cfg.fallback_beta1,
+        "fallback_beta2": cfg.fallback_beta2,
+        "fallback_weight_decay": cfg.fallback_weight_decay,
         "sfplus_polyak": cfg.sfplus_polyak,
         "sfplus_c_warmup_enabled": cfg.sfplus_c_warmup_enabled,
         "sfplus_beta_anneal": cfg.sfplus_beta_anneal,
@@ -1521,6 +1608,11 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
             normuon_aspect_scale=parse_bool(row.get("normuon_aspect_scale", False)),
             root_grouping=str(row.get("root_grouping", "anchor")),
             root_normuon_mode=str(row.get("root_normuon_mode", "row")),
+            fallback_mode=str(row.get("fallback_mode", "rms")),
+            fallback_lr_mult=float(row.get("fallback_lr_mult", 1.0)),
+            fallback_beta1=float(row.get("fallback_beta1", 0.90)),
+            fallback_beta2=float(row.get("fallback_beta2", 0.95)),
+            fallback_weight_decay=float(row.get("fallback_weight_decay", 0.0)),
             sfplus_polyak=parse_bool(row.get("sfplus_polyak", False)),
             sfplus_c_warmup_enabled=parse_bool(row.get("sfplus_c_warmup_enabled", False)),
             sfplus_beta_anneal=parse_bool(row.get("sfplus_beta_anneal", False)),
@@ -1565,6 +1657,10 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
                     match = re.search(r"sfplus_([PCBDMpcbdm]{5})", trial)
                     code = match.group(1) if match else trial[len("sfplus_"):].split("_", 1)[0]
                     return f"SF+ {code}{seed_suffix}"
+                if trial.startswith("fallback_"):
+                    parts = trial.split("_")
+                    mode = parts[1].upper() if len(parts) > 1 else "fallback"
+                    return f"AnchorMuon {mode} fallback{seed_suffix}"
                 component = re.match(r"(?:final_)?component_(full|no_soda|no_pmuoneq|no_gram|no_normuon|adamw)", trial)
                 if component:
                     labels = {
@@ -1700,6 +1796,11 @@ def summaries_to_trials(rows: Iterable[dict]) -> list[TrialConfig]:
             normuon_aspect_scale=parse_bool(row.get("normuon_aspect_scale", False)),
             root_grouping=str(row.get("root_grouping", "anchor")),
             root_normuon_mode=str(row.get("root_normuon_mode", "row")),
+            fallback_mode=str(row.get("fallback_mode", "rms")),
+            fallback_lr_mult=float(row.get("fallback_lr_mult", 1.0)),
+            fallback_beta1=float(row.get("fallback_beta1", 0.90)),
+            fallback_beta2=float(row.get("fallback_beta2", 0.95)),
+            fallback_weight_decay=float(row.get("fallback_weight_decay", 0.0)),
             sfplus_polyak=parse_bool(row.get("sfplus_polyak", False)),
             sfplus_c_warmup_enabled=parse_bool(row.get("sfplus_c_warmup_enabled", False)),
             sfplus_beta_anneal=parse_bool(row.get("sfplus_beta_anneal", False)),

@@ -6,7 +6,8 @@ language-modeling round:
 
     SODA + row-only PMuonEq + Gram Newton-Schulz + NorMuon
 
-The implementation deliberately omits the research ablation switches:
+The implementation deliberately omits the matrix-path research ablation
+switches:
 
     no AMUSE / schedule-free train-eval sequence
     no MiMuon branch
@@ -14,6 +15,11 @@ The implementation deliberately omits the research ablation switches:
     no column PMuonEq scaling
     no post-NorMuon aspect multiplier
     no optional NorMuon disable path
+
+It does expose a small fallback-only ``fallback_mode`` knob for scalar/vector
+tensors. The default remains the RMS fallback used by the original winning
+recipe; ``"atan2"`` and ``"adamc"`` are available for narrow fallback-path
+experiments and do not alter the matrix direction.
 
 The current best-supported recipe comes from the cleanest cross-worker evidence:
 a proper CIFAR-10 train/validation/test split with the official test split
@@ -28,6 +34,12 @@ evaluated only once at the end:
     official test loss: 0.4607 +/- 0.0196
     official test acc:  84.77% +/- 0.65
     step time:          19.95 ms
+
+A later single-seed CIFAR-10 follow-up found that
+``fallback_mode="atan2"``, ``lr=0.014``, and ``fallback_lr=0.007`` improved the
+50-epoch official test result on the ViT-5 micro harness. That result is
+promising but not yet the constructor default because it has not had the same
+multi-seed replay.
 
 The aspect-scaled variant was close and sometimes won on other CIFAR proxies,
 but no-aspect won the cleanest official-test protocol. This root file keeps
@@ -79,14 +91,29 @@ Fallback parameters
 ===================
 
 Scalar/vector tensors and any parameters explicitly placed in a fallback group
-use the same SODA anchor plus RMS-style second-moment update used by the winning
-research path. Automatic matrix eligibility is based only on effective shape
-after ignoring singleton dimensions: for example ``[1, 1, width]`` is a vector,
-while ``[1, tokens, width]`` is a matrix. Names are never used for routing in
-this standalone file.
+use the same SODA anchor plus the RMS-style second-moment update used by the
+winning research path by default. Optional fallback modes exist for narrow
+experiments on scalar/vector parameters only, but they do not affect the matrix
+direction generator. Automatic matrix eligibility is based only on effective
+shape after ignoring singleton dimensions: for example ``[1, 1, width]`` is a
+vector, while ``[1, tokens, width]`` is a matrix. Names are never used for
+routing in this standalone file.
 
        v_t = beta_2 v_{t-1} + (1 - beta_2) g_t^2
-       update = g_t / sqrt(v_t / (1 - beta_2^t) + eps)
+       update = g_t / (sqrt(v_t / (1 - beta_2^t)) + eps)
+
+The optional ``fallback_mode="atan2"`` keeps Adam first/second moments but uses
+an AdamATan2-style bounded angular update:
+
+       m_t = beta_1 m_{t-1} + (1 - beta_1) g_t
+       v_t = beta_2 v_{t-1} + (1 - beta_2) g_t^2
+       update = atan2(m_hat_t, sqrt(v_hat_t) + eps)
+
+The optional ``fallback_mode="adamc"`` uses the AdamC adaptive direction on
+fallback tensors. If ``fallback_weight_decay`` is nonzero, it applies AdamC's
+``lr^2 * weight_decay`` decoupled decay to the fallback tensor before the
+learned update. The default keeps ``fallback_weight_decay=0`` so the shippable
+recipe still uses SODA as its only regularizer.
 
 There is no ordinary weight decay path in this standalone optimizer. SODA is the
 only regularization mechanism applied by AnchorMuon.
@@ -147,8 +174,13 @@ Do not tune everything at once. Treat the knobs in three tiers:
         pmuoneq_beta = 0.90
             EMA coefficient for row gradient-power estimates.
 
+        fallback_mode = "rms"
+            Scalar/vector fallback update. Leave at "rms" unless specifically
+            testing "atan2" or "adamc" for fallback-only ablations.
+
         fallback_betas = (0.9, 0.95)
-            RMS/AdamW-style fallback second-moment defaults.
+            Fallback first/second moment defaults. The first value is ignored
+            by the default RMS mode.
 
         soda_lambda_scale = 1.0, soda_lambda_power = 1.0
             SODA anchor pull schedule. Changing these changes the regularizer,
@@ -216,7 +248,7 @@ from typing import Any, TypeAlias
 import torch
 
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 try:
     from torch.optim.optimizer import ParamsT
@@ -240,6 +272,7 @@ POLAR_EXPRESS_COEFFICIENTS: tuple[tuple[float, float, float], ...] = tuple(
     )
     for a, b, c in POLAR_EXPRESS_UNSCALED
 )
+FALLBACK_MODES = {"rms", "atan2", "adamc"}
 
 
 @torch.no_grad()
@@ -423,8 +456,10 @@ class AnchorMuon(torch.optim.Optimizer):
         *,
         lr: float = 8e-3,
         fallback_lr: float | None = None,
+        fallback_mode: str = "rms",
         momentum: float = 0.95,
         fallback_betas: tuple[float, float] = (0.9, 0.95),
+        fallback_weight_decay: float = 0.0,
         eps: float = 1e-8,
         soda_lambda_scale: float = 1.0,
         soda_lambda_power: float = 1.0,
@@ -442,6 +477,11 @@ class AnchorMuon(torch.optim.Optimizer):
         fallback_lr = lr if fallback_lr is None else fallback_lr
         if lr < 0.0 or fallback_lr < 0.0:
             raise ValueError("learning rates must be non-negative")
+        fallback_mode = str(fallback_mode).lower()
+        if fallback_mode not in FALLBACK_MODES:
+            raise ValueError(f"fallback_mode must be one of {sorted(FALLBACK_MODES)}")
+        if fallback_weight_decay < 0.0:
+            raise ValueError("fallback_weight_decay must be non-negative")
         if not 0.0 <= momentum < 1.0:
             raise ValueError("momentum must be in [0, 1)")
         if not 0.0 <= pmuoneq_beta < 1.0:
@@ -464,8 +504,10 @@ class AnchorMuon(torch.optim.Optimizer):
             params,
             lr=lr,
             fallback_lr=fallback_lr,
+            fallback_mode=fallback_mode,
             momentum=momentum,
             fallback_betas=fallback_betas,
+            fallback_weight_decay=fallback_weight_decay,
             eps=eps,
             pmuoneq_beta=pmuoneq_beta,
             row_gamma=row_gamma,
@@ -499,8 +541,10 @@ class AnchorMuon(torch.optim.Optimizer):
         *,
         lr: float,
         fallback_lr: float,
+        fallback_mode: str,
         momentum: float,
         fallback_betas: tuple[float, float],
+        fallback_weight_decay: float,
         eps: float,
         pmuoneq_beta: float,
         row_gamma: float,
@@ -522,8 +566,10 @@ class AnchorMuon(torch.optim.Optimizer):
                 items,  # type: ignore[arg-type]
                 lr=lr,
                 fallback_lr=fallback_lr,
+                fallback_mode=fallback_mode,
                 momentum=momentum,
                 fallback_betas=fallback_betas,
+                fallback_weight_decay=fallback_weight_decay,
                 eps=eps,
                 pmuoneq_beta=pmuoneq_beta,
                 row_gamma=row_gamma,
@@ -548,8 +594,13 @@ class AnchorMuon(torch.optim.Optimizer):
                     group.setdefault("normuon_eps", normuon_eps)
                     group.setdefault("min_matrix_dim", min_matrix_dim)
                 else:
+                    group.setdefault("fallback_mode", fallback_mode)
                     group.setdefault("betas", fallback_betas)
+                    group.setdefault("fallback_weight_decay", fallback_weight_decay)
                     group.setdefault("eps", eps)
+                if is_matrix:
+                    group.setdefault("fallback_mode", fallback_mode)
+                    group.setdefault("fallback_weight_decay", fallback_weight_decay)
             return groups
 
         matrix_params: list[torch.Tensor] = []
@@ -589,7 +640,9 @@ class AnchorMuon(torch.optim.Optimizer):
                     "params": fallback_params,
                     "use_matrix_update": False,
                     "lr": fallback_lr,
+                    "fallback_mode": fallback_mode,
                     "betas": fallback_betas,
+                    "fallback_weight_decay": fallback_weight_decay,
                     "eps": eps,
                 }
             )
@@ -617,6 +670,7 @@ class AnchorMuon(torch.optim.Optimizer):
                     "numel": int(sum(p.numel() for p in params)),
                     "named": bool(names),
                     "param_names": names,
+                    "fallback_mode": str(group.get("fallback_mode", "rms")),
                 }
             )
         return summary
@@ -764,19 +818,42 @@ class AnchorMuon(torch.optim.Optimizer):
                 "Use dense gradients for this parameter or a different optimizer for sparse embeddings."
             )
         state = self.state[p]
+        mode = str(group.get("fallback_mode", "rms")).lower()
+        if mode not in FALLBACK_MODES:
+            raise ValueError(f"fallback_mode must be one of {sorted(FALLBACK_MODES)}")
         exp_avg_sq = state.get("exp_avg_sq")
         if exp_avg_sq is None or exp_avg_sq.shape != p.shape or exp_avg_sq.device != p.device:
             exp_avg_sq = state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
             state["step"] = 0
+        exp_avg = state.get("exp_avg")
+        if mode in {"atan2", "adamc"} and (
+            exp_avg is None or exp_avg.shape != p.shape or exp_avg.device != p.device
+        ):
+            exp_avg = state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
         state["step"] = int(state.get("step", 0)) + 1
-        _beta1, beta2 = group.get("betas", (0.9, 0.999))
+        beta1, beta2 = group.get("betas", (0.9, 0.999))
         eps = float(group.get("eps", 1e-8))
         g = grad.detach().to(torch.float32)
+        p.lerp_(end=self._soda_anchor(p), weight=self._soda_weight(t))
+        fallback_weight_decay = float(group.get("fallback_weight_decay", 0.0))
+        if mode == "adamc" and fallback_weight_decay != 0.0:
+            p.mul_(1.0 - lr * lr * fallback_weight_decay)
+
         exp_avg_sq.mul_(float(beta2)).addcmul_(g, g, value=1.0 - float(beta2))
         step = int(state["step"])
-        denom = (exp_avg_sq / max(1.0 - float(beta2) ** step, 1e-16)).sqrt().add_(eps)
-        update = g / denom
-        p.lerp_(end=self._soda_anchor(p), weight=self._soda_weight(t))
+        bias2 = max(1.0 - float(beta2) ** step, 1e-16)
+        denom = (exp_avg_sq / bias2).sqrt().add_(eps)
+        if mode == "rms":
+            update = g / denom
+        else:
+            if exp_avg is None:
+                raise RuntimeError("fallback first-moment state was not initialized")
+            exp_avg.mul_(float(beta1)).add_(g, alpha=1.0 - float(beta1))
+            bias1 = max(1.0 - float(beta1) ** step, 1e-16)
+            if mode == "atan2":
+                update = torch.atan2(exp_avg / bias1, denom)
+            else:
+                update = (exp_avg / bias1) / denom
         p.add_(update.to(p.dtype), alpha=-lr)
         return 1
 
@@ -829,8 +906,10 @@ def build_param_groups(
     *,
     lr: float = 8e-3,
     fallback_lr: float | None = None,
+    fallback_mode: str = "rms",
     momentum: float = 0.95,
     fallback_betas: tuple[float, float] = (0.9, 0.95),
+    fallback_weight_decay: float = 0.0,
     eps: float = 1e-8,
     pmuoneq_beta: float = 0.90,
     row_gamma: float = 0.35,
@@ -852,6 +931,11 @@ def build_param_groups(
     if min_matrix_dim < 1:
         raise ValueError("min_matrix_dim must be >= 1")
     fallback_lr = lr if fallback_lr is None else fallback_lr
+    fallback_mode = str(fallback_mode).lower()
+    if fallback_mode not in FALLBACK_MODES:
+        raise ValueError(f"fallback_mode must be one of {sorted(FALLBACK_MODES)}")
+    if fallback_weight_decay < 0.0:
+        raise ValueError("fallback_weight_decay must be non-negative")
 
     matrix_params: list[torch.nn.Parameter] = []
     matrix_names: list[str] = []
@@ -902,7 +986,9 @@ def build_param_groups(
                 "param_names": fallback_names,
                 "use_matrix_update": False,
                 "lr": fallback_lr,
+                "fallback_mode": fallback_mode,
                 "betas": fallback_betas,
+                "fallback_weight_decay": fallback_weight_decay,
                 "eps": eps,
             }
         )

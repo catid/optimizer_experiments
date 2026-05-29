@@ -1,4 +1,5 @@
 import copy
+import math
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -177,8 +178,53 @@ def test_default_recipe_matches_root_documented_winner() -> None:
     assert matrix_group["pmuoneq_beta"] == 0.90
     assert matrix_group["row_gamma"] == 0.35
     assert matrix_group["normuon_beta2"] == 0.93
+    assert fallback_group["fallback_mode"] == "rms"
     assert fallback_group["betas"] == (0.9, 0.95)
+    assert fallback_group["fallback_weight_decay"] == 0.0
     assert fallback_group["eps"] == 1e-8
+
+
+def test_fallback_modes_are_validated() -> None:
+    model = TinyClassifier()
+    with pytest.raises(ValueError, match="fallback_mode"):
+        AnchorMuon(model.named_parameters(), fallback_mode="not-a-mode")
+    with pytest.raises(ValueError, match="fallback_weight_decay"):
+        AnchorMuon(model.named_parameters(), fallback_weight_decay=-0.1)
+
+
+def test_atan2_fallback_scales_only_fallback_update() -> None:
+    p = nn.Parameter(torch.tensor([1.0, -2.0]))
+    opt = AnchorMuon(
+        [{"params": [p], "use_matrix_update": False}],
+        lr=0.1,
+        fallback_mode="atan2",
+        fallback_betas=(0.5, 0.5),
+    )
+    p.grad = torch.tensor([0.5, -0.25])
+    opt.step()
+
+    expected = torch.tensor([1.0, -2.0]) - 0.1 * torch.tensor([math.pi / 4.0, -math.pi / 4.0])
+    assert torch.allclose(p.detach(), expected, atol=1e-6, rtol=1e-6)
+    assert "exp_avg" in opt.state[p]
+    assert "exp_avg_sq" in opt.state[p]
+
+
+def test_adamc_fallback_applies_optional_lr_squared_decay() -> None:
+    p = nn.Parameter(torch.tensor([1.0, -2.0]))
+    opt = AnchorMuon(
+        [{"params": [p], "use_matrix_update": False}],
+        lr=0.1,
+        fallback_mode="adamc",
+        fallback_betas=(0.5, 0.5),
+        fallback_weight_decay=1.0,
+    )
+    p.grad = torch.tensor([0.5, -0.25])
+    opt.step()
+
+    expected = torch.tensor([1.0, -2.0]) * 0.99 - 0.1 * torch.tensor([1.0, -1.0])
+    assert torch.allclose(p.detach(), expected, atol=1e-6, rtol=1e-6)
+    assert "exp_avg" in opt.state[p]
+    assert "exp_avg_sq" in opt.state[p]
 
 
 def test_from_model_constructor_matches_module_constructor() -> None:
