@@ -44,5 +44,8 @@ the root optimizer's examples/second.
 
 - Full table: `all_runs.csv`
 - Per-trial metrics: `*/metrics.jsonl`
+- Combined rendered curves: `loss_accuracy_curves_both.png`
+- Loss-only rendered curves: `loss_curves_both.png`
+- Accuracy-only rendered curves: `accuracy_curves_both.png`
 - Curves: `train_loss.png`, `val_loss.png`, `val_acc.png`
 - Speed charts: `step_time_ms_bar.png`, `examples_per_sec_bar.png`
