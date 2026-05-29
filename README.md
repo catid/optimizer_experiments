@@ -75,6 +75,8 @@ quality regression.
 Full multi-seed report:
 `workers/codex_noradam_confidence/results/component_ablation_multiseed_20260529/summary.md`.
 
+![Validation accuracy curves for the three-seed AnchorMuon component ablation](workers/codex_noradam_confidence/results/component_ablation_multiseed_20260529/val_acc.png)
+
 Earlier single-seed component-removal table:
 
 | Worker ablation | Official test acc | Best val acc | Step time | Takeaway |
