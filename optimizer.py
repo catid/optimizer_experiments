@@ -44,16 +44,18 @@ accuracy/loss and was essentially tied with RMS on official test accuracy
 within seed variance. AdamATan2 is now the constructor default for fallback
 parameters so new users get that stronger validation-loss recipe by default.
 
-Language-model transfer note: a bounded WikiText-103 byte-level 49.4M GPT check
-selected ``lr=0.0015``, ``fallback_lr=0.00075``, ``row_gamma=0.55``, and
+Language-model transfer note: bounded byte-level 49.4M GPT checks now have two
+useful starting points. WikiText-103 selected ``lr=0.0015``,
+``fallback_lr=0.00075``, ``fallback_mode="atan2"``, ``row_gamma=0.55``, and
 ``soda_lambda_scale=0.01`` after a 213-candidate 1200-step HPO and 1600-step
-family replay. It narrowly beat plain Muon on validation loss while running
-faster per step. This is real text data but byte-level and single-seed; treat it
-as an initial LM starting point rather than a standard WikiText perplexity
-result. A longer 10k-step FineWeb-Edu byte-level run with those exact settings
-beat AdamW/AdamW-Atan2 but lost to plain Muon on validation loss, so better
-pretraining data needs its own AnchorMuon HPO rather than blindly reusing the
-WikiText point.
+family replay. FineWeb-Edu needed its own tuning: a 255-candidate 1600-step HPO
+with 10k-step family replay selected ``lr=0.0012``, ``fallback_lr=0.0012``,
+``fallback_mode="rms"``, ``row_gamma=0.45``, ``soda_lambda_scale=0.003``,
+``pmuoneq_beta=0.90``, and ``normuon_beta2=0.93``. That FineWeb point beat
+tuned plain Muon by 1.1755 vs 1.1798 validation loss while running faster per
+step. These are real-text but byte-level, single-seed optimizer-transfer
+signals; treat them as starting points rather than standard LM perplexity
+claims.
 
 The aspect-scaled variant was close and sometimes won on other CIFAR proxies,
 but no-aspect won the cleanest official-test protocol. This root file keeps
@@ -154,8 +156,10 @@ Do not tune everything at once. Treat the knobs in three tiers:
     Tier 1, tune first:
         lr
             Main quality/speed knob for matrix weights. Try
-            {0.0012, 0.0015, 0.00165, 0.00175} for 50M-class byte-level
-            language models, or {0.004, 0.006, 0.008} for smaller ViTs.
+            {0.0010, 0.0012, 0.0015} for 50M-class byte-level language
+            models, or {0.004, 0.006, 0.008} for smaller ViTs. The current
+            FineWeb-Edu 50M byte-level point used 0.0012; the WikiText-103
+            point used 0.0015.
 
         row_gamma
             Strength of row-wise PMuonEq reliability scaling before GramNS.
@@ -167,7 +171,9 @@ Do not tune everything at once. Treat the knobs in three tiers:
             LR for scalars, vectors, and any tensors explicitly
             routed to fallback.
             Default matches lr because this is what the strongest
-            reproduced CIFAR recipe used.
+            reproduced CIFAR and FineWeb-Edu recipes used. WikiText-103 used
+            half-rate AdamATan2 fallback, so tune this separately when moving
+            datasets.
 
         normuon_beta2
             Row second-moment smoothing after GramNS. Default 0.93. Try

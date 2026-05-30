@@ -54,7 +54,47 @@ data in `all_metrics_flat.csv`, and the mean/std table in
 
 ![Iteration step-time bars for the 5-seed CIFAR-10 optimizer confirmation](workers/codex_noradam_confidence/results/cifar5_baseline_confidence_20260529/final50_5seed/iteration_step_time_ms_bar_mean.png)
 
-## FineWeb-Edu 50M LLM Longer Run
+## FineWeb-Edu 50M LLM AnchorMuon HPO
+
+After the fixed WikiText-selected AnchorMuon setting lost to plain Muon on the
+first longer FineWeb-Edu run, I ran a FineWeb-specific HPO. The search used the
+same byte-level 49.4M GPT and data cache as the previous FineWeb run:
+`268,435,456` cached training bytes, `4,194,304` cached validation bytes,
+decoder-only GPT with `10` layers, width `640`, `10` heads, context `128`,
+byte vocab `256`, batch `32 x 128`, BF16 autocast, WSD with 100-step warmup,
+32 validation batches per evaluation point, and two RTX PRO 6000 Blackwell GPUs
+scheduled one trial per GPU.
+
+HPO ran `255` candidates for `1,600` steps each: `240` AnchorMuon variants plus
+AdamW, AdamW-Atan2, and plain Muon baselines. It then replayed the best
+candidate per optimizer family for `10,000` steps.
+
+| Rank | Optimizer | Selected config | Final val loss | Final byte acc | Step time | Throughput |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | AnchorMuon | `lr=0.0012`, `row_gamma=0.45`, `soda=0.003`, `pmuon_beta=0.90`, `normuon_beta2=0.93`, `fallback=RMS@1.0x` | 1.1755 | 64.43% | 14.84 ms | 276.0k byte/s |
+| 2 | Plain Muon | `lr=0.0011`, `wd=0.05` | 1.1798 | 64.31% | 16.87 ms | 242.7k byte/s |
+| 3 | AdamW | `lr=0.0004`, `wd=0.05` | 1.2073 | 63.58% | 10.09 ms | 405.8k byte/s |
+| 4 | AdamW-Atan2 | `lr=0.0004`, `wd=0.05` | 1.2101 | 63.47% | 10.35 ms | 395.7k byte/s |
+
+Takeaway: FineWeb-specific tuning restored AnchorMuon's lead over plain Muon
+on this bounded single-seed run. The important changes versus the earlier
+WikiText-transfer setting were lower matrix LR, weaker SODA, and RMS fallback
+at the full matrix LR instead of AdamATan2 at half LR. The HPO leaderboard was
+tightly clustered, but the selected AnchorMuon replay beat tuned Muon by
+`0.0043` validation loss while also running about 12% faster per step.
+
+Result bundle:
+`workers/codex_noradam_confidence/results/finewebedu_llm50m_anchor_hpo_20260529/`.
+
+![FineWeb-Edu HPO validation loss](workers/codex_noradam_confidence/results/finewebedu_llm50m_anchor_hpo_20260529/plots/val_loss_curve.png)
+
+![FineWeb-Edu HPO validation accuracy](workers/codex_noradam_confidence/results/finewebedu_llm50m_anchor_hpo_20260529/plots/val_acc_curve.png)
+
+![FineWeb-Edu HPO training loss](workers/codex_noradam_confidence/results/finewebedu_llm50m_anchor_hpo_20260529/plots/train_loss_curve.png)
+
+![FineWeb-Edu HPO step time](workers/codex_noradam_confidence/results/finewebedu_llm50m_anchor_hpo_20260529/plots/step_time_ms_bar.png)
+
+## FineWeb-Edu 50M LLM WikiText-Transfer Run
 
 The better-data language-modeling check uses `HuggingFaceFW/fineweb-edu`,
 configuration `sample-10BT`, streamed through Hugging Face datasets and cached
@@ -79,11 +119,11 @@ settings directly: `lr=0.0015`, `row_gamma=0.55`,
 | 3 | AdamW | `lr=0.0003`, `wd=0.05` | 1.1981 | 63.85% | 10.08 ms | 406.5k byte/s |
 | 4 | AdamW-Atan2 | `lr=0.0003`, `wd=0.05` | 1.1991 | 63.78% | 10.20 ms | 401.4k byte/s |
 
-Takeaway: better data changes the picture. The WikiText-tuned AnchorMuon
-settings transfer well enough to beat AdamW and AdamW-Atan2, and AnchorMuon is
-about 11% faster per step than plain Muon, but plain Muon has the best loss on
-this longer FineWeb-Edu run. The next useful experiment is FineWeb-specific HPO
-for AnchorMuon instead of assuming the WikiText settings are optimal.
+Takeaway: better data changed the picture. The WikiText-tuned AnchorMuon
+settings transferred well enough to beat AdamW and AdamW-Atan2, and AnchorMuon
+was about 11% faster per step than plain Muon, but plain Muon had the best loss
+on this fixed-setting FineWeb-Edu run. The FineWeb-specific HPO above addresses
+that gap and should be treated as the stronger FineWeb result.
 
 Result bundle:
 `workers/codex_noradam_confidence/results/finewebedu_llm50m_long_20260529/`.

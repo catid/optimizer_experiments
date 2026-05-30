@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--trial-json", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529"))
-    parser.add_argument("--preset", choices=["smoke", "main", "anchor_deep", "anchor_harder", "fineweb_long"], default="anchor_deep")
+    parser.add_argument("--preset", choices=["smoke", "main", "anchor_deep", "anchor_harder", "fineweb_long", "fineweb_anchor_hpo"], default="anchor_deep")
     parser.add_argument("--dataset-source", choices=["wikitext", "hf_text"], default="wikitext")
     parser.add_argument("--wiki-config", default="wikitext-103-raw-v1")
     parser.add_argument("--hf-dataset", default="HuggingFaceFW/fineweb-edu")
@@ -404,6 +404,109 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
             TrialConfig("fineweb_adamatan2_lr0.0003", "adamatan2", 0.0003, steps=args.hpo_steps),
             TrialConfig("fineweb_adamw_lr0.0003", "adamw", 0.0003, steps=args.hpo_steps),
         ]
+        eval_every = max(1, args.hpo_steps // max(args.eval_bins, 1))
+        warmup = min(args.warmup_steps, max(1, args.hpo_steps // 4))
+        return [replace(trial, eval_every=eval_every, warmup_steps=warmup) for trial in trials]
+
+    if args.preset == "fineweb_anchor_hpo":
+        by_name: dict[str, TrialConfig] = {}
+
+        def add(trial: TrialConfig) -> None:
+            by_name.setdefault(trial.name, trial)
+
+        # FineWeb-specific reference baselines around the previous long-run
+        # winners. This keeps the AnchorMuon HPO honest without spending most
+        # trials on Adam variants.
+        for lr in (2e-4, 3e-4, 4e-4, 5e-4):
+            add(TrialConfig(f"fineweb_adamw_lr{lr:g}", "adamw", lr, steps=args.hpo_steps))
+            add(TrialConfig(f"fineweb_adamatan2_lr{lr:g}", "adamatan2", lr, steps=args.hpo_steps))
+        for lr in (9e-4, 1.0e-3, 1.1e-3, 1.2e-3, 1.3e-3, 1.4e-3, 1.5e-3):
+            add(TrialConfig(f"fineweb_muon_lr{lr:g}", "muon", lr, steps=args.hpo_steps))
+
+        # Main AnchorMuon matrix-path grid. The prior fixed-settings run lost
+        # to Muon with lr=0.0015, row_gamma=0.55, soda=0.01, so this focuses
+        # around lower/lateral LR, wider row-gamma, and much weaker SODA.
+        for lr in (0.0010, 0.0012, 0.00135, 0.0015, 0.00165, 0.0018):
+            for row_gamma in (0.25, 0.45, 0.55, 0.65):
+                for soda_lambda_scale in (0.001, 0.003, 0.01, 0.03):
+                    add(
+                        TrialConfig(
+                            f"fineweb_anchor_lr{lr:g}_rg{row_gamma:g}_soda{soda_lambda_scale:g}_pb0.9_nb0.93_flr0.5_atan2",
+                            "anchormuon",
+                            lr,
+                            row_gamma=row_gamma,
+                            pmuoneq_beta=0.90,
+                            normuon_beta2=0.93,
+                            fallback_lr_mult=0.5,
+                            fallback_mode="atan2",
+                            soda_lambda_scale=soda_lambda_scale,
+                            steps=args.hpo_steps,
+                        )
+                    )
+
+        # Check whether PMuonEq row scaling is helping at all on FineWeb.
+        for lr in (0.0011, 0.0012, 0.00135, 0.0015):
+            for soda_lambda_scale in (0.001, 0.003, 0.01):
+                add(
+                    TrialConfig(
+                        f"fineweb_anchor_lr{lr:g}_rg0_soda{soda_lambda_scale:g}_pb0.9_nb0.93_flr0.5_atan2",
+                        "anchormuon",
+                        lr,
+                        row_gamma=0.0,
+                        pmuoneq_beta=0.90,
+                        normuon_beta2=0.93,
+                        fallback_lr_mult=0.5,
+                        fallback_mode="atan2",
+                        soda_lambda_scale=soda_lambda_scale,
+                        steps=args.hpo_steps,
+                    )
+                )
+
+        # Fallback parameters are a small fraction of the model but can move LM
+        # loss through embeddings/head/scales. Sweep them near the strongest
+        # matrix settings instead of assuming the WikiText fallback ratio.
+        for lr in (0.0012, 0.00135, 0.0015):
+            for row_gamma in (0.45, 0.55):
+                for fallback_lr_mult in (0.25, 0.5, 0.75, 1.0):
+                    for fallback_mode in ("atan2", "rms", "adamc"):
+                        add(
+                            TrialConfig(
+                                f"fineweb_anchor_lr{lr:g}_rg{row_gamma:g}_soda0.003_pb0.9_nb0.93_flr{fallback_lr_mult:g}_{fallback_mode}",
+                                "anchormuon",
+                                lr,
+                                row_gamma=row_gamma,
+                                pmuoneq_beta=0.90,
+                                normuon_beta2=0.93,
+                                fallback_lr_mult=fallback_lr_mult,
+                                fallback_mode=fallback_mode,
+                                soda_lambda_scale=0.003,
+                                steps=args.hpo_steps,
+                            )
+                        )
+
+        # Matrix-state beta sweep around likely FineWeb winners.
+        for lr in (0.0012, 0.00135, 0.0015):
+            for row_gamma in (0.45, 0.55):
+                for pmuoneq_beta in (0.85, 0.90, 0.95, 0.98):
+                    for normuon_beta2 in (0.90, 0.93, 0.95):
+                        add(
+                            TrialConfig(
+                                f"fineweb_anchor_lr{lr:g}_rg{row_gamma:g}_soda0.003_pb{pmuoneq_beta:g}_nb{normuon_beta2:g}_flr0.5_atan2",
+                                "anchormuon",
+                                lr,
+                                row_gamma=row_gamma,
+                                pmuoneq_beta=pmuoneq_beta,
+                                normuon_beta2=normuon_beta2,
+                                fallback_lr_mult=0.5,
+                                fallback_mode="atan2",
+                                soda_lambda_scale=0.003,
+                                steps=args.hpo_steps,
+                            )
+                        )
+
+        trials = list(by_name.values())
+        if args.max_hpo_trials:
+            trials = trials[: args.max_hpo_trials]
         eval_every = max(1, args.hpo_steps // max(args.eval_bins, 1))
         warmup = min(args.warmup_steps, max(1, args.hpo_steps // 4))
         return [replace(trial, eval_every=eval_every, warmup_steps=warmup) for trial in trials]
@@ -764,8 +867,8 @@ def make_plots(args: argparse.Namespace, final_rows: list[dict[str, Any]]) -> No
     plots_dir.mkdir(parents=True, exist_ok=True)
     labels = {"anchormuon": "AnchorMuon", "adamw": "AdamW", "adamatan2": "AdamW-Atan2", "muon": "Muon"}
     for metric, ylabel, out_name in [
-        ("val_loss", "WikiText validation loss", "val_loss_curve.png"),
-        ("val_acc", "WikiText byte accuracy", "val_acc_curve.png"),
+        ("val_loss", "Validation loss", "val_loss_curve.png"),
+        ("val_acc", "Byte accuracy", "val_acc_curve.png"),
         ("train_loss", "Training loss", "train_loss_curve.png"),
     ]:
         fig, ax = plt.subplots(figsize=(7.5, 4.5))
