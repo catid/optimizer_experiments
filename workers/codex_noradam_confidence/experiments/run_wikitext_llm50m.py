@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run a 50M-parameter byte-level LM optimizer comparison.
+"""Run a 50M-parameter LM optimizer comparison.
 
-The benchmark uses real text encoded directly as UTF-8 bytes. This avoids
-tokenizer downloads while still measuring an actual next-token language model
-workload with embeddings, attention, MLPs, and tied output head.
+The original benchmark path encodes text directly as UTF-8 bytes. A real
+tokenizer path is also available via Hugging Face tokenizers, which is the
+preferred mode for language-model optimizer transfer checks.
 """
 
 from __future__ import annotations
@@ -60,11 +60,11 @@ class TrialConfig:
     wsd_decay_frac: float = 0.2
 
 
-class ByteTokenStream:
+class TokenStream:
     def __init__(self, path: Path, device: torch.device) -> None:
         arr = np.load(path)
-        if arr.dtype != np.uint8:
-            raise ValueError(f"{path} must contain uint8 byte tokens, got {arr.dtype}")
+        if not np.issubdtype(arr.dtype, np.integer):
+            raise ValueError(f"{path} must contain integer token ids, got {arr.dtype}")
         self.tokens = torch.from_numpy(arr.astype(np.int64, copy=False)).to(device)
 
     def batch(self, *, batch_size: int, block_size: int, generator: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
@@ -82,8 +82,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--trial-json", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529"))
-    parser.add_argument("--preset", choices=["smoke", "main", "anchor_deep", "anchor_harder", "fineweb_long", "fineweb_anchor_hpo", "muown_ema_hpo"], default="anchor_deep")
+    parser.add_argument(
+        "--preset",
+        choices=[
+            "smoke",
+            "main",
+            "anchor_deep",
+            "anchor_harder",
+            "fineweb_long",
+            "fineweb_anchor_hpo",
+            "fineweb_tokenized_hpo",
+            "muown_ema_hpo",
+        ],
+        default="anchor_deep",
+    )
     parser.add_argument("--dataset-source", choices=["wikitext", "hf_text"], default="wikitext")
+    parser.add_argument("--tokenizer-mode", choices=["byte", "hf"], default="byte")
+    parser.add_argument("--tokenizer-name", default="gpt2")
+    parser.add_argument("--tokenizer-add-eos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--wiki-config", default="wikitext-103-raw-v1")
     parser.add_argument("--hf-dataset", default="HuggingFaceFW/fineweb-edu")
     parser.add_argument("--hf-config", default="sample-10BT")
@@ -94,6 +110,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", type=Path, default=Path("workers/codex_noradam_confidence/data/wikitext_bytes"))
     parser.add_argument("--max-train-bytes", type=int, default=32_000_000)
     parser.add_argument("--max-val-bytes", type=int, default=2_000_000)
+    parser.add_argument("--max-train-tokens", type=int, default=8_000_000)
+    parser.add_argument("--max-val-tokens", type=int, default=1_000_000)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--n-layer", type=int, default=10)
@@ -118,9 +136,34 @@ def _safe_name(text: str) -> str:
 
 def dataset_label(args: argparse.Namespace) -> str:
     if args.dataset_source == "wikitext":
-        return f"wikitext/{args.wiki_config}"
-    config = args.hf_config or "default"
-    return f"{args.hf_dataset}/{config}:{args.hf_split}"
+        base = f"wikitext/{args.wiki_config}"
+    else:
+        config = args.hf_config or "default"
+        base = f"{args.hf_dataset}/{config}:{args.hf_split}"
+    if args.tokenizer_mode == "byte":
+        return f"{base} [utf8-byte]"
+    return f"{base} [{args.tokenizer_name}]"
+
+
+def _load_hf_tokenizer(name: str) -> Any:
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:  # pragma: no cover - environment guard
+        raise RuntimeError("tokenizer-mode=hf requires the transformers package") from exc
+    tokenizer = AutoTokenizer.from_pretrained(name, use_fast=True)
+    if not getattr(tokenizer, "is_fast", False):
+        raise RuntimeError(f"{name!r} did not load as a fast tokenizer")
+    return tokenizer
+
+
+def tokenizer_vocab_size(args: argparse.Namespace) -> int:
+    if args.tokenizer_mode == "byte":
+        return 256
+    tokenizer = _load_hf_tokenizer(args.tokenizer_name)
+    vocab_size = int(getattr(tokenizer, "vocab_size", 0) or len(tokenizer))
+    if vocab_size <= 0:
+        raise RuntimeError(f"could not determine vocab size for {args.tokenizer_name!r}")
+    return vocab_size
 
 
 def _bytes_from_dataset(config: str, split: str, max_bytes: int) -> np.ndarray:
@@ -143,6 +186,8 @@ def _bytes_from_dataset(config: str, split: str, max_bytes: int) -> np.ndarray:
 
 
 def prepare_wikitext_cache(args: argparse.Namespace) -> tuple[Path, Path]:
+    if args.tokenizer_mode == "hf":
+        return prepare_wikitext_token_cache(args)
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     safe_config = args.wiki_config.replace("/", "_")
     train_path = args.cache_dir / f"{safe_config}_train_{args.max_train_bytes}.uint8.npy"
@@ -180,8 +225,87 @@ def _consume_text_bytes(rows: Any, *, text_field: str, max_bytes: int) -> np.nda
     return np.frombuffer(bytes(out), dtype=np.uint8).copy()
 
 
+def _token_dtype(vocab_size: int) -> np.dtype[Any]:
+    if vocab_size <= np.iinfo(np.uint16).max:
+        return np.dtype(np.uint16)
+    return np.dtype(np.uint32)
+
+
+def _consume_text_tokens(
+    rows: Any,
+    *,
+    text_field: str,
+    tokenizer: Any,
+    max_tokens: int,
+    add_eos: bool,
+    batch_rows: int = 128,
+) -> np.ndarray:
+    chunks: list[np.ndarray] = []
+    total = 0
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    dtype = _token_dtype(int(getattr(tokenizer, "vocab_size", 0) or len(tokenizer)))
+
+    def flush(batch: list[str]) -> None:
+        nonlocal total
+        if not batch or total >= max_tokens:
+            return
+        encoded = tokenizer(batch, add_special_tokens=False, return_attention_mask=False)["input_ids"]
+        for ids in encoded:
+            if add_eos and eos_id is not None:
+                ids = [*ids, int(eos_id)]
+            if not ids:
+                continue
+            remaining = max_tokens - total
+            if remaining <= 0:
+                break
+            arr = np.asarray(ids[:remaining], dtype=dtype)
+            chunks.append(arr)
+            total += int(arr.size)
+            if total >= max_tokens:
+                break
+
+    batch: list[str] = []
+    for row in rows:
+        text = _row_text(row, text_field)
+        if text:
+            batch.append(text)
+        if len(batch) >= batch_rows:
+            flush(batch)
+            batch.clear()
+        if total >= max_tokens:
+            break
+    flush(batch)
+    if not chunks:
+        raise RuntimeError("dataset stream produced no token ids")
+    return np.concatenate(chunks)[:max_tokens]
+
+
+def prepare_wikitext_token_cache(args: argparse.Namespace) -> tuple[Path, Path]:
+    from datasets import load_dataset
+
+    args.cache_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer = _load_hf_tokenizer(args.tokenizer_name)
+    safe_config = _safe_name(args.wiki_config)
+    safe_tok = _safe_name(args.tokenizer_name)
+    eos = "eos" if args.tokenizer_add_eos else "noeos"
+    train_path = args.cache_dir / f"{safe_config}_{safe_tok}_{eos}_train_{args.max_train_tokens}.tok.npy"
+    val_path = args.cache_dir / f"{safe_config}_{safe_tok}_{eos}_validation_{args.max_val_tokens}.tok.npy"
+    if not train_path.exists():
+        ds = load_dataset("wikitext", args.wiki_config, split="train")
+        train = _consume_text_tokens(iter(ds), text_field="text", tokenizer=tokenizer, max_tokens=args.max_train_tokens, add_eos=args.tokenizer_add_eos)
+        np.save(train_path, train)
+    if not val_path.exists():
+        ds = load_dataset("wikitext", args.wiki_config, split="validation")
+        val = _consume_text_tokens(iter(ds), text_field="text", tokenizer=tokenizer, max_tokens=args.max_val_tokens, add_eos=args.tokenizer_add_eos)
+        np.save(val_path, val)
+    return train_path, val_path
+
+
 def prepare_hf_text_cache(args: argparse.Namespace) -> tuple[Path, Path]:
     from datasets import load_dataset
+
+    if args.tokenizer_mode == "hf":
+        return prepare_hf_token_cache(args)
 
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     safe = _safe_name(f"{args.hf_dataset}_{args.hf_config}_{args.hf_split}_{args.hf_text_field}_shuf{args.hf_shuffle_buffer}_seed{args.seed}")
@@ -215,6 +339,42 @@ def prepare_text_cache(args: argparse.Namespace) -> tuple[Path, Path]:
     if args.dataset_source == "wikitext":
         return prepare_wikitext_cache(args)
     return prepare_hf_text_cache(args)
+
+
+def prepare_hf_token_cache(args: argparse.Namespace) -> tuple[Path, Path]:
+    from datasets import load_dataset
+
+    args.cache_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer = _load_hf_tokenizer(args.tokenizer_name)
+    eos = "eos" if args.tokenizer_add_eos else "noeos"
+    safe = _safe_name(
+        f"{args.hf_dataset}_{args.hf_config}_{args.hf_split}_{args.hf_text_field}_"
+        f"{args.tokenizer_name}_{eos}_shuf{args.hf_shuffle_buffer}_seed{args.seed}"
+    )
+    train_path = args.cache_dir / f"{safe}_train_{args.max_train_tokens}.tok.npy"
+    val_path = args.cache_dir / f"{safe}_validation_{args.max_val_tokens}.tok.npy"
+    if train_path.exists() and val_path.exists():
+        return train_path, val_path
+
+    name = args.hf_config or None
+    if args.hf_val_split:
+        val_ds = load_dataset(args.hf_dataset, name=name, split=args.hf_val_split, streaming=True)
+        train_ds = load_dataset(args.hf_dataset, name=name, split=args.hf_split, streaming=True)
+        if args.hf_shuffle_buffer > 0:
+            train_ds = train_ds.shuffle(buffer_size=args.hf_shuffle_buffer, seed=args.seed)
+        val = _consume_text_tokens(iter(val_ds), text_field=args.hf_text_field, tokenizer=tokenizer, max_tokens=args.max_val_tokens, add_eos=args.tokenizer_add_eos)
+        train = _consume_text_tokens(iter(train_ds), text_field=args.hf_text_field, tokenizer=tokenizer, max_tokens=args.max_train_tokens, add_eos=args.tokenizer_add_eos)
+    else:
+        ds = load_dataset(args.hf_dataset, name=name, split=args.hf_split, streaming=True)
+        if args.hf_shuffle_buffer > 0:
+            ds = ds.shuffle(buffer_size=args.hf_shuffle_buffer, seed=args.seed)
+        iterator = iter(ds)
+        val = _consume_text_tokens(iterator, text_field=args.hf_text_field, tokenizer=tokenizer, max_tokens=args.max_val_tokens, add_eos=args.tokenizer_add_eos)
+        train = _consume_text_tokens(iterator, text_field=args.hf_text_field, tokenizer=tokenizer, max_tokens=args.max_train_tokens, add_eos=args.tokenizer_add_eos)
+
+    np.save(val_path, val)
+    np.save(train_path, train)
+    return train_path, val_path
 
 
 class Muown(PlainMuon):
@@ -452,7 +612,7 @@ def make_optimizer(model: nn.Module, trial: TrialConfig) -> torch.optim.Optimize
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
-    stream: ByteTokenStream,
+    stream: TokenStream,
     *,
     batch_size: int,
     block_size: int,
@@ -482,9 +642,10 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
     torch.backends.cudnn.allow_tf32 = True
     device = torch.device("cuda")
     train_path, val_path = prepare_text_cache(args)
+    vocab_size = tokenizer_vocab_size(args)
 
     model = TinyGPT(
-        vocab_size=256,
+        vocab_size=vocab_size,
         block_size=args.block_size,
         n_layer=args.n_layer,
         n_head=args.n_head,
@@ -495,8 +656,8 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
     optimizer = make_optimizer(model, trial)
     for group in optimizer.param_groups:
         group["_bench_base_lr"] = float(group.get("lr", trial.lr))
-    train_stream = ByteTokenStream(train_path, device)
-    val_stream = ByteTokenStream(val_path, device)
+    train_stream = TokenStream(train_path, device)
+    val_stream = TokenStream(val_path, device)
     train_gen = torch.Generator(device=device).manual_seed(trial.seed + 10)
     val_gen = torch.Generator(device=device).manual_seed(trial.seed + 20)
 
@@ -567,8 +728,13 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
     summary = {
         **asdict(trial),
         "dataset": dataset_label(args),
-        "train_bytes": int(np.load(train_path, mmap_mode="r").shape[0]),
-        "val_bytes": int(np.load(val_path, mmap_mode="r").shape[0]),
+        "tokenizer_mode": args.tokenizer_mode,
+        "tokenizer_name": args.tokenizer_name if args.tokenizer_mode != "byte" else "utf8-byte",
+        "vocab_size": vocab_size,
+        "train_tokens": int(np.load(train_path, mmap_mode="r").shape[0]),
+        "val_tokens": int(np.load(val_path, mmap_mode="r").shape[0]),
+        "train_bytes": int(np.load(train_path, mmap_mode="r").shape[0]) if args.tokenizer_mode == "byte" else 0,
+        "val_bytes": int(np.load(val_path, mmap_mode="r").shape[0]) if args.tokenizer_mode == "byte" else 0,
         "param_count": param_count,
         "final_train_loss": last_loss,
         "final_val_loss": final_eval["val_loss"],
@@ -712,6 +878,44 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
                                 fallback_lr_mult=0.5,
                                 fallback_mode="atan2",
                                 soda_lambda_scale=0.003,
+                                steps=args.hpo_steps,
+                            )
+                        )
+
+        trials = list(by_name.values())
+        if args.max_hpo_trials:
+            trials = trials[: args.max_hpo_trials]
+        eval_every = max(1, args.hpo_steps // max(args.eval_bins, 1))
+        warmup = min(args.warmup_steps, max(1, args.hpo_steps // 4))
+        return [replace(trial, eval_every=eval_every, warmup_steps=warmup) for trial in trials]
+
+    if args.preset == "fineweb_tokenized_hpo":
+        by_name: dict[str, TrialConfig] = {}
+
+        def add(trial: TrialConfig) -> None:
+            by_name.setdefault(trial.name, trial)
+
+        for lr in (2e-4, 3e-4, 4e-4, 5e-4):
+            add(TrialConfig(f"tok_adamw_lr{lr:g}", "adamw", lr, steps=args.hpo_steps))
+            add(TrialConfig(f"tok_adamatan2_lr{lr:g}", "adamatan2", lr, steps=args.hpo_steps))
+        for lr in (8e-4, 1.0e-3, 1.2e-3, 1.4e-3):
+            add(TrialConfig(f"tok_muon_lr{lr:g}", "muon", lr, steps=args.hpo_steps))
+
+        for lr in (8e-4, 1.0e-3, 1.2e-3, 1.4e-3):
+            for row_gamma in (0.0, 0.25, 0.45, 0.55):
+                for soda_lambda_scale in (0.001, 0.003, 0.01):
+                    for fallback_lr_mult, fallback_mode in ((0.5, "atan2"), (1.0, "rms")):
+                        add(
+                            TrialConfig(
+                                f"tok_anchor_lr{lr:g}_rg{row_gamma:g}_soda{soda_lambda_scale:g}_flr{fallback_lr_mult:g}_{fallback_mode}",
+                                "anchormuon",
+                                lr,
+                                row_gamma=row_gamma,
+                                pmuoneq_beta=0.90,
+                                normuon_beta2=0.93,
+                                fallback_lr_mult=fallback_lr_mult,
+                                fallback_mode=fallback_mode,
+                                soda_lambda_scale=soda_lambda_scale,
                                 steps=args.hpo_steps,
                             )
                         )
@@ -1078,6 +1282,11 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> list[d
                 str(args.output_dir),
                 "--dataset-source",
                 str(args.dataset_source),
+                "--tokenizer-mode",
+                str(args.tokenizer_mode),
+                "--tokenizer-name",
+                str(args.tokenizer_name),
+                "--tokenizer-add-eos" if args.tokenizer_add_eos else "--no-tokenizer-add-eos",
                 "--wiki-config",
                 str(args.wiki_config),
                 "--hf-dataset",
@@ -1098,6 +1307,10 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> list[d
                 str(args.max_train_bytes),
                 "--max-val-bytes",
                 str(args.max_val_bytes),
+                "--max-train-tokens",
+                str(args.max_train_tokens),
+                "--max-val-tokens",
+                str(args.max_val_tokens),
                 "--block-size",
                 str(args.block_size),
                 "--n-layer",
@@ -1166,9 +1379,10 @@ def make_plots(args: argparse.Namespace, final_rows: list[dict[str, Any]]) -> No
         "ema_muon": "EMA-Nesterov + Muon",
         "ema_muown": "EMA-Nesterov + Muown",
     }
+    accuracy_label = "Byte accuracy" if args.tokenizer_mode == "byte" else "Token accuracy"
     for metric, ylabel, out_name in [
         ("val_loss", "Validation loss", "val_loss_curve.png"),
-        ("val_acc", "Byte accuracy", "val_acc_curve.png"),
+        ("val_acc", accuracy_label, "val_acc_curve.png"),
         ("train_loss", "Training loss", "train_loss_curve.png"),
     ]:
         fig, ax = plt.subplots(figsize=(7.5, 4.5))
@@ -1210,27 +1424,47 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
         "ema_muown": "EMA-Nesterov + Muown",
     }
     final_sorted = sorted(final_rows, key=lambda r: float(r["final_val_loss"]))
+    tokenizer_name = "utf8-byte" if args.tokenizer_mode == "byte" else args.tokenizer_name
+    unit = "bytes" if args.tokenizer_mode == "byte" else "tokens"
+    accuracy_name = "byte acc" if args.tokenizer_mode == "byte" else "token acc"
+    throughput_unit = "byte/s" if args.tokenizer_mode == "byte" else "tok/s"
+    title = "Byte-Level 50M LLM Optimizer Comparison" if args.tokenizer_mode == "byte" else "Tokenized 50M LLM Optimizer Comparison"
+    description = (
+        "This benchmark uses real text encoded as UTF-8 bytes. It is byte-level rather than BPE-tokenized, so the numbers should not be compared to standard word/BPE perplexities. It is still a real text next-byte language-model optimizer comparison."
+        if args.tokenizer_mode == "byte"
+        else f"This benchmark uses real text tokenized with the Hugging Face `{args.tokenizer_name}` tokenizer. It is the preferred language-model optimizer transfer check because embeddings, output head, and sequence statistics are closer to a normal BPE/SentencePiece pretraining setup than the older byte-level path."
+    )
+
+    def _step_description(rows: list[dict[str, Any]], fallback: int) -> str:
+        if not rows:
+            return f"{fallback} steps"
+        values = sorted({int(row.get("steps", fallback)) for row in rows})
+        if len(values) == 1:
+            return f"{values[0]} steps"
+        return ", ".join(f"{value} steps" for value in values)
+
     lines = [
-        "# Byte-Level 50M LLM Optimizer Comparison",
+        f"# {title}",
         "",
-        "This benchmark uses real text encoded as UTF-8 bytes. It is byte-level rather than BPE-tokenized, so the numbers should not be compared to standard word/BPE perplexities. It is still a real text next-byte language-model optimizer comparison.",
+        description,
         "",
         "## Setup",
         "",
         f"- Dataset: `{dataset_label(args)}`",
-        f"- Train bytes cached: {int(final_rows[0]['train_bytes']) if final_rows else args.max_train_bytes:,}",
-        f"- Validation bytes cached: {int(final_rows[0]['val_bytes']) if final_rows else args.max_val_bytes:,}",
-        f"- Model: decoder-only GPT, layers={args.n_layer}, width={args.n_embd}, heads={args.n_head}, context={args.block_size}, byte vocab=256",
+        f"- Tokenizer: `{tokenizer_name}`",
+        f"- Train {unit} cached: {int(final_rows[0]['train_tokens']) if final_rows else (args.max_train_bytes if args.tokenizer_mode == 'byte' else args.max_train_tokens):,}",
+        f"- Validation {unit} cached: {int(final_rows[0]['val_tokens']) if final_rows else (args.max_val_bytes if args.tokenizer_mode == 'byte' else args.max_val_tokens):,}",
+        f"- Model: decoder-only GPT, layers={args.n_layer}, width={args.n_embd}, heads={args.n_head}, context={args.block_size}, vocab={int(final_rows[0]['vocab_size']) if final_rows else tokenizer_vocab_size(args):,}",
         f"- Trainable parameters: {int(final_rows[0]['param_count']) if final_rows else 'n/a'}",
-        f"- Batch: {args.batch_size} sequences x {args.block_size} bytes",
-        f"- HPO: {'skipped; fixed preset configs replayed directly' if args.final_only else f'{args.hpo_steps} steps per candidate, selected by best validation loss'}",
-        f"- Final replay: {args.final_steps} steps per selected optimizer",
+        f"- Batch: {args.batch_size} sequences x {args.block_size} {unit}",
+        f"- HPO: {'skipped; fixed preset configs replayed directly' if args.final_only else f'{_step_description(hpo_rows, args.hpo_steps)} per candidate, selected by best validation loss'}",
+        f"- Final replay: {_step_description(final_rows, args.final_steps)} per selected optimizer",
         f"- Validation estimate: {args.eval_batches} random batches per evaluation point",
         f"- GPUs: {torch.cuda.device_count()} visible, one trial per GPU",
         "",
         "## Final Results",
         "",
-        "| Rank | Optimizer | Selected config | Final val loss | Best val loss | Final byte acc | Step time | Throughput |",
+        f"| Rank | Optimizer | Selected config | Final val loss | Best val loss | Final {accuracy_name} | Step time | Throughput |",
         "|---:|---|---|---:|---:|---:|---:|---:|",
     ]
     for rank, row in enumerate(final_sorted, start=1):
@@ -1247,7 +1481,7 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
             f"| {rank} | {labels.get(str(row['family']), row['family'])} | {config} | "
             f"{float(row['final_val_loss']):.4f} | {float(row['best_val_loss']):.4f} | "
             f"{100.0 * float(row['final_val_acc']):.2f}% | {float(row['mean_step_time_ms']):.2f} ms | "
-            f"{float(row['tokens_per_sec']) / 1000.0:.1f}k byte/s |"
+            f"{float(row['tokens_per_sec']) / 1000.0:.1f}k {throughput_unit} |"
         )
     lines += [
         "",

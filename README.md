@@ -54,6 +54,44 @@ data in `all_metrics_flat.csv`, and the mean/std table in
 
 ![Iteration step-time bars for the 5-seed CIFAR-10 optimizer confirmation](workers/codex_noradam_confidence/results/cifar5_baseline_confidence_20260529/final50_5seed/iteration_step_time_ms_bar_mean.png)
 
+## FineWeb-Edu GPT-2 Tokenized 50M LLM Check
+
+The preferred language-model transfer benchmark now uses a real tokenizer
+instead of UTF-8 bytes. This run tokenized FineWeb-Edu with the Hugging Face
+`gpt2` tokenizer, then trained a tied-embedding decoder-only GPT with `8`
+layers, width `512`, `8` heads, context `256`, vocab `50,257`, and
+`51,045,888` trainable parameters. The data cache contains `8,000,000` train
+tokens and `524,288` validation tokens. Batch size is `16 x 256`, BF16
+autocast, WSD with 100-step warmup, and two RTX PRO 6000 Blackwell GPUs with
+one trial per GPU.
+
+HPO ran `108` candidates for `600` steps each: AdamW, AdamW-Atan2, Muon, and a
+compact AnchorMuon grid over LR, row-gamma, SODA strength, and fallback mode.
+The best candidate per optimizer family was replayed for `3,000` steps.
+
+| Rank | Optimizer | Selected config | Final val loss | Final token acc | Step time | Throughput |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | Muon | `lr=0.0014`, `wd=0.05` | 5.0843 | 22.95% | 21.23 ms | 193.0k tok/s |
+| 2 | AnchorMuon | `lr=0.0014`, `row_gamma=0.45`, `soda=0.003`, `fallback=RMS@1.0x` | 5.1667 | 23.49% | 20.06 ms | 204.2k tok/s |
+| 3 | AdamW-Atan2 | `lr=0.0005`, `wd=0.05` | 5.5179 | 20.99% | 16.24 ms | 252.2k tok/s |
+| 4 | AdamW | `lr=0.0005`, `wd=0.05` | 5.5275 | 21.01% | 15.43 ms | 265.4k tok/s |
+
+Takeaway: using a real tokenizer changes the interpretation. AnchorMuon won the
+short HPO stage and was about `5.5%` faster per step than Muon, with higher
+final token accuracy, but plain Muon overtook it on 3K-step validation loss.
+For LLMs, treat AnchorMuon as competitive but not settled. The next real-LM
+round should tune Muon and AnchorMuon for longer token budgets and include
+multi-seed or longer replay before choosing a language-modeling default.
+
+Result bundle:
+`workers/codex_noradam_confidence/results/fineweb_gpt2_llm50m_20260601/`.
+
+![FineWeb GPT-2-tokenized validation loss](workers/codex_noradam_confidence/results/fineweb_gpt2_llm50m_20260601/plots/val_loss_curve.png)
+
+![FineWeb GPT-2-tokenized validation accuracy](workers/codex_noradam_confidence/results/fineweb_gpt2_llm50m_20260601/plots/val_acc_curve.png)
+
+![FineWeb GPT-2-tokenized step time](workers/codex_noradam_confidence/results/fineweb_gpt2_llm50m_20260601/plots/step_time_ms_bar.png)
+
 ## FineWeb-Edu 50M LLM AnchorMuon HPO
 
 After the fixed WikiText-selected AnchorMuon setting lost to plain Muon on the

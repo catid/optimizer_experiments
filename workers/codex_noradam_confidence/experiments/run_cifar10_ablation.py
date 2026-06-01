@@ -87,6 +87,7 @@ class TrialConfig:
     ema_gamma: float = 0.99
     ema_warmup_frac: float = 0.30
     ema_rest_frac: float = 0.20
+    muown_mag_lr_mult: float = 1.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -117,6 +118,7 @@ def parse_args() -> argparse.Namespace:
             "sfplus_combo20",
             "component_ablation",
             "muown_ema_cifar10",
+            "ema_muown_cifar10_hard",
         ],
     )
     parser.add_argument("--only", default="", help="Regex filter for trial names")
@@ -666,6 +668,102 @@ def trial_grid(preset: str) -> list[TrialConfig]:
                         ema_gamma=0.99,
                     ))
         return trials
+    if preset == "ema_muown_cifar10_hard":
+        trials = [
+            TrialConfig(
+                "adamw_cosine_lr0.004_wd0.001",
+                "adamw",
+                4e-3,
+                lr_schedule="cosine",
+                weight_decay=0.001,
+            ),
+            TrialConfig(
+                "anchor_wsd_lr0.016_flr0.5_atan2_rg0.35_pb0.9_nb0.93",
+                "root",
+                1.6e-2,
+                lr_schedule="wsd",
+                soda="all",
+                row_gamma=0.35,
+                pmuon_beta=0.90,
+                momentum=0.95,
+                normuon=True,
+                normuon_beta=0.93,
+                amuse=False,
+                root_grouping="named",
+                root_normuon_mode="row",
+                fallback_mode="atan2",
+                fallback_lr_mult=0.5,
+                fallback_beta1=0.90,
+                fallback_beta2=0.95,
+            ),
+        ]
+        for lr in [0.008, 0.010, 0.012, 0.014]:
+            for mag_mult in [0.5, 1.0]:
+                trials.append(TrialConfig(
+                    f"muown_wsd_lr{lr:g}_wd0_flr0.5_mag{mag_mult:g}",
+                    "muown",
+                    lr,
+                    lr_schedule="wsd",
+                    weight_decay=0.0,
+                    momentum=0.95,
+                    fallback_lr_mult=0.5,
+                    muown_mag_lr_mult=mag_mult,
+                ))
+        for schedule in ["wsd", "cosine"]:
+            for lr in [0.006, 0.008, 0.010, 0.012, 0.014]:
+                for fallback_mult in [0.25, 0.5, 1.0]:
+                    for mag_mult in [0.5, 1.0]:
+                        for ema_beta in [0.03, 0.06, 0.10, 0.15]:
+                            trials.append(TrialConfig(
+                                (
+                                    f"ema_muown_{schedule}_lr{lr:g}_wd0"
+                                    f"_flr{fallback_mult:g}_mag{mag_mult:g}"
+                                    f"_b{ema_beta:g}_g0.995"
+                                ),
+                                "ema_muown",
+                                lr,
+                                lr_schedule=schedule,
+                                weight_decay=0.0,
+                                momentum=0.95,
+                                fallback_lr_mult=fallback_mult,
+                                muown_mag_lr_mult=mag_mult,
+                                ema_beta=ema_beta,
+                                ema_gamma=0.995,
+                                ema_warmup_frac=0.20,
+                                ema_rest_frac=0.10,
+                            ))
+        for lr in [0.008, 0.010, 0.012]:
+            for wd in [0.0001, 0.0003]:
+                for ema_beta in [0.03, 0.06]:
+                    trials.append(TrialConfig(
+                        f"ema_muown_wsd_lr{lr:g}_wd{wd:g}_flr0.5_mag0.5_b{ema_beta:g}_g0.995",
+                        "ema_muown",
+                        lr,
+                        lr_schedule="wsd",
+                        weight_decay=wd,
+                        momentum=0.95,
+                        fallback_lr_mult=0.5,
+                        muown_mag_lr_mult=0.5,
+                        ema_beta=ema_beta,
+                        ema_gamma=0.995,
+                        ema_warmup_frac=0.20,
+                        ema_rest_frac=0.10,
+                    ))
+        for lr in [0.010, 0.014]:
+            for ema_beta in [0.03, 0.06, 0.10]:
+                trials.append(TrialConfig(
+                    f"ema_muon_wsd_lr{lr:g}_wd0.001_b{ema_beta:g}_g0.995",
+                    "ema_muon",
+                    lr,
+                    lr_schedule="wsd",
+                    weight_decay=0.001,
+                    momentum=0.95,
+                    ema_beta=ema_beta,
+                    ema_gamma=0.995,
+                    ema_warmup_frac=0.20,
+                    ema_rest_frac=0.10,
+                ))
+        return trials
     if preset == "sfplus_combo20":
         trials = [
             TrialConfig(
@@ -1124,6 +1222,24 @@ def scheduled_lr(
     raise ValueError(f"unknown lr schedule {schedule!r}")
 
 
+def apply_scheduled_lrs(optimizer: torch.optim.Optimizer, scheduled_base_lr: float, config_base_lr: float) -> None:
+    """Apply the trainer schedule while preserving per-group LR ratios.
+
+    Root AnchorMuon uses a separate fallback group with ``fallback_lr``. Writing
+    the same absolute LR into every group erases that tuned ratio, so each group
+    keeps its construction-time LR as ``_bench_base_lr`` and receives the common
+    schedule factor.
+    """
+
+    if config_base_lr <= 0.0:
+        for group in optimizer.param_groups:
+            group["lr"] = scheduled_base_lr
+        return
+    for group in optimizer.param_groups:
+        group_base_lr = float(group.setdefault("_bench_base_lr", float(group.get("lr", config_base_lr))))
+        group["lr"] = scheduled_base_lr * group_base_lr / float(config_base_lr)
+
+
 class CifarMuown(torch.optim.Optimizer):
     """Muon with Muown's implicit row-magnitude parameterization.
 
@@ -1142,6 +1258,8 @@ class CifarMuown(torch.optim.Optimizer):
         betas: tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
         min_matrix_dim: int = 2,
+        fallback_lr_mult: float = 1.0,
+        mag_lr_mult: float = 1.0,
     ) -> None:
         groups: list[dict[str, Any]] = []
         for group in params:
@@ -1152,6 +1270,8 @@ class CifarMuown(torch.optim.Optimizer):
             copied.setdefault("betas", betas)
             copied.setdefault("eps", eps)
             copied.setdefault("min_matrix_dim", min_matrix_dim)
+            copied.setdefault("fallback_lr_mult", fallback_lr_mult)
+            copied.setdefault("mag_lr_mult", mag_lr_mult)
             copied.setdefault("_bench_base_lr", float(copied["lr"]))
             groups.append(copied)
         super().__init__(groups, {})
@@ -1219,12 +1339,13 @@ class CifarMuown(torch.optim.Optimizer):
 
         state["mag_step"] = int(state["mag_step"]) + 1
         mag_step = int(state["mag_step"])
+        mag_lr = lr * float(group.get("mag_lr_mult", 1.0))
         beta1, beta2 = group.get("betas", (0.9, 0.95))
         mag_exp_avg.mul_(float(beta1)).add_(grad_g, alpha=1.0 - float(beta1))
         mag_exp_avg_sq.mul_(float(beta2)).addcmul_(grad_g, grad_g, value=1.0 - float(beta2))
         m_hat = mag_exp_avg / max(1.0 - float(beta1) ** mag_step, 1e-16)
         v_hat = mag_exp_avg_sq / max(1.0 - float(beta2) ** mag_step, 1e-16)
-        g_mag.add_(m_hat / v_hat.sqrt().clamp_min(eps), alpha=-lr)
+        g_mag.add_(m_hat / v_hat.sqrt().clamp_min(eps), alpha=-mag_lr)
         g_mag.clamp_(min=eps)
 
         new_r_norm = hidden_r.norm(dim=1).clamp_min(eps)
@@ -1237,7 +1358,7 @@ class CifarMuown(torch.optim.Optimizer):
         p.copy_(w_new.reshape_as(p).to(p.dtype))
 
     def _step_adamw_param(self, p: torch.Tensor, group: dict[str, Any]) -> None:
-        lr = float(group["lr"])
+        lr = float(group["lr"]) * float(group.get("fallback_lr_mult", 1.0))
         wd = float(group.get("weight_decay", 0.0))
         beta1, beta2 = group.get("betas", (0.9, 0.95))
         eps = float(group.get("eps", 1e-8))
@@ -1332,6 +1453,14 @@ class EMANesterovOptimizer:
 
     @torch.no_grad()
     def step(self, closure: Any | None = None) -> Any:
+        # Gradients were computed at the lookahead weights. Restore the base
+        # weights before applying the base optimizer so the update is
+        # Nesterov-style x_{t+1} = x_t - lr * direction(grad(y_t)).
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state.get(p)
+                if state and state.get("lookahead_active", False):
+                    p.copy_(state["base_param"].to(p.dtype))
         loss = self.base_optimizer.step(closure=closure)
         for group in self.param_groups:
             for p in group["params"]:
@@ -1500,6 +1629,8 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             momentum=cfg.momentum,
             betas=(0.9, 0.95),
             min_matrix_dim=int(getattr(args, "anchor_min_matrix_dim", 2)),
+            fallback_lr_mult=cfg.fallback_lr_mult,
+            mag_lr_mult=cfg.muown_mag_lr_mult,
         )
     if cfg.optimizer == "ema_muown":
         base = CifarMuown(
@@ -1508,6 +1639,8 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             momentum=cfg.momentum,
             betas=(0.9, 0.95),
             min_matrix_dim=int(getattr(args, "anchor_min_matrix_dim", 2)),
+            fallback_lr_mult=cfg.fallback_lr_mult,
+            mag_lr_mult=cfg.muown_mag_lr_mult,
         )
         return EMANesterovOptimizer(
             base,
@@ -1756,8 +1889,7 @@ def run_worker(args: argparse.Namespace) -> None:
                         final_scale=args.lr_final_scale,
                         wsd_decay_frac=args.wsd_decay_frac,
                     )
-                    for group in optimizer.param_groups:
-                        group["lr"] = lr
+                    apply_scheduled_lrs(optimizer, lr, cfg.lr)
                 images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
                 targets = targets.to(device, non_blocking=True)
                 if args.sync_step_timing and torch.cuda.is_available():
@@ -1922,6 +2054,7 @@ def run_worker(args: argparse.Namespace) -> None:
         "ema_gamma": cfg.ema_gamma,
         "ema_warmup_frac": cfg.ema_warmup_frac,
         "ema_rest_frac": cfg.ema_rest_frac,
+        "muown_mag_lr_mult": cfg.muown_mag_lr_mult,
         "avg_step_ms": 1000.0 * total_train_seconds / max(global_step, 1),
         "overall_examples_per_sec": total_examples_seen / max(total_train_seconds, 1e-9),
         "elapsed_sec": time.perf_counter() - started,
@@ -2104,6 +2237,7 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
             ema_gamma=float(row.get("ema_gamma", 0.99)),
             ema_warmup_frac=float(row.get("ema_warmup_frac", 0.30)),
             ema_rest_frac=float(row.get("ema_rest_frac", 0.20)),
+            muown_mag_lr_mult=float(row.get("muown_mag_lr_mult", 1.0)),
         )
         fam = trial_family(cfg)
         current = by_family.get(fam)
@@ -2311,6 +2445,7 @@ def summaries_to_trials(rows: Iterable[dict]) -> list[TrialConfig]:
             ema_gamma=float(row.get("ema_gamma", 0.99)),
             ema_warmup_frac=float(row.get("ema_warmup_frac", 0.30)),
             ema_rest_frac=float(row.get("ema_rest_frac", 0.20)),
+            muown_mag_lr_mult=float(row.get("muown_mag_lr_mult", 1.0)),
         ))
     return trials
 
