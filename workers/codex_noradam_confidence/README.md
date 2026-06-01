@@ -45,6 +45,8 @@ commit b009f03 Compare NorMuon base against AdamW
 - `results/finewebedu_llm50m_muown_ema_20260601/`: 50M byte-level FineWeb-Edu
   comparison of Muown and EMA-Nesterov wrappers against AnchorMuon, Muon, AdamW,
   and AdamW-Atan2 controls.
+- `results/cifar10_muown_ema_20260601/`: CIFAR-10 transfer check for Muown and
+  EMA-Nesterov against the current AnchorMuon image-classification recipe.
 
 ## Main Result
 
@@ -108,6 +110,39 @@ EMA-Nesterov adds a small loss improvement on top of Muown, but it is slower
 because it keeps full-parameter EMA lookahead state. This is not a replacement
 for the CIFAR-10 AnchorMuon winner; it is evidence for the next language-model
 optimizer round.
+
+### CIFAR-10 Muown / EMA-Nesterov Transfer Check
+
+This follow-up tested the same Muown and EMA-Nesterov ideas in the established
+ViT-5 CIFAR-10 harness.
+
+Protocol: `vit5_micro`, CIFAR-10 45k/5k train/validation split, official
+10k test evaluated only at the end, batch size 512, seed `123`, BF16 autocast,
+channels-last tensors, 16 dataloader workers, two RTX PRO 6000 Blackwell GPUs
+scheduled one trial per GPU. HPO used 12 epochs; the best config per optimizer
+family was replayed for 50 epochs.
+
+| Rank | Family | Selected config | Final val acc | Official test acc | Final val loss | Test loss | Step | Throughput |
+|---:|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | AnchorMuon root | `lr=0.016`, WSD, `row_gamma=0.35`, `pmuon_beta=0.90`, `normuon_beta=0.93`, AdamAtan2 fallback at `0.5x` | 88.32% | 87.98% | 0.3787 | 0.4065 | 17.11 ms | 29.9k ex/s |
+| 2 | EMA-Nesterov + Muon | `lr=0.014`, `wd=0.001`, `ema_beta=0.1`, `ema_gamma=0.99` | 86.94% | 86.08% | 0.4754 | 0.5023 | 17.79 ms | 28.8k ex/s |
+| 3 | Plain Muon | `lr=0.014`, `wd=0.001`, GramNS | 86.72% | 85.40% | 0.5289 | 0.5582 | 17.08 ms | 30.0k ex/s |
+| 4 | Muown | `lr=0.012`, `wd=0`, WSD | 83.36% | 83.56% | 0.4845 | 0.4902 | 20.10 ms | 25.5k ex/s |
+| 5 | AdamW | `lr=0.004`, `wd=0.001`, cosine | 79.22% | 79.76% | 0.6158 | 0.6352 | 11.62 ms | 44.1k ex/s |
+| 6 | EMA-Nesterov + Muown | `lr=0.012`, `wd=0.001`, `ema_beta=0.1`, `ema_gamma=0.99` | 76.54% | 75.40% | 0.6649 | 0.6954 | 21.18 ms | 24.2k ex/s |
+
+Takeaway: Muown did not transfer to CIFAR-10 as well as it did to the
+byte-level LM proxy. The current root AnchorMuon image-classification recipe
+remains the best CIFAR option. EMA-Nesterov + Muon is stable and beats plain
+Muon on official test in this single-seed run, but it still trails AnchorMuon.
+EMA-Nesterov + Muown was unstable in no-weight-decay HPO runs and weak in the
+best stable final replay.
+
+Plots and full CSV:
+`results/cifar10_muown_ema_20260601/summary.md`,
+`results/cifar10_muown_ema_20260601/final_bins/val_acc.png`,
+`results/cifar10_muown_ema_20260601/final_bins/val_loss.png`, and
+`results/cifar10_muown_ema_20260601/final_bins/step_time_ms_bar.png`.
 
 ### ScheduleFree+ Combination Sweep
 

@@ -20,7 +20,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import torch
 from timm.models import create_model
@@ -83,6 +83,10 @@ class TrialConfig:
     sfplus_r: float = 0.0
     sfplus_weight_lr_power: float = 2.0
     external_lr: bool = False
+    ema_beta: float = 0.0
+    ema_gamma: float = 0.99
+    ema_warmup_frac: float = 0.30
+    ema_rest_frac: float = 0.20
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,6 +116,7 @@ def parse_args() -> argparse.Namespace:
             "cifar5_compare",
             "sfplus_combo20",
             "component_ablation",
+            "muown_ema_cifar10",
         ],
     )
     parser.add_argument("--only", default="", help="Regex filter for trial names")
@@ -191,6 +196,8 @@ def trial_grid(preset: str) -> list[TrialConfig]:
         TrialConfig("anchormuon_full_lr4e-3_rg0p20", "anchormuon", 4e-3),
         TrialConfig("anchormuon_no_soda_lr4e-3", "anchormuon", 4e-3, soda="none"),
         TrialConfig("anchormuon_no_pmuoneq_lr4e-3", "anchormuon", 4e-3, pmuon_eq=False),
+        TrialConfig("muown_lr1e-3_wd0", "muown", 1e-3, weight_decay=0.0, lr_schedule="wsd"),
+        TrialConfig("ema_muown_lr1e-3_wd0_b0.3", "ema_muown", 1e-3, weight_decay=0.0, lr_schedule="wsd", ema_beta=0.3),
     ]
     if preset == "smoke":
         return smoke
@@ -577,6 +584,88 @@ def trial_grid(preset: str) -> list[TrialConfig]:
                     external_lr=True,
                 ))
         return trials
+    if preset == "muown_ema_cifar10":
+        trials = [
+            TrialConfig("adamw_cosine_lr0.0035_wd0.001", "adamw", 3.5e-3, lr_schedule="cosine", weight_decay=0.001),
+            TrialConfig("adamw_cosine_lr0.004_wd0.001", "adamw", 4e-3, lr_schedule="cosine", weight_decay=0.001),
+            TrialConfig("adamw_cosine_lr0.0045_wd0.001", "adamw", 4.5e-3, lr_schedule="cosine", weight_decay=0.001),
+        ]
+        for lr in [0.012, 0.014, 0.016]:
+            trials.append(TrialConfig(
+                f"anchor_wsd_lr{lr:g}_flr0.5_atan2_rg0.35_pb0.9_nb0.93",
+                "root",
+                lr,
+                lr_schedule="wsd",
+                soda="all",
+                row_gamma=0.35,
+                pmuon_beta=0.90,
+                momentum=0.95,
+                normuon=True,
+                normuon_beta=0.93,
+                amuse=False,
+                root_grouping="named",
+                root_normuon_mode="row",
+                fallback_mode="atan2",
+                fallback_lr_mult=0.5,
+                fallback_beta1=0.90,
+                fallback_beta2=0.95,
+            ))
+        for lr in [0.010, 0.014, 0.018]:
+            for wd in [0.0, 0.001]:
+                trials.append(TrialConfig(
+                    f"muon_wsd_lr{lr:g}_wd{wd:g}",
+                    "anchormuon",
+                    lr,
+                    lr_schedule="wsd",
+                    weight_decay=wd,
+                    soda="none",
+                    pmuon_eq=False,
+                    use_gram=True,
+                    row_gamma=0.0,
+                    col_gamma=0.0,
+                    pmuon_beta=0.90,
+                    momentum=0.95,
+                    amuse=False,
+                    mimuon=False,
+                    normuon=False,
+                    external_lr=True,
+                ))
+        for lr in [0.008, 0.012, 0.016, 0.020]:
+            for wd in [0.0, 0.001, 0.005]:
+                trials.append(TrialConfig(
+                    f"muown_wsd_lr{lr:g}_wd{wd:g}",
+                    "muown",
+                    lr,
+                    lr_schedule="wsd",
+                    weight_decay=wd,
+                    momentum=0.95,
+                ))
+        for lr in [0.010, 0.014]:
+            for ema_beta in [0.1, 0.3]:
+                trials.append(TrialConfig(
+                    f"ema_muon_wsd_lr{lr:g}_wd0.001_b{ema_beta:g}_g0.99",
+                    "ema_muon",
+                    lr,
+                    lr_schedule="wsd",
+                    weight_decay=0.001,
+                    momentum=0.95,
+                    ema_beta=ema_beta,
+                    ema_gamma=0.99,
+                ))
+        for lr in [0.012, 0.016]:
+            for wd in [0.0, 0.001]:
+                for ema_beta in [0.1, 0.3]:
+                    trials.append(TrialConfig(
+                        f"ema_muown_wsd_lr{lr:g}_wd{wd:g}_b{ema_beta:g}_g0.99",
+                        "ema_muown",
+                        lr,
+                        lr_schedule="wsd",
+                        weight_decay=wd,
+                        momentum=0.95,
+                        ema_beta=ema_beta,
+                        ema_gamma=0.99,
+                    ))
+        return trials
     if preset == "sfplus_combo20":
         trials = [
             TrialConfig(
@@ -892,6 +981,8 @@ def trial_family(cfg: TrialConfig) -> str:
         return "previous_best_rms"
     if cfg.name.startswith("atan2_best_") or "_atan2_best_" in cfg.name:
         return "atan2_best"
+    if cfg.optimizer in {"muown", "ema_muon", "ema_muown"}:
+        return cfg.optimizer
     if cfg.optimizer == "root":
         return f"root_{cfg.root_grouping}_{cfg.root_normuon_mode}_{cfg.soda}"
     if cfg.optimizer == "golden":
@@ -1033,6 +1124,253 @@ def scheduled_lr(
     raise ValueError(f"unknown lr schedule {schedule!r}")
 
 
+class CifarMuown(torch.optim.Optimizer):
+    """Muon with Muown's implicit row-magnitude parameterization.
+
+    This is local to the CIFAR runner so the new paper idea can be compared
+    against the existing AnchorMuon baselines without changing root
+    ``optimizer.py``. Matrix-like parameters use the Muown update; vectors,
+    biases, and tiny tensors use an AdamW fallback with the group weight decay.
+    """
+
+    def __init__(
+        self,
+        params: Iterable[dict[str, Any]],
+        *,
+        lr: float,
+        momentum: float = 0.95,
+        betas: tuple[float, float] = (0.9, 0.95),
+        eps: float = 1e-8,
+        min_matrix_dim: int = 2,
+    ) -> None:
+        groups: list[dict[str, Any]] = []
+        for group in params:
+            copied = dict(group)
+            copied["params"] = list(group["params"])
+            copied.setdefault("lr", lr)
+            copied.setdefault("momentum", momentum)
+            copied.setdefault("betas", betas)
+            copied.setdefault("eps", eps)
+            copied.setdefault("min_matrix_dim", min_matrix_dim)
+            copied.setdefault("_bench_base_lr", float(copied["lr"]))
+            groups.append(copied)
+        super().__init__(groups, {})
+        self._orthogonalizer = root_optimizer.GramNewtonSchulz()
+
+    @torch.no_grad()
+    def step(self, closure: Any | None = None) -> Any:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                if p.grad.is_sparse:
+                    raise RuntimeError("CifarMuown does not support sparse gradients")
+                if root_optimizer._is_matrix_like_parameter(
+                    p,
+                    min_matrix_dim=int(group.get("min_matrix_dim", 2)),
+                ):
+                    self._step_matrix_param(p, group)
+                else:
+                    self._step_adamw_param(p, group)
+        return loss
+
+    def _step_matrix_param(self, p: torch.Tensor, group: dict[str, Any]) -> None:
+        lr = float(group["lr"])
+        wd = float(group.get("weight_decay", 0.0))
+        beta = float(group["momentum"])
+        eps = float(group.get("eps", 1e-8))
+        w = root_optimizer._matrix_view(p.detach()).to(torch.float32)
+        grad_w = root_optimizer._matrix_view(p.grad.detach()).to(torch.float32)
+        rows, cols = w.shape
+        state = self.state[p]
+        row_norm = w.norm(dim=1).clamp_min(eps)
+
+        if "g_mag" not in state or tuple(state["g_mag"].shape) != (rows,):
+            state["g_mag"] = row_norm.clone()
+            state["r_norm"] = row_norm.clone()
+            state["momentum_buffer"] = torch.zeros_like(w, dtype=torch.float32)
+            state["mag_exp_avg"] = torch.zeros_like(row_norm, dtype=torch.float32)
+            state["mag_exp_avg_sq"] = torch.zeros_like(row_norm, dtype=torch.float32)
+            state["mag_step"] = 0
+
+        g_mag = state["g_mag"]
+        r_norm = state["r_norm"]
+        momentum = state["momentum_buffer"]
+        mag_exp_avg = state["mag_exp_avg"]
+        mag_exp_avg_sq = state["mag_exp_avg_sq"]
+
+        safe_g = g_mag.clamp_min(eps)
+        safe_r = r_norm.clamp_min(eps)
+        hidden_r = w * (safe_r / safe_g).unsqueeze(1)
+        direction = hidden_r / safe_r.unsqueeze(1)
+        radial = (grad_w * direction).sum(dim=1, keepdim=True)
+        grad_g = radial.squeeze(1)
+        grad_hidden_r = (safe_g / safe_r).unsqueeze(1) * (grad_w - radial * direction)
+
+        momentum.lerp_(grad_hidden_r, 1.0 - beta)
+        source = torch.lerp(grad_hidden_r, momentum, beta)
+        update = self._orthogonalizer(source)
+        update = update * (0.2 * math.sqrt(max(rows, cols)))
+        hidden_r.add_(update, alpha=-lr)
+
+        state["mag_step"] = int(state["mag_step"]) + 1
+        mag_step = int(state["mag_step"])
+        beta1, beta2 = group.get("betas", (0.9, 0.95))
+        mag_exp_avg.mul_(float(beta1)).add_(grad_g, alpha=1.0 - float(beta1))
+        mag_exp_avg_sq.mul_(float(beta2)).addcmul_(grad_g, grad_g, value=1.0 - float(beta2))
+        m_hat = mag_exp_avg / max(1.0 - float(beta1) ** mag_step, 1e-16)
+        v_hat = mag_exp_avg_sq / max(1.0 - float(beta2) ** mag_step, 1e-16)
+        g_mag.add_(m_hat / v_hat.sqrt().clamp_min(eps), alpha=-lr)
+        g_mag.clamp_(min=eps)
+
+        new_r_norm = hidden_r.norm(dim=1).clamp_min(eps)
+        w_new = hidden_r * (g_mag / new_r_norm).unsqueeze(1)
+        if wd:
+            w_new.mul_(1.0 - lr * wd)
+            new_r_norm = w_new.norm(dim=1).clamp_min(eps)
+            g_mag.copy_(new_r_norm)
+        r_norm.copy_(new_r_norm)
+        p.copy_(w_new.reshape_as(p).to(p.dtype))
+
+    def _step_adamw_param(self, p: torch.Tensor, group: dict[str, Any]) -> None:
+        lr = float(group["lr"])
+        wd = float(group.get("weight_decay", 0.0))
+        beta1, beta2 = group.get("betas", (0.9, 0.95))
+        eps = float(group.get("eps", 1e-8))
+        if wd:
+            p.mul_(1.0 - lr * wd)
+        grad = p.grad.detach().to(torch.float32)
+        state = self.state[p]
+        if "exp_avg" not in state or state["exp_avg"].shape != p.shape:
+            state["step"] = 0
+            state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+            state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+        state["step"] = int(state["step"]) + 1
+        exp_avg = state["exp_avg"]
+        exp_avg_sq = state["exp_avg_sq"]
+        exp_avg.mul_(float(beta1)).add_(grad, alpha=1.0 - float(beta1))
+        exp_avg_sq.mul_(float(beta2)).addcmul_(grad, grad, value=1.0 - float(beta2))
+        step = int(state["step"])
+        m_hat = exp_avg / max(1.0 - float(beta1) ** step, 1e-16)
+        v_hat = exp_avg_sq / max(1.0 - float(beta2) ** step, 1e-16)
+        p.add_((m_hat / v_hat.sqrt().add_(eps)).to(p.dtype), alpha=-lr)
+
+
+class EMANesterovOptimizer:
+    """EMA-Nesterov lookahead wrapper for the CIFAR training loop.
+
+    The runner calls ``zero_grad`` immediately before the forward pass. That is
+    where this wrapper evaluates gradients at y_t = x_t + beta_t * ema_delta.
+    ``step`` then leaves parameters at x_{t+1} and updates the EMA direction.
+    """
+
+    def __init__(
+        self,
+        base_optimizer: torch.optim.Optimizer,
+        *,
+        total_steps: int,
+        beta: float,
+        gamma: float,
+        warmup_frac: float,
+        rest_frac: float,
+    ) -> None:
+        self.base_optimizer = base_optimizer
+        self.param_groups = base_optimizer.param_groups
+        for group in self.param_groups:
+            group.setdefault("_bench_base_lr", float(group.get("lr", 1.0)))
+        self.state: dict[torch.Tensor, dict[str, Any]] = {}
+        self.total_steps = int(total_steps)
+        self.beta = float(beta)
+        self.gamma = float(gamma)
+        self.warmup_steps = int(round(self.total_steps * float(warmup_frac)))
+        self.rest_start = int(round(self.total_steps * max(0.0, 1.0 - float(rest_frac))))
+        self.step_index = 0
+
+    def _beta_t(self) -> float:
+        if self.beta <= 0.0:
+            return 0.0
+        if self.step_index < self.warmup_steps:
+            return 0.0
+        if self.step_index >= self.rest_start:
+            return 0.0
+        return self.beta
+
+    def _beta_t_for_group(self, group: dict[str, Any]) -> float:
+        beta_t = self._beta_t()
+        if not beta_t:
+            return 0.0
+        base_lr = float(group.get("_bench_base_lr", group.get("lr", 1.0)))
+        if base_lr <= 0.0:
+            return beta_t
+        return beta_t * float(group.get("lr", base_lr)) / base_lr
+
+    @torch.no_grad()
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        self.base_optimizer.zero_grad(set_to_none=set_to_none)
+        for group in self.param_groups:
+            beta_t = self._beta_t_for_group(group)
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                state = self.state.setdefault(p, {})
+                if state.pop("lookahead_active", False):
+                    p.copy_(state["base_param"].to(p.dtype))
+                base_param = state.get("base_param")
+                if base_param is None or base_param.shape != p.shape:
+                    base_param = state["base_param"] = torch.empty_like(p, dtype=torch.float32)
+                base_param.copy_(p.detach().to(torch.float32))
+                ema_delta = state.get("ema_delta")
+                if ema_delta is None or ema_delta.shape != p.shape:
+                    ema_delta = state["ema_delta"] = torch.zeros_like(p, dtype=torch.float32)
+                if beta_t:
+                    p.add_(ema_delta.to(p.dtype), alpha=beta_t)
+                state["lookahead_active"] = True
+
+    @torch.no_grad()
+    def step(self, closure: Any | None = None) -> Any:
+        loss = self.base_optimizer.step(closure=closure)
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state.get(p)
+                if not state or not state.get("lookahead_active", False):
+                    continue
+                base = state["base_param"]
+                delta = p.detach().to(torch.float32) - base
+                state["ema_delta"].mul_(self.gamma).add_(delta, alpha=1.0 - self.gamma)
+                state["lookahead_active"] = False
+        self.step_index += 1
+        return loss
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "base_optimizer": self.base_optimizer.state_dict(),
+            "state": self.state,
+            "step_index": self.step_index,
+            "total_steps": self.total_steps,
+            "beta": self.beta,
+            "gamma": self.gamma,
+            "warmup_steps": self.warmup_steps,
+            "rest_start": self.rest_start,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.base_optimizer.load_state_dict(state_dict["base_optimizer"])
+        self.state = state_dict.get("state", {})
+        self.step_index = int(state_dict.get("step_index", 0))
+
+    def train(self) -> None:
+        if hasattr(self.base_optimizer, "train"):
+            self.base_optimizer.train()
+
+    def eval(self) -> None:
+        if hasattr(self.base_optimizer, "eval"):
+            self.base_optimizer.eval()
+
+
 class RootAnchorMuonOrientation(root_optimizer.AnchorMuon):
     """Trainer-side root optimizer adapter for the NorMuon orientation ablation.
 
@@ -1155,6 +1493,58 @@ def root_anchor_param_groups(model: nn.Module, cfg: TrialConfig) -> list[dict]:
 def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace) -> torch.optim.Optimizer:
     if cfg.optimizer == "adamw":
         return torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.999))
+    if cfg.optimizer == "muown":
+        return CifarMuown(
+            _anchor_param_groups(model, cfg.weight_decay),
+            lr=cfg.lr,
+            momentum=cfg.momentum,
+            betas=(0.9, 0.95),
+            min_matrix_dim=int(getattr(args, "anchor_min_matrix_dim", 2)),
+        )
+    if cfg.optimizer == "ema_muown":
+        base = CifarMuown(
+            _anchor_param_groups(model, cfg.weight_decay),
+            lr=cfg.lr,
+            momentum=cfg.momentum,
+            betas=(0.9, 0.95),
+            min_matrix_dim=int(getattr(args, "anchor_min_matrix_dim", 2)),
+        )
+        return EMANesterovOptimizer(
+            base,
+            total_steps=int(getattr(args, "total_steps_for_optimizer", args.epochs)),
+            beta=cfg.ema_beta,
+            gamma=cfg.ema_gamma,
+            warmup_frac=cfg.ema_warmup_frac,
+            rest_frac=cfg.ema_rest_frac,
+        )
+    if cfg.optimizer == "ema_muon":
+        base = AnchorMuon(
+            _anchor_param_groups(model, cfg.weight_decay),
+            lr=cfg.lr,
+            warmup_steps=args.warmup_steps,
+            use_external_lr=True,
+            weight_decay=cfg.weight_decay,
+            soda="none",
+            pmuon_eq=False,
+            use_gram=True,
+            row_gamma=0.0,
+            col_gamma=0.0,
+            pmuon_beta=cfg.pmuon_beta,
+            momentum=cfg.momentum,
+            amuse=False,
+            mimuon=False,
+            normuon=False,
+        )
+        for group in base.param_groups:
+            group.setdefault("_bench_base_lr", float(group.get("lr", cfg.lr)))
+        return EMANesterovOptimizer(
+            base,
+            total_steps=int(getattr(args, "total_steps_for_optimizer", args.epochs)),
+            beta=cfg.ema_beta,
+            gamma=cfg.ema_gamma,
+            warmup_frac=cfg.ema_warmup_frac,
+            rest_frac=cfg.ema_rest_frac,
+        )
     if cfg.optimizer == "anchormuon":
         return AnchorMuon(
             _anchor_param_groups(model, cfg.weight_decay),
@@ -1320,6 +1710,7 @@ def run_worker(args: argparse.Namespace) -> None:
     total_steps = args.epochs * len(train_loader)
     if args.max_steps > 0:
         total_steps = min(total_steps, int(args.max_steps))
+    args.total_steps_for_optimizer = total_steps
     if cfg.optimizer == "sfplus":
         if cfg.sfplus_c_warmup_enabled and cfg.sfplus_c_warmup <= 0:
             cfg.sfplus_c_warmup = int(args.warmup_steps)
@@ -1355,7 +1746,7 @@ def run_worker(args: argparse.Namespace) -> None:
             for batch_idx, (images, targets) in enumerate(train_loader):
                 if global_step >= total_steps:
                     break
-                if cfg.optimizer in {"adamw", "root"} or cfg.external_lr:
+                if cfg.optimizer in {"adamw", "root", "muown", "ema_muon", "ema_muown"} or cfg.external_lr:
                     lr = scheduled_lr(
                         global_step,
                         total_steps,
@@ -1527,6 +1918,10 @@ def run_worker(args: argparse.Namespace) -> None:
         "sfplus_r": cfg.sfplus_r,
         "sfplus_weight_lr_power": cfg.sfplus_weight_lr_power,
         "external_lr": cfg.external_lr,
+        "ema_beta": cfg.ema_beta,
+        "ema_gamma": cfg.ema_gamma,
+        "ema_warmup_frac": cfg.ema_warmup_frac,
+        "ema_rest_frac": cfg.ema_rest_frac,
         "avg_step_ms": 1000.0 * total_train_seconds / max(global_step, 1),
         "overall_examples_per_sec": total_examples_seen / max(total_train_seconds, 1e-9),
         "elapsed_sec": time.perf_counter() - started,
@@ -1705,6 +2100,10 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
             sfplus_r=float(row.get("sfplus_r", 0.0)),
             sfplus_weight_lr_power=float(row.get("sfplus_weight_lr_power", 2.0)),
             external_lr=parse_bool(row.get("external_lr", False)),
+            ema_beta=float(row.get("ema_beta", 0.0)),
+            ema_gamma=float(row.get("ema_gamma", 0.99)),
+            ema_warmup_frac=float(row.get("ema_warmup_frac", 0.30)),
+            ema_rest_frac=float(row.get("ema_rest_frac", 0.20)),
         )
         fam = trial_family(cfg)
         current = by_family.get(fam)
@@ -1743,6 +2142,14 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
                     return f"AnchorMuon {mode} fallback{seed_suffix}"
                 if trial.startswith("plain_muon_"):
                     return f"Plain Muon{seed_suffix}"
+                if trial.startswith("muon_"):
+                    return f"Plain Muon{seed_suffix}"
+                if trial.startswith("muown_"):
+                    return f"Muown{seed_suffix}"
+                if trial.startswith("ema_muon_"):
+                    return f"EMA-Nesterov Muon{seed_suffix}"
+                if trial.startswith("ema_muown_"):
+                    return f"EMA-Nesterov Muown{seed_suffix}"
                 if trial.startswith("previous_best_rms_"):
                     return f"Previous best RMS{seed_suffix}"
                 if trial.startswith("atan2_best_"):
@@ -1900,6 +2307,10 @@ def summaries_to_trials(rows: Iterable[dict]) -> list[TrialConfig]:
             sfplus_r=float(row.get("sfplus_r", 0.0)),
             sfplus_weight_lr_power=float(row.get("sfplus_weight_lr_power", 2.0)),
             external_lr=parse_bool(row.get("external_lr", False)),
+            ema_beta=float(row.get("ema_beta", 0.0)),
+            ema_gamma=float(row.get("ema_gamma", 0.99)),
+            ema_warmup_frac=float(row.get("ema_warmup_frac", 0.30)),
+            ema_rest_frac=float(row.get("ema_rest_frac", 0.20)),
         ))
     return trials
 
