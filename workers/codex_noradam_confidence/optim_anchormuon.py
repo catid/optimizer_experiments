@@ -75,11 +75,18 @@ def _as_float(x: Tensor) -> Tensor:
     return x.detach().float()
 
 
+def _effective_matrix_shape(x: Tensor) -> tuple[int, ...]:
+    return tuple(int(dim) for dim in x.shape if int(dim) > 1)
+
+
 def _matrix_view(x: Tensor) -> tuple[Tensor, tuple[int, ...]]:
-    if x.ndim < 2:
-        raise ValueError("matrix view requires a tensor with ndim >= 2")
+    effective_shape = _effective_matrix_shape(x)
+    if len(effective_shape) < 2:
+        raise ValueError("matrix view requires at least two non-singleton dimensions")
     shape = tuple(x.shape)
-    return x.reshape(x.shape[0], -1), shape
+    rows = effective_shape[0]
+    cols = math.prod(effective_shape[1:])
+    return x.reshape(rows, cols), shape
 
 
 def _restore_matrix_view(x: Tensor, shape: tuple[int, ...]) -> Tensor:
@@ -452,11 +459,12 @@ class AnchorMuon(torch.optim.Optimizer):
 
     def _use_muon_for_param(self, group: dict[str, Any], param: Tensor) -> bool:
         if "use_muon" in group:
-            return bool(group["use_muon"])
-        if param.ndim < 2:
+            return bool(group["use_muon"]) and len(_effective_matrix_shape(param)) >= 2
+        effective_shape = _effective_matrix_shape(param)
+        if len(effective_shape) < 2:
             return False
-        rows = int(param.shape[0])
-        cols = int(param.numel() // max(rows, 1))
+        rows = effective_shape[0]
+        cols = math.prod(effective_shape[1:])
         return min(rows, cols) >= int(group["min_matrix_dim"])
 
     def _soda_for_param(self, group: dict[str, Any], *, use_muon: bool) -> bool:

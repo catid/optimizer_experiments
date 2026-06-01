@@ -510,6 +510,7 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
             scale = lr_scale(step, trial.steps, trial.warmup_steps, trial.final_lr_scale, trial.wsd_decay_frac)
             for group in optimizer.param_groups:
                 group["lr"] = float(group.get("_bench_base_lr", trial.lr)) * scale
+            actual_lrs = [float(group["lr"]) for group in optimizer.param_groups]
             x, y = train_stream.batch(batch_size=args.batch_size, block_size=args.block_size, generator=train_gen)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -529,7 +530,9 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
                     "step": step,
                     "phase": "train",
                     "train_loss": last_loss,
-                    "lr": trial.lr * scale,
+                    "lr": actual_lrs[0],
+                    "lr_min": min(actual_lrs),
+                    "lr_max": max(actual_lrs),
                     "step_time_ms": elapsed * 1000.0,
                     "tokens_per_sec": args.batch_size * args.block_size / max(elapsed, 1e-9),
                 }
@@ -549,7 +552,9 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
                     "train_loss": last_loss,
                     "val_loss": val_loss,
                     "val_acc": val_acc,
-                    "lr": trial.lr * scale,
+                    "lr": actual_lrs[0],
+                    "lr_min": min(actual_lrs),
+                    "lr_max": max(actual_lrs),
                     "mean_step_time_ms": float(np.mean(step_times[-max(1, min(len(step_times), trial.eval_every)) :])) * 1000.0,
                     "tokens_per_sec": args.batch_size * args.block_size / max(float(np.mean(step_times[-max(1, min(len(step_times), trial.eval_every)) :])), 1e-9),
                 }
@@ -582,8 +587,8 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
 def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
     if args.preset == "smoke":
         return [
-            TrialConfig("smoke_adamw", "adamw", 1e-3, steps=4, eval_every=2),
-            TrialConfig("smoke_anchor", "anchormuon", 4e-3, steps=4, eval_every=2),
+            TrialConfig("smoke_adamw", "adamw", 1e-3, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_anchor", "anchormuon", 4e-3, steps=4, eval_every=2, warmup_steps=1),
         ]
     trials: list[TrialConfig] = []
     for lr in (5.0e-4, 1.0e-3, 1.5e-3, 2.0e-3):
@@ -618,6 +623,8 @@ def final_trials_from_hpo(args: argparse.Namespace, hpo_rows: list[dict[str, Any
     trials: list[TrialConfig] = []
     eval_every = max(1, args.final_steps // max(args.eval_bins, 1))
     for family in ("anchormuon", "adamw", "adamatan2", "muon"):
+        if family not in best:
+            continue
         row = best[family]
         cfg = TrialConfig(
             name=f"final_{row['name']}",

@@ -140,10 +140,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--val-source",
         choices=["test", "train_split"],
-        default="test",
+        default="train_split",
         help=(
-            "Validation source. Historical runs use CIFAR-10 train=False as validation. "
-            "Use train_split for HPO and reserve train=False for final test evaluation."
+            "Validation source. Use train_split for HPO/model selection and reserve "
+            "CIFAR-10 train=False for final test evaluation via --eval-test."
         ),
     )
     parser.add_argument(
@@ -190,6 +190,16 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(sync_step_timing=True)
     parser.add_argument("--no-plots", action="store_true")
     return parser.parse_args()
+
+
+def validate_experiment_args(args: argparse.Namespace) -> None:
+    if args.val_source == "test" and args.eval_test:
+        raise ValueError("--val-source=test cannot be combined with --eval-test; validation would overlap test")
+    if not args.worker and args.val_source == "test":
+        raise ValueError(
+            "--val-source=test is not allowed for supervisor/HPO runs. "
+            "Use --val-source=train_split and reserve the official test split for --eval-test."
+        )
 
 
 def trial_grid(preset: str) -> list[TrialConfig]:
@@ -1149,14 +1159,14 @@ def cifar10_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, D
         train_ds = train_full
         val_ds = test_full
         if 0 < args.train_subset < len(train_ds):
-            subset_gen = torch.Generator().manual_seed(int(args.seed))
+            subset_gen = torch.Generator().manual_seed(int(args.split_seed))
             train_indices = torch.randperm(len(train_ds), generator=subset_gen)[: args.train_subset].tolist()
             train_ds = Subset(train_ds, train_indices)
         if 0 < args.val_subset < len(val_ds):
             val_ds = Subset(val_ds, list(range(args.val_subset)))
         dataset_info = {
             "val_source": "test",
-            "split_seed": int(args.seed),
+            "split_seed": int(args.split_seed),
             "train_val_size": 0,
             "train_examples": len(train_ds),
             "val_examples": len(val_ds),
@@ -1238,6 +1248,14 @@ def apply_scheduled_lrs(optimizer: torch.optim.Optimizer, scheduled_base_lr: flo
     for group in optimizer.param_groups:
         group_base_lr = float(group.setdefault("_bench_base_lr", float(group.get("lr", config_base_lr))))
         group["lr"] = scheduled_base_lr * group_base_lr / float(config_base_lr)
+
+
+def trainer_owns_lr_schedule(cfg: TrialConfig) -> bool:
+    if cfg.external_lr:
+        return True
+    if cfg.optimizer in {"adamw", "root", "muown", "ema_muon", "ema_muown"}:
+        return True
+    return cfg.lr_schedule != "constant"
 
 
 class CifarMuown(torch.optim.Optimizer):
@@ -1683,7 +1701,7 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             _anchor_param_groups(model, cfg.weight_decay),
             lr=cfg.lr,
             warmup_steps=args.warmup_steps,
-            use_external_lr=cfg.external_lr,
+            use_external_lr=trainer_owns_lr_schedule(cfg),
             weight_decay=cfg.weight_decay,
             soda=cfg.soda,
             pmuon_eq=cfg.pmuon_eq,
@@ -1767,6 +1785,7 @@ def make_optimizer(model: nn.Module, cfg: TrialConfig, args: argparse.Namespace)
             _anchor_param_groups(model, cfg.weight_decay),
             lr=cfg.lr,
             warmup_steps=args.warmup_steps,
+            use_external_lr=trainer_owns_lr_schedule(cfg),
             momentum=cfg.momentum,
             pmuoneq_beta=cfg.pmuon_beta,
             row_gamma=cfg.row_gamma,
@@ -1824,6 +1843,12 @@ def evaluate(model: nn.Module, optimizer: torch.optim.Optimizer, loader: DataLoa
     return loss_sum / max(total, 1), 100.0 * correct / max(total, 1)
 
 
+def final_epoch_row_or_raise(epoch_rows: list[dict[str, float | int | str]]) -> dict[str, float | int | str]:
+    if not epoch_rows:
+        raise RuntimeError("No training epoch completed; check --epochs, --max-steps, and dataloader size")
+    return dict(epoch_rows[-1])
+
+
 def run_worker(args: argparse.Namespace) -> None:
     assert args.trial_json is not None
     if not torch.cuda.is_available():
@@ -1879,7 +1904,7 @@ def run_worker(args: argparse.Namespace) -> None:
             for batch_idx, (images, targets) in enumerate(train_loader):
                 if global_step >= total_steps:
                     break
-                if cfg.optimizer in {"adamw", "root", "muown", "ema_muon", "ema_muown"} or cfg.external_lr:
+                if trainer_owns_lr_schedule(cfg):
                     lr = scheduled_lr(
                         global_step,
                         total_steps,
@@ -1999,7 +2024,7 @@ def run_worker(args: argparse.Namespace) -> None:
             if global_step >= total_steps:
                 break
 
-    final = dict(epoch_rows[-1])
+    final = final_epoch_row_or_raise(epoch_rows)
     if args.eval_test:
         if test_loader is None:
             raise RuntimeError("--eval-test was requested but no test loader was constructed")
@@ -2191,7 +2216,7 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
         writer.writerows(summaries)
     best = max(summaries, key=lambda row: (float(row["best_val_acc"]), -float(row["best_val_loss"])))
     (output_dir / "best_run.json").write_text(json.dumps(best, indent=2) + "\n")
-    by_family: dict[str, dict] = {}
+    by_family_candidates: dict[str, dict[str, dict[str, Any]]] = {}
     for row in summaries:
         cfg = TrialConfig(
             name=row["trial"],
@@ -2240,13 +2265,52 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
             muown_mag_lr_mult=float(row.get("muown_mag_lr_mult", 1.0)),
         )
         fam = trial_family(cfg)
-        current = by_family.get(fam)
-        if current is None or (
-            float(row["best_val_acc"]), -float(row["best_val_loss"])
-        ) > (
-            float(current["best_val_acc"]), -float(current["best_val_loss"])
-        ):
-            by_family[fam] = row
+        seedless_cfg = TrialConfig(**asdict(cfg))
+        seedless_cfg.name = re.sub(r"_seed\d+$", "", seedless_cfg.name)
+        seedless_cfg.seed = None
+        key = json.dumps(asdict(seedless_cfg), sort_keys=True)
+        family_candidates = by_family_candidates.setdefault(fam, {})
+        candidate = family_candidates.setdefault(key, {"cfg": seedless_cfg, "rows": []})
+        candidate["rows"].append(row)
+
+    by_family: dict[str, dict] = {}
+    for fam, candidates in by_family_candidates.items():
+        best_candidate: dict[str, Any] | None = None
+        best_score: tuple[float, float, int] | None = None
+        for candidate in candidates.values():
+            rows = candidate["rows"]
+            acc_values = [float(row["best_val_acc"]) for row in rows]
+            loss_values = [float(row["best_val_loss"]) for row in rows]
+            mean_acc = sum(acc_values) / len(acc_values)
+            mean_loss = sum(loss_values) / len(loss_values)
+            score = (mean_acc, -mean_loss, len(rows))
+            if best_score is None or score > best_score:
+                best_candidate = candidate
+                best_score = score
+        if best_candidate is None:
+            continue
+        rows = best_candidate["rows"]
+        cfg = best_candidate["cfg"]
+        acc_values = [float(row["best_val_acc"]) for row in rows]
+        loss_values = [float(row["best_val_loss"]) for row in rows]
+        mean_acc = sum(acc_values) / len(acc_values)
+        mean_loss = sum(loss_values) / len(loss_values)
+        acc_std = math.sqrt(sum((value - mean_acc) ** 2 for value in acc_values) / len(acc_values))
+        loss_std = math.sqrt(sum((value - mean_loss) ** 2 for value in loss_values) / len(loss_values))
+        selected = dict(rows[0])
+        selected.update(
+            {
+                "trial": cfg.name,
+                "seed": "",
+                "hpo_selected_by": "mean_over_seeds",
+                "hpo_seed_count": len(rows),
+                "hpo_best_val_acc_mean": mean_acc,
+                "hpo_best_val_acc_std": acc_std,
+                "hpo_best_val_loss_mean": mean_loss,
+                "hpo_best_val_loss_std": loss_std,
+            }
+        )
+        by_family[fam] = selected
     (output_dir / "best_by_family.json").write_text(json.dumps(by_family, indent=2) + "\n")
     if make_plots:
         try:
@@ -2452,6 +2516,7 @@ def summaries_to_trials(rows: Iterable[dict]) -> list[TrialConfig]:
 
 def main() -> None:
     args = parse_args()
+    validate_experiment_args(args)
     if args.worker:
         run_worker(args)
         return

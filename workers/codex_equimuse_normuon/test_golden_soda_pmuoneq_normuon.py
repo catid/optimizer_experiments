@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import sys
 from io import BytesIO
+from pathlib import Path
 
 import torch
+
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) in sys.path:
+    sys.path.remove(str(ROOT))
+sys.path.insert(0, str(ROOT))
+for module_name in ("direct_soda_pmuoneq_normuon", "golden_soda_pmuoneq_normuon"):
+    sys.modules.pop(module_name, None)
 
 from direct_soda_pmuoneq_normuon import (
     SodaPmuonEqNorMuon,
@@ -56,6 +65,54 @@ def test_golden_param_group_helper_excludes_lm_sensitive_params() -> None:
     assert {id(p) for p in groups[1]["params"]} == {id(embed), id(lm_head), id(norm)}
     assert groups[0]["col_gamma"] == 0.05
     assert "normuon_aspect_scale" not in groups[0]
+
+
+def test_matrix_group_vector_fallback_uses_configured_defaults() -> None:
+    vector = torch.nn.Parameter(torch.ones(5))
+    opt = GoldenSodaPmuonEqNorMuon(
+        [{"params": [vector], "use_matrix_update": True}],
+        eps=1e-4,
+        fallback_beta2=0.8,
+        fallback_weight_decay=0.2,
+        warmup_steps=1,
+    )
+
+    group = opt.param_groups[0]
+    assert group["fallback_beta2"] == 0.8
+    assert group["eps"] == 1e-4
+    assert group["weight_decay"] == 0.2
+
+    vector.grad = torch.full_like(vector, 0.1)
+    opt.step()
+
+    assert torch.isfinite(vector).all()
+    assert opt.state[vector]["exp_avg_sq"].dtype == torch.float32
+
+
+def test_direct_optimizer_deduplicates_shared_parameters() -> None:
+    shared = torch.nn.Parameter(torch.ones(4, 4))
+    vector = torch.nn.Parameter(torch.ones(4))
+
+    opt = SodaPmuonEqNorMuon([shared, shared, vector, vector], warmup_steps=1)
+    params = [p for group in opt.param_groups for p in group["params"]]
+
+    assert sum(p is shared for p in params) == 1
+    assert sum(p is vector for p in params) == 1
+
+
+def test_direct_param_group_builder_deduplicates_tied_weights() -> None:
+    shared = torch.nn.Parameter(torch.ones(4, 4))
+    vector = torch.nn.Parameter(torch.ones(4))
+    groups = build_soda_pmuoneq_normuon_param_groups([
+        ("embed.weight", shared),
+        ("lm_head.weight", shared),
+        ("norm.weight", vector),
+        ("norm_alias.weight", vector),
+    ])
+    params = [p for group in groups for p in group["params"]]
+
+    assert sum(p is shared for p in params) == 1
+    assert sum(p is vector for p in params) == 1
 
 
 def test_golden_matches_direct_best_result_configuration() -> None:

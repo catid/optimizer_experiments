@@ -7,8 +7,11 @@ from pathlib import Path
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+if str(ROOT) in sys.path:
+    sys.path.remove(str(ROOT))
+sys.path.insert(0, str(ROOT))
+for module_name in ("golden_soda_pmuoneq_normuon", "optim_anchormuon"):
+    sys.modules.pop(module_name, None)
 
 from golden_soda_pmuoneq_normuon import (  # noqa: E402
     GoldenSodaPmuonEqNorMuon,

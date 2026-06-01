@@ -45,6 +45,9 @@ commit b009f03 Compare NorMuon base against AdamW
 - `results/finewebedu_llm50m_muown_ema_20260601/`: 50M byte-level FineWeb-Edu
   comparison of Muown and EMA-Nesterov wrappers against AnchorMuon, Muon, AdamW,
   and AdamW-Atan2 controls.
+- `results/fineweb_gpt2_llm50m_anchormuown_20260601/`: 51M GPT-2-tokenized
+  FineWeb-Edu comparison of Muown, EMA-Nesterov, AnchorMuon, AnchorMuown,
+  Muon, AdamW, and AdamW-Atan2 controls.
 - `results/cifar10_muown_ema_20260601/`: CIFAR-10 transfer check for Muown and
   EMA-Nesterov against the current AnchorMuon image-classification recipe.
 
@@ -110,6 +113,40 @@ EMA-Nesterov adds a small loss improvement on top of Muown, but it is slower
 because it keeps full-parameter EMA lookahead state. This is not a replacement
 for the CIFAR-10 AnchorMuon winner; it is evidence for the next language-model
 optimizer round.
+
+### FineWeb-Edu GPT-2 Tokenized Muown / EMA / AnchorMuown Result
+
+This follow-up uses the stronger tokenizer path rather than byte-level text:
+GPT-2 tokenizer, `51,045,888`-parameter GPT, `8,000,000` train tokens,
+`524,288` validation tokens, batch `16 x 256`, BF16, WSD with 100-step warmup,
+sequential validation, 128 final validation batches, 600-step HPO, and 3K-step
+final replay. Two RTX PRO 6000 Blackwell GPUs were used one trial per GPU.
+
+| Rank | Optimizer | Selected config | Final val loss | Final token acc | Step | Throughput |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | EMA-Nesterov + Muon | `lr=0.0014`, `wd=0.05`, `ema_beta=0.1`, `ema_gamma=0.995` | 5.0625 | 23.07% | 23.31 ms | 175.7k tok/s |
+| 2 | Plain Muon | `lr=0.0014`, `wd=0.05` | 5.0640 | 22.96% | 21.36 ms | 191.8k tok/s |
+| 3 | Muown | `lr=0.0016`, `wd=0` | 5.1104 | 23.17% | 24.93 ms | 164.3k tok/s |
+| 4 | EMA-Nesterov + Muown | `lr=0.0016`, `wd=0`, `ema_beta=0.3`, `ema_gamma=0.99` | 5.1117 | 23.24% | 27.07 ms | 151.3k tok/s |
+| 5 | AnchorMuon | `lr=0.0014`, `row_gamma=0.25`, `soda=0.001`, `fallback=RMS@1.0x` | 5.1557 | 23.44% | 20.15 ms | 203.2k tok/s |
+| 6 | EMA-Nesterov + AnchorMuon | `lr=0.0014`, `row_gamma=0.45`, `soda=0.003`, `ema_beta=0.5`, `ema_gamma=0.995` | 5.1560 | 23.40% | 22.15 ms | 184.9k tok/s |
+| 7 | AdamW-Atan2 | `lr=0.0005`, `wd=0.05` | 5.5349 | 20.80% | 16.18 ms | 253.1k tok/s |
+| 8 | AdamW | `lr=0.0005`, `wd=0.05` | 5.5373 | 20.69% | 15.47 ms | 264.7k tok/s |
+
+Failed variants: AnchorMuon+Muown and EMA-Nesterov+AnchorMuon+Muown hit NaNs
+in the final replay. The best pre-NaN validation losses were `5.9265` and
+`5.6765`, so the hybrid is not ready without a separate stability pass.
+
+Takeaway: EMA-Nesterov + Muon is the best current GPT-2-tokenized LLM loss
+result in this worker. Plain Muon is nearly tied and faster. AnchorMuon remains
+faster than Muon and has the best final token accuracy, but it does not win
+cross-entropy on this real-tokenized proxy.
+
+Plots and full CSV:
+`results/fineweb_gpt2_llm50m_anchormuown_20260601/summary.md`,
+`results/fineweb_gpt2_llm50m_anchormuown_20260601/plots/val_loss_curve.png`,
+`results/fineweb_gpt2_llm50m_anchormuown_20260601/plots/val_acc_curve.png`,
+and `results/fineweb_gpt2_llm50m_anchormuown_20260601/plots/step_time_ms_bar.png`.
 
 ### CIFAR-10 Muown / EMA-Nesterov Transfer Check
 

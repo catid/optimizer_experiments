@@ -147,7 +147,7 @@ class vit_models(nn.Module):
     def __init__(self, img_size=224,  patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.,
                  qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm, ape=True,
                  block_layers=Block, Patch_layer=PatchEmbed, act_layer=nn.GELU, Attention_block=Attention, Mlp_block=Mlp,
-                 init_scale=1e-4, flash=True, rope=False, num_registers=0, qk_norm=False, reg_theta=10000, layer_scale=True, **kwargs):
+                 init_scale=1e-4, flash=True, rope=False, rope_reg=True, num_registers=0, qk_norm=False, reg_theta=10000, layer_scale=True, **kwargs):
         super().__init__()       
         self.dropout_rate = drop_rate  
         self.num_classes = num_classes
@@ -161,8 +161,9 @@ class vit_models(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.reg_token = nn.Parameter(torch.zeros(1, num_registers, embed_dim)) if num_registers > 0 else None
 
-        rope_reg_size = int(num_registers ** 0.5)
-        assert rope_reg_size ** 2 == num_registers, "num_registers must be a square number"
+        rope_reg_size = int(num_registers ** 0.5) if rope and rope_reg and num_registers > 0 else 0
+        if rope_reg_size > 0:
+            assert rope_reg_size ** 2 == num_registers, "num_registers must be a square number when rope_reg=True"
 
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim)) if ape else None
 
@@ -266,46 +267,52 @@ def deit_large_patch16_LS(img_size=224, **kwargs):
 
 @register_model
 def vit5_micro(img_size=32, **kwargs):
+    rope_reg = kwargs.pop("rope_reg", True)
     model = vit_models(
         img_size=img_size, patch_size=4, embed_dim=96, depth=4, num_heads=3,
         mlp_ratio=4, qkv_bias=False, num_registers=4, flash=False,
         norm_layer=partial(RMSNorm, eps=1e-6), block_layers=Block, rope=True,
-        rope_reg=True, reg_theta=100, qk_norm=True, **kwargs)
+        rope_reg=rope_reg, reg_theta=100, qk_norm=True, **kwargs)
     return model
 
 @register_model
 def vit5_tiny(img_size=32, **kwargs):
+    rope_reg = kwargs.pop("rope_reg", True)
     model = vit_models(
         img_size=img_size, patch_size=4, embed_dim=192, depth=6, num_heads=3,
         mlp_ratio=4, qkv_bias=False, num_registers=4, flash=False,
         norm_layer=partial(RMSNorm, eps=1e-6), block_layers=Block, rope=True,
-        rope_reg=True, reg_theta=100, qk_norm=True, **kwargs)
+        rope_reg=rope_reg, reg_theta=100, qk_norm=True, **kwargs)
     return model
 
 @register_model
 def vit5_small(img_size=224, **kwargs):
+    rope_reg = kwargs.pop("rope_reg", True)
     model = vit_models(
         img_size=img_size, patch_size=16, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4, qkv_bias=False, num_registers=4, flash=False,
-        norm_layer=partial(RMSNorm, eps=1e-6), block_layers=Block, rope=True, rope_reg=True, reg_theta=100, qk_norm=True, **kwargs)
+        norm_layer=partial(RMSNorm, eps=1e-6), block_layers=Block, rope=True, rope_reg=rope_reg, reg_theta=100, qk_norm=True, **kwargs)
     return model
 
 @register_model
 def vit5_base(img_size=224, **kwargs):
+    rope_reg = kwargs.pop("rope_reg", True)
     model = vit_models(
         img_size=img_size, patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=False, num_registers=4, flash=False,
-        norm_layer=partial(RMSNorm, eps=1e-6), block_layers=Block, rope=True, rope_reg=True, reg_theta=100, qk_norm=True, **kwargs)
+        norm_layer=partial(RMSNorm, eps=1e-6), block_layers=Block, rope=True, rope_reg=rope_reg, reg_theta=100, qk_norm=True, **kwargs)
     return model
 
 @register_model
 def vit5_large(img_size=224, **kwargs):
+    rope_reg = kwargs.pop("rope_reg", True)
     model = vit_models(
         img_size=img_size, patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=False, num_registers=4, flash=False,
-        norm_layer=partial(RMSNorm, eps=1e-6), block_layers=Block, rope=True, rope_reg=True, reg_theta=100, qk_norm=True, **kwargs)
+        norm_layer=partial(RMSNorm, eps=1e-6), block_layers=Block, rope=True, rope_reg=rope_reg, reg_theta=100, qk_norm=True, **kwargs)
     return model
 
 @register_model
 def vit5_xlarge(img_size=224, **kwargs):
+    rope_reg = kwargs.pop("rope_reg", True)
     model = vit_models(
         img_size=img_size, patch_size=16, embed_dim=1152, depth=28, num_heads=16, mlp_ratio=4, qkv_bias=False, num_registers=4, flash=False,
-        norm_layer=partial(RMSNorm, eps=1e-6), block_layers=Block, rope=True, rope_reg=True, reg_theta=100, qk_norm=True, **kwargs)
+        norm_layer=partial(RMSNorm, eps=1e-6), block_layers=Block, rope=True, rope_reg=rope_reg, reg_theta=100, qk_norm=True, **kwargs)
     return model

@@ -553,7 +553,25 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             raise ValueError("optimizer got an empty parameter list")
         if isinstance(items[0], dict):
             groups = [dict(group) for group in items]  # type: ignore[arg-type]
+            seen_params: set[int] = set()
+            deduped_groups: list[dict[str, Any]] = []
             for group in groups:
+                params_in = list(group["params"])
+                names_in = list(group.get("param_names", []))
+                params_out: list[torch.Tensor] = []
+                names_out: list[str] = []
+                for idx, p in enumerate(params_in):
+                    if id(p) in seen_params:
+                        continue
+                    seen_params.add(id(p))
+                    params_out.append(p)
+                    if names_in:
+                        names_out.append(names_in[idx])
+                if not params_out:
+                    continue
+                group["params"] = params_out
+                if names_in:
+                    group["param_names"] = names_out
                 group.setdefault("use_matrix_update", group.get("use_muon", False))
                 is_matrix = bool(group["use_matrix_update"])
                 group.setdefault("lr", matrix_lr if is_matrix else adam_lr)
@@ -575,13 +593,18 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                     group.setdefault("weight_decay", adam_weight_decay)
                     group.setdefault("betas", adam_betas)
                     group.setdefault("eps", eps)
-            return groups
+                deduped_groups.append(group)
+            return deduped_groups
 
         matrix_params: list[torch.Tensor] = []
         fallback_params: list[torch.Tensor] = []
+        seen_params: set[int] = set()
         for p in items:  # type: ignore[assignment]
             if not isinstance(p, torch.Tensor):
                 raise TypeError("params must be tensors or optimizer param-group dictionaries")
+            if id(p) in seen_params:
+                continue
+            seen_params.add(id(p))
             if p.requires_grad and p.ndim >= 2:
                 matrix_params.append(p)
             else:
@@ -876,10 +899,14 @@ def build_soda_pmuoneq_normuon_param_groups(
     matrix_names: list[str] = []
     fallback_params: list[torch.nn.Parameter] = []
     fallback_names: list[str] = []
+    seen_params: set[int] = set()
 
     for name, p in named_parameters:
         if not p.requires_grad:
             continue
+        if id(p) in seen_params:
+            continue
+        seen_params.add(id(p))
         if matrix_filter is not None:
             use_matrix = bool(matrix_filter(name, p))
         else:

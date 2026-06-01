@@ -393,6 +393,9 @@ class GoldenSodaPmuonEqNorMuon(torch.optim.Optimizer):
                 group.setdefault("lr", matrix_lr if is_matrix else fallback_lr)
                 group.setdefault("base_lr", group["lr"])
                 group.setdefault("use_external_lr", use_external_lr)
+                group.setdefault("fallback_beta2", fallback_beta2)
+                group.setdefault("eps", eps)
+                group.setdefault("weight_decay", fallback_weight_decay)
                 if is_matrix:
                     group["momentum"] = momentum
                     group["pmuoneq_beta"] = pmuoneq_beta
@@ -401,10 +404,6 @@ class GoldenSodaPmuonEqNorMuon(torch.optim.Optimizer):
                     group["pmuoneq_eps"] = pmuoneq_eps
                     group["normuon_beta2"] = normuon_beta2
                     group["normuon_eps"] = normuon_eps
-                else:
-                    group["fallback_beta2"] = fallback_beta2
-                    group["eps"] = eps
-                    group["weight_decay"] = fallback_weight_decay
             return groups
 
         matrix_params: list[torch.Tensor] = []
@@ -432,6 +431,9 @@ class GoldenSodaPmuonEqNorMuon(torch.optim.Optimizer):
                     "pmuoneq_eps": pmuoneq_eps,
                     "normuon_beta2": normuon_beta2,
                     "normuon_eps": normuon_eps,
+                    "fallback_beta2": fallback_beta2,
+                    "eps": eps,
+                    "weight_decay": fallback_weight_decay,
                     "use_external_lr": use_external_lr,
                 }
             )

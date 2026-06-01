@@ -302,11 +302,12 @@ def _bucket_muon(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
 def _foreach_lerp_(params: list[Tensor], ends: list[Tensor], weight: float, enabled: bool) -> None:
     if not params:
         return
-    if enabled and hasattr(torch, "_foreach_lerp_"):
+    same_dtype = all(param.dtype == end.dtype for param, end in zip(params, ends, strict=True))
+    if enabled and same_dtype and hasattr(torch, "_foreach_lerp_"):
         torch._foreach_lerp_(params, ends, weight)
     else:
         for p, end in zip(params, ends, strict=True):
-            p.lerp_(end, weight)
+            p.lerp_(end.to(dtype=p.dtype), weight)
 
 
 class EquiMuseNorMuon(torch.optim.Optimizer):
@@ -561,7 +562,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
     def _get_z(self, p: Tensor) -> Tensor:
         state = self.state[p]
         if "z" not in state:
-            state["z"] = torch.clone(p.detach(), memory_format=torch.preserve_format)
+            state["z"] = torch.clone(p.detach().to(torch.float32), memory_format=torch.preserve_format)
         return state["z"]
 
     def _soda_lambda(self, group: dict[str, Any], t: int) -> float:
@@ -574,7 +575,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
     def _get_soda_anchor(self, p: Tensor, z: Tensor) -> Tensor:
         state = self.state[p]
         if "soda_z0" not in state:
-            state["soda_z0"] = torch.clone(z.detach(), memory_format=torch.preserve_format)
+            state["soda_z0"] = torch.clone(z.detach().to(torch.float32), memory_format=torch.preserve_format)
         return state["soda_z0"]
 
     @staticmethod
@@ -608,8 +609,8 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
             z = self._get_z(p)
             anchor = self._get_soda_anchor(p, z)
             if "exp_avg_sq" not in state:
-                state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-            items.append((p, p.grad, z, state["exp_avg_sq"], anchor))
+                state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32, memory_format=torch.preserve_format)
+            items.append((p, p.grad.detach().to(torch.float32), z, state["exp_avg_sq"], anchor))
 
         if bool(group.get("foreach", self.foreach)) and hasattr(torch, "_foreach_mul_"):
             for bucket in _bucket_by_tensor(items, tensor_index=0):
@@ -667,15 +668,15 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         beta2 = float(group.get("beta2", 0.999))
         eps = float(group.get("eps", 1e-10))
         wd = float(group.get("weight_decay", 0.0))
-        p.lerp_(z, 1.0 - 1.0 / beta1)
+        p.lerp_(z.to(dtype=p.dtype), 1.0 - 1.0 / beta1)
         self._apply_soda_anchor_one(z, anchor, soda_lambda)
         exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
         update = grad.div(exp_avg_sq.div(1.0 - beta2**t).sqrt_().add_(eps))
         if wd and soda_lambda <= 0.0:
             update = update.add(z, alpha=wd)
         z.add_(update, alpha=-lr)
-        p.lerp_(z, ckp1)
-        p.lerp_(z, 1.0 - beta1)
+        p.lerp_(z.to(dtype=p.dtype), ckp1)
+        p.lerp_(z.to(dtype=p.dtype), 1.0 - beta1)
 
     def _step_muon_group(self, group: dict[str, Any], lr: float, ckp1: float, beta1: float, soda_lambda: float) -> int:
         items: list[dict[str, Any]] = []
@@ -689,11 +690,12 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
             z = self._get_z(p)
             anchor = self._get_soda_anchor(p, z)
             if "momentum_buffer" not in state:
-                state["momentum_buffer"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-            p.lerp_(z, 1.0 - 1.0 / beta1)
-            state["momentum_buffer"].lerp_(p.grad, 1.0 - momentum_beta)
-            update = p.grad.lerp(state["momentum_buffer"], momentum_beta)
-            raw_grad = p.grad.detach()
+                state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32, memory_format=torch.preserve_format)
+            p.lerp_(z.to(dtype=p.dtype), 1.0 - 1.0 / beta1)
+            grad32 = p.grad.detach().to(torch.float32)
+            state["momentum_buffer"].lerp_(grad32, 1.0 - momentum_beta)
+            update = grad32.lerp(state["momentum_buffer"], momentum_beta)
+            raw_grad = grad32
             if update.ndim > 2:
                 matrix = update.reshape(update.shape[0], -1)
                 raw_matrix = raw_grad.reshape(raw_grad.shape[0], -1)
@@ -862,8 +864,8 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         if wd and soda_lambda <= 0.0:
             z.mul_(1.0 - lr * wd)
         z.add_(update.to(z.dtype), alpha=-lr)
-        item["param"].lerp_(z, ckp1)
-        item["param"].lerp_(z, 1.0 - beta1)
+        item["param"].lerp_(z.to(dtype=item["param"].dtype), ckp1)
+        item["param"].lerp_(z.to(dtype=item["param"].dtype), 1.0 - beta1)
 
 
 def build_equimuse_normuon_param_groups(

@@ -1,6 +1,7 @@
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -60,6 +61,62 @@ def test_effective_tokenizer_vocab_size_includes_added_tokens():
             return 12
 
     assert runner._effective_tokenizer_vocab_size(AddedTokenTokenizer()) == 12
+
+
+def test_atomic_save_npy_writes_complete_file_and_cleans_temp(tmp_path):
+    runner = _load_runner()
+    path = tmp_path / "cache.npy"
+    array = np.arange(16, dtype=np.uint16)
+
+    runner._atomic_save_npy(path, array)
+
+    assert np.array_equal(np.load(path), array)
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_worker_hf_token_cache_requires_parent_seeded_cache(tmp_path):
+    runner = _load_runner()
+    args = SimpleNamespace(
+        dataset_source="hf_text",
+        tokenizer_mode="hf",
+        cache_dir=tmp_path,
+        hf_dataset="demo/dataset",
+        hf_config="",
+        hf_split="train",
+        hf_text_field="text",
+        tokenizer_name="gpt2",
+        tokenizer_add_eos=True,
+        hf_shuffle_buffer=17,
+        seed=777,
+        max_train_tokens=128,
+        max_val_tokens=64,
+    )
+
+    with pytest.raises(FileNotFoundError, match="seed777"):
+        runner.prepare_text_cache(args, require_existing=True)
+
+
+def test_worker_command_forwards_supervisor_seed(monkeypatch, tmp_path):
+    runner = _load_runner()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "runner",
+            "--seed",
+            "777",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+        ],
+    )
+    args = runner.parse_args()
+
+    cmd = runner.build_worker_command(args, tmp_path / "trial.json")
+
+    assert "--seed" in cmd
+    assert cmd[cmd.index("--seed") + 1] == "777"
 
 
 def test_token_stream_batches_integer_token_arrays(tmp_path):
@@ -136,3 +193,31 @@ def test_ema_nesterov_restores_base_weights_before_step():
     opt.step()
 
     assert float(p.detach()) == pytest.approx(0.8)
+
+
+def test_anchor_muown_optimizer_step_keeps_parameters_finite():
+    runner = _load_runner()
+    torch.manual_seed(123)
+    model = torch.nn.Sequential(
+        torch.nn.Linear(4, 8, bias=False),
+        torch.nn.GELU(),
+        torch.nn.Linear(8, 3, bias=False),
+    )
+    opt = runner.AnchorMuown(
+        model,
+        lr=1e-3,
+        fallback_lr=1e-3,
+        row_gamma=0.25,
+        soda_lambda_scale=0.003,
+        muown_mag_lr_mult=0.5,
+    )
+
+    x = torch.randn(5, 4)
+    target = torch.randn(5, 3)
+    loss = torch.nn.functional.mse_loss(model(x), target)
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+
+    for param in model.parameters():
+        assert torch.isfinite(param).all()

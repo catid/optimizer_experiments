@@ -7,8 +7,10 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+if str(ROOT) in sys.path:
+    sys.path.remove(str(ROOT))
+sys.path.insert(0, str(ROOT))
+sys.modules.pop("optim_sfplus", None)
 
 from optim_sfplus import SFPlusAnchorMuon
 

@@ -209,6 +209,26 @@ def test_atan2_fallback_scales_only_fallback_update() -> None:
     assert "exp_avg_sq" in opt.state[p]
 
 
+def test_matrix_dict_group_propagates_fallback_settings_for_fallback_params() -> None:
+    p = nn.Parameter(torch.tensor([1.0, -2.0]))
+    opt = AnchorMuon(
+        [{"params": [p], "use_matrix_update": True}],
+        lr=0.1,
+        fallback_mode="atan2",
+        fallback_betas=(0.5, 0.5),
+        eps=0.123,
+    )
+
+    assert opt.param_groups[0]["betas"] == (0.5, 0.5)
+    assert opt.param_groups[0]["eps"] == 0.123
+
+    p.grad = torch.tensor([0.5, -0.25])
+    opt.step()
+
+    assert "exp_avg" in opt.state[p]
+    assert "exp_avg_sq" in opt.state[p]
+
+
 def test_adamc_fallback_applies_optional_lr_squared_decay() -> None:
     p = nn.Parameter(torch.tensor([1.0, -2.0]))
     opt = AnchorMuon(
@@ -225,6 +245,29 @@ def test_adamc_fallback_applies_optional_lr_squared_decay() -> None:
     assert torch.allclose(p.detach(), expected, atol=1e-6, rtol=1e-6)
     assert "exp_avg" in opt.state[p]
     assert "exp_avg_sq" in opt.state[p]
+
+
+def test_fallback_soda_anchor_pulls_after_multiple_steps() -> None:
+    p = nn.Parameter(torch.tensor([1.0, -2.0]))
+    opt = AnchorMuon(
+        [{"params": [p], "use_matrix_update": False}],
+        lr=0.1,
+        fallback_mode="rms",
+        fallback_betas=(0.0, 0.0),
+        soda_lambda_scale=1.0,
+        soda_lambda_power=1.0,
+    )
+    anchor = p.detach().clone()
+
+    p.grad = torch.tensor([0.5, -0.25])
+    opt.step()
+    after_update = p.detach().clone()
+    assert torch.dist(after_update, anchor) > 0.0
+
+    p.grad = torch.zeros_like(p)
+    opt.step()
+
+    assert torch.dist(p.detach(), anchor) < torch.dist(after_update, anchor)
 
 
 def test_from_model_constructor_matches_module_constructor() -> None:

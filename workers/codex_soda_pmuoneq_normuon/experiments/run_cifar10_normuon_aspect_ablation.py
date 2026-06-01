@@ -484,11 +484,11 @@ def launch(args: argparse.Namespace) -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     trials = [trial for trial in default_trials(args.seed, args.preset) if not args.only or args.only in trial.name]
     pending = list(trials)
-    running: list[tuple[subprocess.Popen, str]] = []
     gpu_count = torch.cuda.device_count()
-    next_gpu = 0
+    free_gpus = list(range(gpu_count))
+    running: list[tuple[subprocess.Popen, str, int]] = []
     while pending or running:
-        while pending and len(running) < gpu_count:
+        while pending and free_gpus:
             trial = pending.pop(0)
             run_dir = args.output_dir / trial.name
             if args.skip_existing and (run_dir / "summary.json").exists():
@@ -532,21 +532,24 @@ def launch(args: argparse.Namespace) -> None:
             if args.sync_step_timing:
                 cmd.append("--sync-step-timing")
             env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(next_gpu % gpu_count)
-            next_gpu += 1
+            gpu_id = free_gpus.pop(0)
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
             (run_dir / "resolved_command.sh").write_text("CUDA_VISIBLE_DEVICES=" + env["CUDA_VISIBLE_DEVICES"] + " " + " ".join(cmd) + "\n", encoding="utf-8")
             stdout = (run_dir / "stdout.log").open("w", encoding="utf-8")
             stderr = (run_dir / "stderr.log").open("w", encoding="utf-8")
             print(f"Launching {trial.name} on GPU {env['CUDA_VISIBLE_DEVICES']}", flush=True)
-            running.append((subprocess.Popen(cmd, env=env, stdout=stdout, stderr=stderr, text=True), trial.name))
+            running.append((subprocess.Popen(cmd, env=env, stdout=stdout, stderr=stderr, text=True), trial.name, gpu_id))
         time.sleep(1.0)
         still_running = []
-        for proc, name in running:
+        for proc, name, gpu_id in running:
             code = proc.poll()
             if code is None:
-                still_running.append((proc, name))
+                still_running.append((proc, name, gpu_id))
             elif code != 0:
                 raise SystemExit(f"Trial {name} failed with code {code}; see {args.output_dir / name}")
+            else:
+                free_gpus.append(gpu_id)
+        free_gpus.sort()
         running = still_running
     summarize(args.output_dir)
 

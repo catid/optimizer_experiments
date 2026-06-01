@@ -8,8 +8,11 @@ from pathlib import Path
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+if str(ROOT) in sys.path:
+    sys.path.remove(str(ROOT))
+sys.path.insert(0, str(ROOT))
+for module_name in ("optim_anchormuon", "optim_factory"):
+    sys.modules.pop(module_name, None)
 
 from optim_anchormuon import (
     AnchorMuon,
@@ -105,6 +108,20 @@ def test_pmuon_eq_updates_state_and_preserves_shape() -> None:
     assert torch.isfinite(out).all()
     assert not torch.equal(row, torch.ones_like(row))
     assert not torch.equal(col, torch.ones_like(col))
+
+
+def test_leading_singleton_matrix_params_use_effective_matrix_shape() -> None:
+    torch.manual_seed(22)
+    param = torch.nn.Parameter(torch.randn(1, 6, 8) * 0.02)
+    opt = AnchorMuon([param], lr=1e-3, warmup_steps=1, amuse=False, min_matrix_dim=2)
+
+    param.grad = torch.randn_like(param)
+    opt.step()
+
+    state = opt.state[param]
+    assert state["row_ema"].shape == (6,)
+    assert state["col_ema"].shape == (8,)
+    assert opt.last_stats["matrix_params"] == 1
 
 
 def test_normuon_normalizes_rows_or_columns_and_preserves_norm() -> None:

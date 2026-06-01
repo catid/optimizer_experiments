@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import sys
 from io import BytesIO
+from pathlib import Path
 
 import torch
+
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) in sys.path:
+    sys.path.remove(str(ROOT))
+sys.path.insert(0, str(ROOT))
 
 from equimuse_normuon import EquiMuseNorMuon, build_equimuse_normuon_param_groups, normuon_precondition
 
@@ -288,3 +295,30 @@ def test_train_eval_return_self_and_checkpoint_roundtrips() -> None:
     train_clone.eval()
     for p, expected in zip(train_clone_params, eval_params, strict=True):
         assert torch.allclose(p, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_bfloat16_parameters_keep_optimizer_state_in_fp32() -> None:
+    matrix = torch.nn.Parameter(torch.randn(4, 4, dtype=torch.bfloat16))
+    vector = torch.nn.Parameter(torch.randn(4, dtype=torch.bfloat16))
+    opt = EquiMuseNorMuon(
+        [
+            {"params": [matrix], "use_muon": True, "lr": 0.01, "batch_muon": False},
+            {"params": [vector], "use_muon": False, "lr": 0.01},
+        ],
+        warmup_steps=1,
+        ns_dtype=torch.float32,
+    )
+    opt.train()
+
+    before_matrix = matrix.detach().float().clone()
+    before_vector = vector.detach().float().clone()
+    matrix.grad = torch.randn_like(matrix)
+    vector.grad = torch.randn_like(vector)
+    opt.step()
+
+    assert opt.state[matrix]["z"].dtype == torch.float32
+    assert opt.state[matrix]["momentum_buffer"].dtype == torch.float32
+    assert opt.state[vector]["z"].dtype == torch.float32
+    assert opt.state[vector]["exp_avg_sq"].dtype == torch.float32
+    assert not torch.equal(matrix.detach().float(), before_matrix)
+    assert not torch.equal(vector.detach().float(), before_vector)

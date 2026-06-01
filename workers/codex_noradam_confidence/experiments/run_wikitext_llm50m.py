@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,7 @@ class TrialConfig:
     ema_gamma: float = 0.99
     ema_warmup_frac: float = 0.30
     ema_rest_frac: float = 0.20
+    muown_mag_lr_mult: float = 1.0
     seed: int = 123
     steps: int = 800
     eval_every: int = 100
@@ -220,19 +222,45 @@ def _bytes_from_dataset(config: str, split: str, max_bytes: int) -> np.ndarray:
     return np.frombuffer(blob, dtype=np.uint8).copy()
 
 
-def prepare_wikitext_cache(args: argparse.Namespace) -> tuple[Path, Path]:
+def _atomic_save_npy(path: Path, array: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("wb") as f:
+            np.save(f, array)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _require_cache_files(train_path: Path, val_path: Path) -> None:
+    missing = [str(path) for path in (train_path, val_path) if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Required text cache is missing in worker mode. "
+            "Run the supervisor once to prepare caches before launching workers. Missing: "
+            + ", ".join(missing)
+        )
+
+
+def prepare_wikitext_cache(args: argparse.Namespace, *, require_existing: bool = False) -> tuple[Path, Path]:
     if args.tokenizer_mode == "hf":
-        return prepare_wikitext_token_cache(args)
+        return prepare_wikitext_token_cache(args, require_existing=require_existing)
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     safe_config = args.wiki_config.replace("/", "_")
     train_path = args.cache_dir / f"{safe_config}_train_{args.max_train_bytes}.uint8.npy"
     val_path = args.cache_dir / f"{safe_config}_validation_{args.max_val_bytes}.uint8.npy"
+    if require_existing:
+        _require_cache_files(train_path, val_path)
+        return train_path, val_path
     if not train_path.exists():
         train = _bytes_from_dataset(args.wiki_config, "train", args.max_train_bytes)
-        np.save(train_path, train)
+        _atomic_save_npy(train_path, train)
     if not val_path.exists():
         val = _bytes_from_dataset(args.wiki_config, "validation", args.max_val_bytes)
-        np.save(val_path, val)
+        _atomic_save_npy(val_path, val)
     return train_path, val_path
 
 
@@ -315,37 +343,43 @@ def _consume_text_tokens(
     return np.concatenate(chunks)[:max_tokens]
 
 
-def prepare_wikitext_token_cache(args: argparse.Namespace) -> tuple[Path, Path]:
+def prepare_wikitext_token_cache(args: argparse.Namespace, *, require_existing: bool = False) -> tuple[Path, Path]:
     from datasets import load_dataset
 
     args.cache_dir.mkdir(parents=True, exist_ok=True)
-    tokenizer = _load_hf_tokenizer(args.tokenizer_name)
     safe_config = _safe_name(args.wiki_config)
     safe_tok = _safe_name(args.tokenizer_name)
     eos = "eos" if args.tokenizer_add_eos else "noeos"
     train_path = args.cache_dir / f"{safe_config}_{safe_tok}_{eos}_train_{args.max_train_tokens}.tok.npy"
     val_path = args.cache_dir / f"{safe_config}_{safe_tok}_{eos}_validation_{args.max_val_tokens}.tok.npy"
+    if require_existing:
+        _require_cache_files(train_path, val_path)
+        return train_path, val_path
+    tokenizer = _load_hf_tokenizer(args.tokenizer_name)
     if not train_path.exists():
         ds = load_dataset("wikitext", args.wiki_config, split="train")
         train = _consume_text_tokens(iter(ds), text_field="text", tokenizer=tokenizer, max_tokens=args.max_train_tokens, add_eos=args.tokenizer_add_eos)
-        np.save(train_path, train)
+        _atomic_save_npy(train_path, train)
     if not val_path.exists():
         ds = load_dataset("wikitext", args.wiki_config, split="validation")
         val = _consume_text_tokens(iter(ds), text_field="text", tokenizer=tokenizer, max_tokens=args.max_val_tokens, add_eos=args.tokenizer_add_eos)
-        np.save(val_path, val)
+        _atomic_save_npy(val_path, val)
     return train_path, val_path
 
 
-def prepare_hf_text_cache(args: argparse.Namespace) -> tuple[Path, Path]:
+def prepare_hf_text_cache(args: argparse.Namespace, *, require_existing: bool = False) -> tuple[Path, Path]:
     from datasets import load_dataset
 
     if args.tokenizer_mode == "hf":
-        return prepare_hf_token_cache(args)
+        return prepare_hf_token_cache(args, require_existing=require_existing)
 
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     safe = _safe_name(f"{args.hf_dataset}_{args.hf_config}_{args.hf_split}_{args.hf_text_field}_shuf{args.hf_shuffle_buffer}_seed{args.seed}")
     train_path = args.cache_dir / f"{safe}_train_{args.max_train_bytes}.uint8.npy"
     val_path = args.cache_dir / f"{safe}_validation_{args.max_val_bytes}.uint8.npy"
+    if require_existing:
+        _require_cache_files(train_path, val_path)
+        return train_path, val_path
     if train_path.exists() and val_path.exists():
         return train_path, val_path
 
@@ -365,22 +399,21 @@ def prepare_hf_text_cache(args: argparse.Namespace) -> tuple[Path, Path]:
         val = _consume_text_bytes(iterator, text_field=args.hf_text_field, max_bytes=args.max_val_bytes)
         train = _consume_text_bytes(iterator, text_field=args.hf_text_field, max_bytes=args.max_train_bytes)
 
-    np.save(val_path, val)
-    np.save(train_path, train)
+    _atomic_save_npy(val_path, val)
+    _atomic_save_npy(train_path, train)
     return train_path, val_path
 
 
-def prepare_text_cache(args: argparse.Namespace) -> tuple[Path, Path]:
+def prepare_text_cache(args: argparse.Namespace, *, require_existing: bool = False) -> tuple[Path, Path]:
     if args.dataset_source == "wikitext":
-        return prepare_wikitext_cache(args)
-    return prepare_hf_text_cache(args)
+        return prepare_wikitext_cache(args, require_existing=require_existing)
+    return prepare_hf_text_cache(args, require_existing=require_existing)
 
 
-def prepare_hf_token_cache(args: argparse.Namespace) -> tuple[Path, Path]:
+def prepare_hf_token_cache(args: argparse.Namespace, *, require_existing: bool = False) -> tuple[Path, Path]:
     from datasets import load_dataset
 
     args.cache_dir.mkdir(parents=True, exist_ok=True)
-    tokenizer = _load_hf_tokenizer(args.tokenizer_name)
     eos = "eos" if args.tokenizer_add_eos else "noeos"
     safe = _safe_name(
         f"{args.hf_dataset}_{args.hf_config}_{args.hf_split}_{args.hf_text_field}_"
@@ -388,8 +421,12 @@ def prepare_hf_token_cache(args: argparse.Namespace) -> tuple[Path, Path]:
     )
     train_path = args.cache_dir / f"{safe}_train_{args.max_train_tokens}.tok.npy"
     val_path = args.cache_dir / f"{safe}_validation_{args.max_val_tokens}.tok.npy"
+    if require_existing:
+        _require_cache_files(train_path, val_path)
+        return train_path, val_path
     if train_path.exists() and val_path.exists():
         return train_path, val_path
+    tokenizer = _load_hf_tokenizer(args.tokenizer_name)
 
     name = args.hf_config or None
     if args.hf_val_split:
@@ -407,8 +444,8 @@ def prepare_hf_token_cache(args: argparse.Namespace) -> tuple[Path, Path]:
         val = _consume_text_tokens(iterator, text_field=args.hf_text_field, tokenizer=tokenizer, max_tokens=args.max_val_tokens, add_eos=args.tokenizer_add_eos)
         train = _consume_text_tokens(iterator, text_field=args.hf_text_field, tokenizer=tokenizer, max_tokens=args.max_train_tokens, add_eos=args.tokenizer_add_eos)
 
-    np.save(val_path, val)
-    np.save(train_path, train)
+    _atomic_save_npy(val_path, val)
+    _atomic_save_npy(train_path, train)
     return train_path, val_path
 
 
@@ -487,6 +524,145 @@ class Muown(PlainMuon):
                 g_mag.copy_(new_r)
             r_norm.copy_(new_r)
             p.copy_(w_new.reshape_as(p).to(p.dtype))
+
+
+class AnchorMuown(root_optimizer.AnchorMuon):
+    """AnchorMuon direction inside Muown's implicit row-magnitude parameterization.
+
+    Matrix parameters are represented as W = diag(g / ||R||row) R. The radial
+    gradient updates g with Adam-style moments while the tangential R gradient
+    is fed through AnchorMuon's PMuonEq + GramNS + NorMuon matrix direction.
+    This keeps the experiment local to the benchmark runner and leaves the
+    shippable root optimizer unchanged.
+    """
+
+    def __init__(
+        self,
+        params: Any,
+        *,
+        muown_mag_lr_mult: float = 1.0,
+        muown_mag_betas: tuple[float, float] = (0.9, 0.95),
+        **kwargs: Any,
+    ) -> None:
+        if muown_mag_lr_mult < 0.0:
+            raise ValueError("muown_mag_lr_mult must be non-negative")
+        if len(muown_mag_betas) != 2 or not all(0.0 <= beta < 1.0 for beta in muown_mag_betas):
+            raise ValueError("muown_mag_betas must contain two values in [0, 1)")
+        super().__init__(params, **kwargs)
+        for group in self.param_groups:
+            if group.get("use_matrix_update", False):
+                group.setdefault("muown_mag_lr_mult", float(muown_mag_lr_mult))
+                group.setdefault("muown_mag_betas", tuple(float(beta) for beta in muown_mag_betas))
+
+    def _ensure_muown_state(
+        self,
+        p: torch.Tensor,
+        w: torch.Tensor,
+        *,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        rows = w.shape[0]
+        state = self.state[p]
+        row_norm = w.norm(dim=1).clamp_min(eps)
+        if "muown_g_mag" not in state or tuple(state["muown_g_mag"].shape) != (rows,):
+            state["muown_g_mag"] = row_norm.clone()
+            state["muown_r_norm"] = row_norm.clone()
+            state["muown_momentum_buffer"] = torch.zeros_like(w, dtype=torch.float32)
+            state["muown_mag_exp_avg"] = torch.zeros_like(row_norm, dtype=torch.float32)
+            state["muown_mag_exp_avg_sq"] = torch.zeros_like(row_norm, dtype=torch.float32)
+            state["muown_mag_step"] = 0
+        return (
+            state["muown_g_mag"],
+            state["muown_r_norm"],
+            state["muown_momentum_buffer"],
+            state["muown_mag_exp_avg"],
+            state["muown_mag_exp_avg_sq"],
+        )
+
+    def _step_matrix_group(self, group: dict[str, Any], *, lr: float, t: int) -> dict[str, float]:
+        beta_m = float(group["momentum"])
+        eps = float(group.get("eps", group.get("pmuoneq_eps", 1e-8)))
+        soda_weight = self._soda_weight(t)
+        entries: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        muown_entries: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        fallback_count = 0
+
+        for p in group["params"]:
+            grad = p.grad
+            if grad is None:
+                continue
+            if grad.is_sparse:
+                raise RuntimeError(
+                    "AnchorMuown does not support sparse gradients. "
+                    "Use dense gradients for this parameter or a different optimizer for sparse embeddings."
+                )
+            if not root_optimizer._is_matrix_like_parameter(grad, min_matrix_dim=int(group.get("min_matrix_dim", 2))):
+                fallback_count += self._step_fallback_param(p, group, lr=lr, t=t)
+                continue
+
+            # Keep SODA as a regularizer on the effective model weight W, then
+            # reconstruct the hidden Muown variable from the anchored W.
+            anchor = self._soda_anchor(p)
+            p.lerp_(end=anchor, weight=soda_weight)
+            w = root_optimizer._matrix_view(p.detach()).to(torch.float32)
+            grad_w = root_optimizer._matrix_view(grad.detach()).to(torch.float32)
+            g_mag, r_norm, momentum, mag_exp_avg, mag_exp_avg_sq = self._ensure_muown_state(p, w, eps=eps)
+
+            safe_g = g_mag.clamp_min(eps)
+            safe_r = r_norm.clamp_min(eps)
+            hidden_r = w * (safe_r / safe_g).unsqueeze(1)
+            direction = hidden_r / safe_r.unsqueeze(1)
+            radial = (grad_w * direction).sum(dim=1, keepdim=True)
+            grad_g = radial.squeeze(1)
+            grad_hidden_r = (safe_g / safe_r).unsqueeze(1) * (grad_w - radial * direction)
+
+            momentum.lerp_(grad_hidden_r, 1.0 - beta_m)
+            source = torch.lerp(grad_hidden_r, momentum, beta_m)
+            entries.append((p, anchor, source, grad_hidden_r))
+            muown_entries.append((p, hidden_r, grad_g, g_mag, r_norm, mag_exp_avg, mag_exp_avg_sq))
+
+        if not entries:
+            return {
+                "matrix_count": 0.0,
+                "fallback_count": float(fallback_count),
+                "soda_weight": float(soda_weight),
+            }
+
+        buckets: dict[tuple[torch.device, torch.Size], list[int]] = {}
+        for idx, entry in enumerate(entries):
+            buckets.setdefault((entry[2].device, entry[2].shape), []).append(idx)
+
+        matrix_count = 0
+        for indices in buckets.values():
+            bucket_entries = [entries[idx] for idx in indices]
+            updates = self._transform_matrix_bucket(bucket_entries, group)
+            for idx, update in zip(indices, updates.unbind(0), strict=True):
+                p, hidden_r, grad_g, g_mag, r_norm, mag_exp_avg, mag_exp_avg_sq = muown_entries[idx]
+                hidden_r.add_(update, alpha=-lr)
+
+                state = self.state[p]
+                state["muown_mag_step"] = int(state.get("muown_mag_step", 0)) + 1
+                mag_step = int(state["muown_mag_step"])
+                mag_lr = lr * float(group.get("muown_mag_lr_mult", 1.0))
+                beta1, beta2 = group.get("muown_mag_betas", (0.9, 0.95))
+                mag_exp_avg.mul_(float(beta1)).add_(grad_g, alpha=1.0 - float(beta1))
+                mag_exp_avg_sq.mul_(float(beta2)).addcmul_(grad_g, grad_g, value=1.0 - float(beta2))
+                m_hat = mag_exp_avg / max(1.0 - float(beta1) ** mag_step, 1e-16)
+                v_hat = mag_exp_avg_sq / max(1.0 - float(beta2) ** mag_step, 1e-16)
+                g_mag.add_(m_hat / v_hat.sqrt().clamp_min(eps), alpha=-mag_lr)
+                g_mag.clamp_(min=eps)
+
+                new_r = hidden_r.norm(dim=1).clamp_min(eps)
+                w_new = hidden_r * (g_mag / new_r).unsqueeze(1)
+                r_norm.copy_(new_r)
+                p.copy_(w_new.reshape_as(p).to(p.dtype))
+                matrix_count += 1
+
+        return {
+            "matrix_count": float(matrix_count),
+            "fallback_count": float(fallback_count),
+            "soda_weight": float(soda_weight),
+        }
 
 
 class EMANesterovOptimizer:
@@ -597,6 +773,21 @@ class EMANesterovOptimizer:
 
 
 def make_optimizer(model: nn.Module, trial: TrialConfig) -> torch.optim.Optimizer:
+    def make_anchor_base(cls: type[torch.optim.Optimizer]) -> torch.optim.Optimizer:
+        kwargs = {
+            "lr": trial.lr,
+            "fallback_lr": trial.lr * trial.fallback_lr_mult,
+            "fallback_mode": trial.fallback_mode,
+            "row_gamma": trial.row_gamma,
+            "pmuoneq_beta": trial.pmuoneq_beta,
+            "normuon_beta2": trial.normuon_beta2,
+            "soda_lambda_scale": trial.soda_lambda_scale,
+            "soda_lambda_power": trial.soda_lambda_power,
+        }
+        if cls is AnchorMuown:
+            kwargs["muown_mag_lr_mult"] = trial.muown_mag_lr_mult
+        return cls(model, **kwargs)
+
     if trial.family == "adamw":
         return torch.optim.AdamW(
             make_decay_groups(model, trial.weight_decay),
@@ -635,16 +826,28 @@ def make_optimizer(model: nn.Module, trial: TrialConfig) -> torch.optim.Optimize
             rest_frac=trial.ema_rest_frac,
         )
     if trial.family == "anchormuon":
-        return root_optimizer.AnchorMuon(
-            model,
-            lr=trial.lr,
-            fallback_lr=trial.lr * trial.fallback_lr_mult,
-            fallback_mode=trial.fallback_mode,
-            row_gamma=trial.row_gamma,
-            pmuoneq_beta=trial.pmuoneq_beta,
-            normuon_beta2=trial.normuon_beta2,
-            soda_lambda_scale=trial.soda_lambda_scale,
-            soda_lambda_power=trial.soda_lambda_power,
+        return make_anchor_base(root_optimizer.AnchorMuon)
+    if trial.family == "anchormuown":
+        return make_anchor_base(AnchorMuown)
+    if trial.family == "ema_anchormuon":
+        base = make_anchor_base(root_optimizer.AnchorMuon)
+        return EMANesterovOptimizer(
+            base,
+            total_steps=trial.steps,
+            beta=trial.ema_beta,
+            gamma=trial.ema_gamma,
+            warmup_frac=trial.ema_warmup_frac,
+            rest_frac=trial.ema_rest_frac,
+        )
+    if trial.family == "ema_anchormuown":
+        base = make_anchor_base(AnchorMuown)
+        return EMANesterovOptimizer(
+            base,
+            total_steps=trial.steps,
+            beta=trial.ema_beta,
+            gamma=trial.ema_gamma,
+            warmup_frac=trial.ema_warmup_frac,
+            rest_frac=trial.ema_rest_frac,
         )
     raise ValueError(f"unknown optimizer family {trial.family}")
 
@@ -687,7 +890,7 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     device = torch.device("cuda")
-    train_path, val_path = prepare_text_cache(args)
+    train_path, val_path = prepare_text_cache(args, require_existing=bool(args.worker))
     vocab_size = tokenizer_vocab_size(args)
 
     model = TinyGPT(
@@ -822,7 +1025,10 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
         return [
             TrialConfig("smoke_adamw", "adamw", 5e-4, steps=4, eval_every=2),
             TrialConfig("smoke_anchor", "anchormuon", 1e-3, steps=4, eval_every=2),
+            TrialConfig("smoke_anchormuown", "anchormuown", 1e-3, steps=4, eval_every=2),
             TrialConfig("smoke_muown", "muown", 1e-3, weight_decay=0.0, steps=4, eval_every=2),
+            TrialConfig("smoke_ema_anchor", "ema_anchormuon", 1e-3, ema_beta=0.3, steps=4, eval_every=2),
+            TrialConfig("smoke_ema_anchormuown", "ema_anchormuown", 1e-3, ema_beta=0.3, steps=4, eval_every=2),
             TrialConfig("smoke_ema_muon", "ema_muon", 1e-3, ema_beta=0.3, steps=4, eval_every=2),
             TrialConfig("smoke_ema_muown", "ema_muown", 1e-3, weight_decay=0.0, ema_beta=0.3, steps=4, eval_every=2),
         ]
@@ -964,6 +1170,9 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
             add(TrialConfig(f"tok_adamatan2_lr{lr:g}", "adamatan2", lr, steps=args.hpo_steps))
         for lr in (8e-4, 1.0e-3, 1.2e-3, 1.4e-3):
             add(TrialConfig(f"tok_muon_lr{lr:g}", "muon", lr, steps=args.hpo_steps))
+        for lr in (1.0e-3, 1.2e-3, 1.4e-3, 1.6e-3):
+            for wd in (0.0, 0.01, 0.05):
+                add(TrialConfig(f"tok_muown_lr{lr:g}_wd{wd:g}", "muown", lr, weight_decay=wd, steps=args.hpo_steps))
 
         for lr in (8e-4, 1.0e-3, 1.2e-3, 1.4e-3):
             for row_gamma in (0.0, 0.25, 0.45, 0.55):
@@ -980,6 +1189,96 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
                                 fallback_lr_mult=fallback_lr_mult,
                                 fallback_mode=fallback_mode,
                                 soda_lambda_scale=soda_lambda_scale,
+                                steps=args.hpo_steps,
+                            )
+                        )
+
+        for lr in (1.0e-3, 1.2e-3, 1.4e-3, 1.6e-3):
+            for row_gamma in (0.25, 0.45, 0.55):
+                for soda_lambda_scale in (0.001, 0.003, 0.01):
+                    for muown_mag_lr_mult in (0.5, 1.0):
+                        for fallback_lr_mult, fallback_mode in ((0.5, "atan2"), (1.0, "rms")):
+                            add(
+                                TrialConfig(
+                                    f"tok_anchormuown_lr{lr:g}_rg{row_gamma:g}_soda{soda_lambda_scale:g}_mag{muown_mag_lr_mult:g}_flr{fallback_lr_mult:g}_{fallback_mode}",
+                                    "anchormuown",
+                                    lr,
+                                    row_gamma=row_gamma,
+                                    pmuoneq_beta=0.90,
+                                    normuon_beta2=0.93,
+                                    fallback_lr_mult=fallback_lr_mult,
+                                    fallback_mode=fallback_mode,
+                                    soda_lambda_scale=soda_lambda_scale,
+                                    muown_mag_lr_mult=muown_mag_lr_mult,
+                                    steps=args.hpo_steps,
+                                )
+                            )
+
+        for lr in (1.2e-3, 1.4e-3):
+            for ema_beta in (0.1, 0.3, 0.5):
+                for ema_gamma in (0.99, 0.995):
+                    add(
+                        TrialConfig(
+                            f"tok_ema_muon_lr{lr:g}_b{ema_beta:g}_g{ema_gamma:g}",
+                            "ema_muon",
+                            lr,
+                            weight_decay=0.05,
+                            ema_beta=ema_beta,
+                            ema_gamma=ema_gamma,
+                            steps=args.hpo_steps,
+                        )
+                    )
+                    add(
+                        TrialConfig(
+                            f"tok_ema_anchor_lr{lr:g}_rg0.45_soda0.003_b{ema_beta:g}_g{ema_gamma:g}",
+                            "ema_anchormuon",
+                            lr,
+                            row_gamma=0.45,
+                            pmuoneq_beta=0.90,
+                            normuon_beta2=0.93,
+                            fallback_lr_mult=1.0,
+                            fallback_mode="rms",
+                            soda_lambda_scale=0.003,
+                            ema_beta=ema_beta,
+                            ema_gamma=ema_gamma,
+                            steps=args.hpo_steps,
+                        )
+                    )
+
+        for lr in (1.2e-3, 1.4e-3, 1.6e-3):
+            for wd in (0.0, 0.01):
+                for ema_beta in (0.1, 0.3):
+                    for ema_gamma in (0.99, 0.995):
+                        add(
+                            TrialConfig(
+                                f"tok_ema_muown_lr{lr:g}_wd{wd:g}_b{ema_beta:g}_g{ema_gamma:g}",
+                                "ema_muown",
+                                lr,
+                                weight_decay=wd,
+                                ema_beta=ema_beta,
+                                ema_gamma=ema_gamma,
+                                steps=args.hpo_steps,
+                            )
+                        )
+
+        for lr in (1.2e-3, 1.4e-3):
+            for muown_mag_lr_mult in (0.5, 1.0):
+                for ema_beta in (0.1, 0.3):
+                    for ema_gamma in (0.99, 0.995):
+                        add(
+                            TrialConfig(
+                                f"tok_ema_anchormuown_lr{lr:g}_rg0.45_soda0.003_mag{muown_mag_lr_mult:g}_b{ema_beta:g}_g{ema_gamma:g}",
+                                "ema_anchormuown",
+                                lr,
+                                row_gamma=0.45,
+                                pmuoneq_beta=0.90,
+                                normuon_beta2=0.93,
+                                fallback_lr_mult=1.0,
+                                fallback_mode="rms",
+                                soda_lambda_scale=0.003,
+                                muown_mag_lr_mult=muown_mag_lr_mult,
+                                ema_beta=ema_beta,
+                                ema_gamma=ema_gamma,
                                 steps=args.hpo_steps,
                             )
                         )
@@ -1256,7 +1555,18 @@ def final_trials_from_hpo(args: argparse.Namespace, hpo_rows: list[dict[str, Any
     eval_every = max(1, args.final_steps // max(args.eval_bins, 1))
     warmup = min(args.warmup_steps, max(1, args.final_steps // 4))
     trials: list[TrialConfig] = []
-    for family in ("anchormuon", "muown", "ema_muown", "ema_muon", "adamw", "adamatan2", "muon"):
+    for family in (
+        "anchormuon",
+        "anchormuown",
+        "ema_anchormuon",
+        "ema_anchormuown",
+        "muown",
+        "ema_muown",
+        "ema_muon",
+        "adamw",
+        "adamatan2",
+        "muon",
+    ):
         if family not in best:
             continue
         row = best[family]
@@ -1277,6 +1587,7 @@ def final_trials_from_hpo(args: argparse.Namespace, hpo_rows: list[dict[str, Any
                 ema_gamma=float(row.get("ema_gamma", 0.99)),
                 ema_warmup_frac=float(row.get("ema_warmup_frac", 0.30)),
                 ema_rest_frac=float(row.get("ema_rest_frac", 0.20)),
+                muown_mag_lr_mult=float(row.get("muown_mag_lr_mult", 1.0)),
                 seed=args.seed,
                 steps=args.final_steps,
                 eval_every=eval_every,
@@ -1301,6 +1612,79 @@ def final_trials_from_preset(args: argparse.Namespace) -> list[TrialConfig]:
             )
         )
     return trials
+
+
+def build_worker_command(args: argparse.Namespace, trial_file: Path) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--worker",
+        "--trial-json",
+        str(trial_file),
+        "--output-dir",
+        str(args.output_dir),
+        "--dataset-source",
+        str(args.dataset_source),
+        "--tokenizer-mode",
+        str(args.tokenizer_mode),
+        "--tokenizer-name",
+        str(args.tokenizer_name),
+        "--tokenizer-add-eos" if args.tokenizer_add_eos else "--no-tokenizer-add-eos",
+        "--wiki-config",
+        str(args.wiki_config),
+        "--hf-dataset",
+        str(args.hf_dataset),
+        "--hf-config",
+        str(args.hf_config),
+        "--hf-split",
+        str(args.hf_split),
+        "--hf-val-split",
+        str(args.hf_val_split),
+        "--hf-text-field",
+        str(args.hf_text_field),
+        "--hf-shuffle-buffer",
+        str(args.hf_shuffle_buffer),
+        "--cache-dir",
+        str(args.cache_dir),
+        "--seed",
+        str(args.seed),
+        "--max-train-bytes",
+        str(args.max_train_bytes),
+        "--max-val-bytes",
+        str(args.max_val_bytes),
+        "--max-train-tokens",
+        str(args.max_train_tokens),
+        "--max-val-tokens",
+        str(args.max_val_tokens),
+        "--block-size",
+        str(args.block_size),
+        "--n-layer",
+        str(args.n_layer),
+        "--n-head",
+        str(args.n_head),
+        "--n-embd",
+        str(args.n_embd),
+        "--dropout",
+        str(args.dropout),
+        "--batch-size",
+        str(args.batch_size),
+        "--hpo-steps",
+        str(args.hpo_steps),
+        "--final-steps",
+        str(args.final_steps),
+        "--eval-bins",
+        str(args.eval_bins),
+        "--eval-batches",
+        str(args.eval_batches),
+        "--eval-mode",
+        str(args.eval_mode),
+        "--final-eval-batches",
+        str(args.final_eval_batches),
+        "--warmup-steps",
+        str(args.warmup_steps),
+        "--log-every",
+        str(args.log_every),
+    ]
 
 
 def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> list[dict[str, Any]]:
@@ -1336,74 +1720,7 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> list[d
             trial_file.write_text(json.dumps(asdict(trial), indent=2) + "\n")
             env = dict(os.environ)
             env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-            cmd = [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "--worker",
-                "--trial-json",
-                str(trial_file),
-                "--output-dir",
-                str(args.output_dir),
-                "--dataset-source",
-                str(args.dataset_source),
-                "--tokenizer-mode",
-                str(args.tokenizer_mode),
-                "--tokenizer-name",
-                str(args.tokenizer_name),
-                "--tokenizer-add-eos" if args.tokenizer_add_eos else "--no-tokenizer-add-eos",
-                "--wiki-config",
-                str(args.wiki_config),
-                "--hf-dataset",
-                str(args.hf_dataset),
-                "--hf-config",
-                str(args.hf_config),
-                "--hf-split",
-                str(args.hf_split),
-                "--hf-val-split",
-                str(args.hf_val_split),
-                "--hf-text-field",
-                str(args.hf_text_field),
-                "--hf-shuffle-buffer",
-                str(args.hf_shuffle_buffer),
-                "--cache-dir",
-                str(args.cache_dir),
-                "--max-train-bytes",
-                str(args.max_train_bytes),
-                "--max-val-bytes",
-                str(args.max_val_bytes),
-                "--max-train-tokens",
-                str(args.max_train_tokens),
-                "--max-val-tokens",
-                str(args.max_val_tokens),
-                "--block-size",
-                str(args.block_size),
-                "--n-layer",
-                str(args.n_layer),
-                "--n-head",
-                str(args.n_head),
-                "--n-embd",
-                str(args.n_embd),
-                "--dropout",
-                str(args.dropout),
-                "--batch-size",
-                str(args.batch_size),
-                "--hpo-steps",
-                str(args.hpo_steps),
-                "--final-steps",
-                str(args.final_steps),
-                "--eval-bins",
-                str(args.eval_bins),
-                "--eval-batches",
-                str(args.eval_batches),
-                "--eval-mode",
-                str(args.eval_mode),
-                "--final-eval-batches",
-                str(args.final_eval_batches),
-                "--warmup-steps",
-                str(args.warmup_steps),
-                "--log-every",
-                str(args.log_every),
-            ]
+            cmd = build_worker_command(args, trial_file)
             log_path = args.output_dir / f"{trial.name}.worker.log"
             log = log_path.open("w")
             proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, text=True)
@@ -1440,6 +1757,9 @@ def make_plots(args: argparse.Namespace, final_rows: list[dict[str, Any]]) -> No
     plots_dir.mkdir(parents=True, exist_ok=True)
     labels = {
         "anchormuon": "AnchorMuon",
+        "anchormuown": "AnchorMuown",
+        "ema_anchormuon": "EMA-Nesterov + AnchorMuon",
+        "ema_anchormuown": "EMA-Nesterov + AnchorMuown",
         "adamw": "AdamW",
         "adamatan2": "AdamW-Atan2",
         "muon": "Muon",
@@ -1484,6 +1804,9 @@ def make_plots(args: argparse.Namespace, final_rows: list[dict[str, Any]]) -> No
 def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], final_rows: list[dict[str, Any]]) -> None:
     labels = {
         "anchormuon": "AnchorMuon",
+        "anchormuown": "AnchorMuown",
+        "ema_anchormuon": "EMA-Nesterov + AnchorMuon",
+        "ema_anchormuown": "EMA-Nesterov + AnchorMuown",
         "adamw": "AdamW",
         "adamatan2": "AdamW-Atan2",
         "muon": "Muon",
@@ -1538,13 +1861,15 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
     ]
     for rank, row in enumerate(final_sorted, start=1):
         config = f"lr={float(row['lr']):g}, wd={float(row.get('weight_decay', 0.0)):g}"
-        if row["family"] == "anchormuon":
+        if row["family"] in ("anchormuon", "anchormuown", "ema_anchormuon", "ema_anchormuown"):
             config += (
                 f", row_gamma={float(row['row_gamma']):g}, pmuon_beta={float(row['pmuoneq_beta']):g}, "
                 f"normuon_beta2={float(row['normuon_beta2']):g}, fallback={row['fallback_mode']}@{float(row['fallback_lr_mult']):g}x, "
                 f"soda={float(row.get('soda_lambda_scale', 1.0)):g}"
             )
-        if row["family"] in ("ema_muon", "ema_muown"):
+        if row["family"] in ("anchormuown", "ema_anchormuown"):
+            config += f", mag_lr={float(row.get('muown_mag_lr_mult', 1.0)):g}x"
+        if row["family"] in ("ema_muon", "ema_muown", "ema_anchormuon", "ema_anchormuown"):
             config += f", ema_beta={float(row['ema_beta']):g}, ema_gamma={float(row['ema_gamma']):g}"
         if "final_full_val_loss" in row:
             full_loss = f"{float(row['final_full_val_loss']):.4f}"

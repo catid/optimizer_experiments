@@ -632,7 +632,9 @@ class AnchorMuon(torch.optim.Optimizer):
                     group.setdefault("eps", eps)
                 if is_matrix:
                     group.setdefault("fallback_mode", fallback_mode)
+                    group.setdefault("betas", fallback_betas)
                     group.setdefault("fallback_weight_decay", fallback_weight_decay)
+                    group.setdefault("eps", eps)
             return groups
 
         matrix_params: list[torch.Tensor] = []
