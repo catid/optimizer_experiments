@@ -61,17 +61,33 @@ class TrialConfig:
 
 
 class TokenStream:
-    def __init__(self, path: Path, device: torch.device) -> None:
+    def __init__(self, path: Path, device: torch.device, *, vocab_size: int | None = None) -> None:
         arr = np.load(path)
         if not np.issubdtype(arr.dtype, np.integer):
             raise ValueError(f"{path} must contain integer token ids, got {arr.dtype}")
+        if arr.size == 0:
+            raise ValueError(f"{path} contains no token ids")
+        max_id = int(arr.max())
+        if vocab_size is not None and max_id >= vocab_size:
+            raise ValueError(f"{path} contains token id {max_id}, but model vocab size is {vocab_size}")
         self.tokens = torch.from_numpy(arr.astype(np.int64, copy=False)).to(device)
 
     def batch(self, *, batch_size: int, block_size: int, generator: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
-        max_start = self.tokens.numel() - block_size - 1
-        if max_start <= 0:
+        max_start_exclusive = self.tokens.numel() - block_size
+        if max_start_exclusive <= 0:
             raise ValueError("token stream is shorter than block_size")
-        idx = torch.randint(0, max_start, (batch_size,), device=self.tokens.device, generator=generator)
+        idx = torch.randint(0, max_start_exclusive, (batch_size,), device=self.tokens.device, generator=generator)
+        offsets = torch.arange(block_size + 1, device=self.tokens.device)
+        chunk = self.tokens[idx[:, None] + offsets[None, :]]
+        return chunk[:, :-1], chunk[:, 1:]
+
+    def sequential_batch(self, *, batch_index: int, batch_size: int, block_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        max_start_exclusive = self.tokens.numel() - block_size
+        if max_start_exclusive <= 0:
+            raise ValueError("token stream is shorter than block_size")
+        stride = block_size
+        start = (batch_index * batch_size * stride) % max_start_exclusive
+        idx = (start + torch.arange(batch_size, device=self.tokens.device) * stride) % max_start_exclusive
         offsets = torch.arange(block_size + 1, device=self.tokens.device)
         chunk = self.tokens[idx[:, None] + offsets[None, :]]
         return chunk[:, :-1], chunk[:, 1:]
@@ -123,6 +139,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-steps", type=int, default=800)
     parser.add_argument("--eval-bins", type=int, default=8)
     parser.add_argument("--eval-batches", type=int, default=8)
+    parser.add_argument("--eval-mode", choices=["random", "sequential"], default="random")
+    parser.add_argument("--final-eval-batches", type=int, default=0)
     parser.add_argument("--warmup-steps", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--max-hpo-trials", type=int, default=0)
@@ -156,11 +174,28 @@ def _load_hf_tokenizer(name: str) -> Any:
     return tokenizer
 
 
+def _effective_tokenizer_vocab_size(tokenizer: Any) -> int:
+    sizes: list[int] = []
+    try:
+        sizes.append(int(len(tokenizer)))
+    except TypeError:
+        pass
+    vocab_size = int(getattr(tokenizer, "vocab_size", 0) or 0)
+    if vocab_size > 0:
+        sizes.append(vocab_size)
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is not None:
+        sizes.append(int(eos_id) + 1)
+    if not sizes:
+        return 0
+    return max(sizes)
+
+
 def tokenizer_vocab_size(args: argparse.Namespace) -> int:
     if args.tokenizer_mode == "byte":
         return 256
     tokenizer = _load_hf_tokenizer(args.tokenizer_name)
-    vocab_size = int(getattr(tokenizer, "vocab_size", 0) or len(tokenizer))
+    vocab_size = _effective_tokenizer_vocab_size(tokenizer)
     if vocab_size <= 0:
         raise RuntimeError(f"could not determine vocab size for {args.tokenizer_name!r}")
     return vocab_size
@@ -243,7 +278,7 @@ def _consume_text_tokens(
     chunks: list[np.ndarray] = []
     total = 0
     eos_id = getattr(tokenizer, "eos_token_id", None)
-    dtype = _token_dtype(int(getattr(tokenizer, "vocab_size", 0) or len(tokenizer)))
+    dtype = _token_dtype(_effective_tokenizer_vocab_size(tokenizer))
 
     def flush(batch: list[str]) -> None:
         nonlocal total
@@ -525,6 +560,11 @@ class EMANesterovOptimizer:
 
     @torch.no_grad()
     def step(self, closure: Any | None = None) -> Any:
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state.get(p)
+                if state and state.get("lookahead_active", False):
+                    p.copy_(state["base_param"].to(p.dtype))
         loss = self.base_optimizer.step(closure=closure)
         for group in self.param_groups:
             for p in group["params"]:
@@ -618,13 +658,19 @@ def evaluate(
     block_size: int,
     batches: int,
     generator: torch.Generator,
+    mode: str = "random",
 ) -> tuple[float, float]:
     model.eval()
     losses: list[float] = []
     correct = 0
     total = 0
-    for _ in range(batches):
-        x, y = stream.batch(batch_size=batch_size, block_size=block_size, generator=generator)
+    for batch_index in range(batches):
+        if mode == "sequential":
+            x, y = stream.sequential_batch(batch_index=batch_index, batch_size=batch_size, block_size=block_size)
+        elif mode == "random":
+            x, y = stream.batch(batch_size=batch_size, block_size=block_size, generator=generator)
+        else:
+            raise ValueError(f"unknown eval mode {mode!r}")
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits = model(x)
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
@@ -656,8 +702,8 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
     optimizer = make_optimizer(model, trial)
     for group in optimizer.param_groups:
         group["_bench_base_lr"] = float(group.get("lr", trial.lr))
-    train_stream = TokenStream(train_path, device)
-    val_stream = TokenStream(val_path, device)
+    train_stream = TokenStream(train_path, device, vocab_size=vocab_size)
+    val_stream = TokenStream(val_path, device, vocab_size=vocab_size)
     train_gen = torch.Generator(device=device).manual_seed(trial.seed + 10)
     val_gen = torch.Generator(device=device).manual_seed(trial.seed + 20)
 
@@ -708,6 +754,7 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
                     block_size=args.block_size,
                     batches=args.eval_batches,
                     generator=val_gen,
+                    mode=args.eval_mode,
                 )
                 recent = step_times[-max(1, min(len(step_times), trial.eval_every)):]
                 mean_recent = float(np.mean(recent))
@@ -725,6 +772,22 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
 
     eval_rows = [json.loads(line) for line in metrics_path.read_text().splitlines() if '"phase": "eval"' in line]
     final_eval = eval_rows[-1]
+    final_full_eval: dict[str, float] = {}
+    if args.final_eval_batches > 0:
+        full_loss, full_acc = evaluate(
+            model,
+            val_stream,
+            batch_size=args.batch_size,
+            block_size=args.block_size,
+            batches=args.final_eval_batches,
+            generator=torch.Generator(device=device).manual_seed(trial.seed + 30),
+            mode=args.eval_mode,
+        )
+        final_full_eval = {
+            "final_full_val_loss": full_loss,
+            "final_full_val_acc": full_acc,
+            "final_full_eval_batches": int(args.final_eval_batches),
+        }
     summary = {
         **asdict(trial),
         "dataset": dataset_label(args),
@@ -741,6 +804,7 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
         "best_val_loss": min(row["val_loss"] for row in eval_rows),
         "final_val_acc": final_eval["val_acc"],
         "best_val_acc": max(row["val_acc"] for row in eval_rows),
+        **final_full_eval,
         "mean_step_time_ms": float(np.mean(step_times)) * 1000.0,
         "median_step_time_ms": float(np.median(step_times)) * 1000.0,
         "tokens_per_sec": args.batch_size * args.block_size / max(float(np.mean(step_times)), 1e-9),
@@ -1331,6 +1395,10 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> list[d
                 str(args.eval_bins),
                 "--eval-batches",
                 str(args.eval_batches),
+                "--eval-mode",
+                str(args.eval_mode),
+                "--final-eval-batches",
+                str(args.final_eval_batches),
                 "--warmup-steps",
                 str(args.warmup_steps),
                 "--log-every",
@@ -1459,13 +1527,14 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
         f"- Batch: {args.batch_size} sequences x {args.block_size} {unit}",
         f"- HPO: {'skipped; fixed preset configs replayed directly' if args.final_only else f'{_step_description(hpo_rows, args.hpo_steps)} per candidate, selected by best validation loss'}",
         f"- Final replay: {_step_description(final_rows, args.final_steps)} per selected optimizer",
-        f"- Validation estimate: {args.eval_batches} random batches per evaluation point",
+        f"- Validation estimate: {args.eval_batches} {args.eval_mode} batches per evaluation point",
+        f"- Final extra validation: {'disabled' if args.final_eval_batches <= 0 else f'{args.final_eval_batches} {args.eval_mode} batches'}",
         f"- GPUs: {torch.cuda.device_count()} visible, one trial per GPU",
         "",
         "## Final Results",
         "",
-        f"| Rank | Optimizer | Selected config | Final val loss | Best val loss | Final {accuracy_name} | Step time | Throughput |",
-        "|---:|---|---|---:|---:|---:|---:|---:|",
+        f"| Rank | Optimizer | Selected config | Final val loss | Best val loss | Final {accuracy_name} | Full val loss | Full {accuracy_name} | Step time | Throughput |",
+        "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for rank, row in enumerate(final_sorted, start=1):
         config = f"lr={float(row['lr']):g}, wd={float(row.get('weight_decay', 0.0)):g}"
@@ -1477,10 +1546,17 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
             )
         if row["family"] in ("ema_muon", "ema_muown"):
             config += f", ema_beta={float(row['ema_beta']):g}, ema_gamma={float(row['ema_gamma']):g}"
+        if "final_full_val_loss" in row:
+            full_loss = f"{float(row['final_full_val_loss']):.4f}"
+            full_acc = f"{100.0 * float(row['final_full_val_acc']):.2f}%"
+        else:
+            full_loss = "n/a"
+            full_acc = "n/a"
         lines.append(
             f"| {rank} | {labels.get(str(row['family']), row['family'])} | {config} | "
             f"{float(row['final_val_loss']):.4f} | {float(row['best_val_loss']):.4f} | "
-            f"{100.0 * float(row['final_val_acc']):.2f}% | {float(row['mean_step_time_ms']):.2f} ms | "
+            f"{100.0 * float(row['final_val_acc']):.2f}% | {full_loss} | {full_acc} | "
+            f"{float(row['mean_step_time_ms']):.2f} ms | "
             f"{float(row['tokens_per_sec']) / 1000.0:.1f}k {throughput_unit} |"
         )
     lines += [

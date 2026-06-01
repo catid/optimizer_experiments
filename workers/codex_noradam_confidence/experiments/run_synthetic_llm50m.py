@@ -82,8 +82,10 @@ class SyntheticMotifStream:
         self.tokens = torch.from_numpy(stream.astype(np.int64)).to(device)
 
     def batch(self, *, batch_size: int, block_size: int, generator: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
-        max_start = self.tokens.numel() - block_size - 1
-        idx = torch.randint(0, max_start, (batch_size,), device=self.tokens.device, generator=generator)
+        max_start_exclusive = self.tokens.numel() - block_size
+        if max_start_exclusive <= 0:
+            raise ValueError("token stream is shorter than block_size")
+        idx = torch.randint(0, max_start_exclusive, (batch_size,), device=self.tokens.device, generator=generator)
         offsets = torch.arange(block_size + 1, device=self.tokens.device)
         chunk = self.tokens[idx[:, None] + offsets[None, :]]
         return chunk[:, :-1], chunk[:, 1:]

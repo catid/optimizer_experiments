@@ -83,6 +83,18 @@ For LLMs, treat AnchorMuon as competitive but not settled. The next real-LM
 round should tune Muon and AnchorMuon for longer token budgets and include
 multi-seed or longer replay before choosing a language-modeling default.
 
+Bug-hunt note: the loss/accuracy disagreement is not by itself a correctness
+failure. Cross-entropy can be worse while top-1 token accuracy is better if the
+model is less calibrated on the non-argmax probability mass. I did find and fix
+runner issues after this table: tokenizer model-vocab sizing now uses the
+effective tokenizer length, random token windows include the final valid start,
+the LLM EMA-Nesterov wrapper restores base weights before stepping, and the
+runner now supports deterministic sequential validation plus a larger final
+validation pass via `--eval-mode sequential --final-eval-batches N`. The GPT-2
+table above was not affected by the tokenizer-size issue, and it did not include
+EMA-Nesterov variants, but future LLM comparisons should use the stronger final
+evaluation options before treating small loss/accuracy rank reversals as real.
+
 Result bundle:
 `workers/codex_noradam_confidence/results/fineweb_gpt2_llm50m_20260601/`.
 
