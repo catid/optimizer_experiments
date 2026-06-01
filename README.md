@@ -94,6 +94,59 @@ Result bundle:
 
 ![FineWeb-Edu HPO step time](workers/codex_noradam_confidence/results/finewebedu_llm50m_anchor_hpo_20260529/plots/step_time_ms_bar.png)
 
+## FineWeb-Edu 50M LLM Muown / EMA-Nesterov Check
+
+I processed two newer optimizer papers and ran a bounded same-run comparison
+against the previous FineWeb AnchorMuon control:
+
+- **Muown: Row-Norm Control for Muon Optimization**, arXiv `2605.10797v1`.
+  Cleaned notes: `papers/md/2605.10797v1_muown.md`; reference code cloned at
+  `papers/code/muown/`.
+- **EMA-Nesterov: Stabilizing Nesterov's Lookahead for Accelerated Deep
+  Learning Optimization**, arXiv `2605.25395v1`. Cleaned notes:
+  `papers/md/2605.25395v1_ema_nesterov.md`; reference code cloned at
+  `papers/code/ema-nesterov/`.
+
+The implementation lives only in the benchmark runner
+`workers/codex_noradam_confidence/experiments/run_wikitext_llm50m.py` so it does
+not change the shippable root `optimizer.py`. Muown was implemented as an
+implicit optimizer-side weight-normalized Muon variant. EMA-Nesterov was
+implemented as a wrapper around Muon/Muown that applies lookahead before forward
+and updates its EMA direction after the base optimizer step.
+
+Protocol: same byte-level 49.4M GPT and FineWeb-Edu byte cache as the previous
+FineWeb HPO, batch `32 x 128`, BF16 autocast, WSD with 100-step warmup, 32
+validation batches, two RTX PRO 6000 Blackwell GPUs scheduled one trial per
+GPU. HPO used `1,200` steps per candidate and final replay used `6,000` steps
+per selected family. Because this replay is 6K steps, it should be compared to
+the rows in this section, not directly to the older 10K AnchorMuon HPO above.
+
+| Rank | Optimizer | Selected config | Final val loss | Final byte acc | Step time | Throughput |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | EMA-Nesterov + Muown | `lr=0.0016`, `wd=0`, `ema_beta=0.3`, `ema_gamma=0.995` | 1.2131 | 63.30% | 21.91 ms | 187.0k byte/s |
+| 2 | Muown | `lr=0.0016`, `wd=0` | 1.2156 | 63.23% | 20.69 ms | 198.0k byte/s |
+| 3 | AnchorMuon | `lr=0.0012`, `row_gamma=0.45`, `soda=0.003`, `pmuon_beta=0.90`, `normuon_beta2=0.93`, `fallback=RMS@1.0x` | 1.2312 | 62.84% | 14.83 ms | 276.2k byte/s |
+| 4 | Plain Muon | `lr=0.0011`, `wd=0.05` | 1.2338 | 62.76% | 16.89 ms | 242.5k byte/s |
+| 5 | EMA-Nesterov + Muon | `lr=0.001`, `wd=0.05`, `ema_beta=0.5`, `ema_gamma=0.995` | 1.2340 | 62.72% | 18.51 ms | 221.3k byte/s |
+| 6 | AdamW | `lr=0.0004`, `wd=0.05` | 1.2727 | 61.60% | 10.00 ms | 409.4k byte/s |
+| 7 | AdamW-Atan2 | `lr=0.0004`, `wd=0.05` | 1.2756 | 61.44% | 10.35 ms | 395.7k byte/s |
+
+Takeaway: Muown is a real candidate for the next LM round. In this bounded
+single-seed 6K-step proxy, zero-weight-decay Muown beat tuned Muon and the
+previous AnchorMuon control on loss. EMA-Nesterov provided a small additional
+gain on top of Muown but increased step time further. The practical tradeoff is
+quality versus speed: EMA-Nesterov+Muown was best by loss, while AnchorMuon was
+about 35% faster per step than EMA-Nesterov+Muown.
+
+Result bundle:
+`workers/codex_noradam_confidence/results/finewebedu_llm50m_muown_ema_20260601/`.
+
+![Muown / EMA-Nesterov validation loss](workers/codex_noradam_confidence/results/finewebedu_llm50m_muown_ema_20260601/plots/val_loss_curve.png)
+
+![Muown / EMA-Nesterov validation accuracy](workers/codex_noradam_confidence/results/finewebedu_llm50m_muown_ema_20260601/plots/val_acc_curve.png)
+
+![Muown / EMA-Nesterov step time](workers/codex_noradam_confidence/results/finewebedu_llm50m_muown_ema_20260601/plots/step_time_ms_bar.png)
+
 ## FineWeb-Edu 50M LLM WikiText-Transfer Run
 
 The better-data language-modeling check uses `HuggingFaceFW/fineweb-edu`,

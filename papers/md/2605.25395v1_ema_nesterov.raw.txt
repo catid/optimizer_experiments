@@ -1,0 +1,1663 @@
+                                         EMA-Nesterov: Stabilizing Nesterov’s Lookahead for
+                                             Accelerated Deep Learning Optimization
+
+
+                                                        Chung-Yiu Yau1                       Dawei Li1∗             Athanasios Glentis1∗
+
+                                                                    Valentyn Boreiko2†                            Hoi-To Wai3
+arXiv:2605.25395v1 [cs.LG] 25 May 2026
+
+
+
+
+                                                                                             Mingyi Hong1
+                                               1                               2              3
+                                                   University of Minnesota       Amazon AGI     The Chinese University of Hong Kong
+                                                                     1
+                                                                       {cyau,li004678,glent007,mhong}@umn.edu
+                                                             2                                 3
+                                                               valentyn.boreiko@gmail.com        htwai@se.cuhk.edu.hk
+
+
+
+                                                                                                Abstract
+                                                      Lookahead-based acceleration methods, such as Nesterov’s momentum, are widely
+                                                      used in optimization, but they often become unreliable in deep learning training
+                                                      mainly due to stochastic gradient noise and non-convex loss landscapes. In partic-
+                                                      ular, standard lookahead relies on short-horizon update signals (e.g., differences
+                                                      between consecutive iterates), which are inherently noisy and can lead to unstable
+                                                      extrapolation directions. This work revisits Nesterov’s acceleration from a tra-
+                                                      jectory perspective and argues that effective acceleration in deep learning should
+                                                      harness the low-frequency trends of optimization trajectories rather than extrapolat-
+                                                      ing noisy one-step updates. Leveraging this insight, we propose EMA-Nesterov,
+                                                      a simple modification that replaces the standard Nesterov’s lookahead direction
+                                                      with an exponential moving average (EMA) of parameter updates. This yields
+                                                      a stabilized lookahead direction that captures and harnesses the evolving trend
+                                                      of the training trajectory through a low-pass filter, while remaining adaptive to
+                                                      progressive changes via the geometric weighting structure of EMA. We show
+                                                      that EMA-Nesterov retains a theoretical accelerated convergence rate in convex
+                                                      problems that is analogous to Nesterov’s accelerated gradient method. Further-
+                                                      more, we provide empirical evidence on language model pre-training to verify that
+                                                      EMA-Nesterov is broadly applicable across a range of fine-tuned base optimizers,
+                                                      including Adam, SOAP, Muon, as well as complex optimizers that achieve state-
+                                                      of-the-art performance on optimization benchmarks (NanoGPT). Compared to
+                                                      prior lookahead methods, EMA-Nesterov achieves better performance by avoiding
+                                                      the instability of short-horizon lookahead and the non-adaptivity of long-horizon
+                                                      lookahead.
+
+
+                                         1     Introduction
+                                         The growing scale of deep learning training has motivated a new generation of optimizers, such
+                                         as Adam [Kingma and Ba, 2014], SOAP [Vyas et al., 2024], and Muon [Jordan et al., 2024],
+                                         which improve optimization through adaptive preconditioning and normalization mechanisms that
+                                         regularize stochastic gradient updates and stabilize training in highly irregular non-convex loss
+                                         landscapes. Beyond the (base) optimizer design, there has also been renewed interest in incorporating
+                                             ∗ Equally contributing second author.
+                                             † This work is unrelated to Valentyn Boreiko’s position at Amazon.
+
+
+
+                                         Preprint.
+               Trajectory                                  Trajectory
+               Lookahead Position yt                       EMA-Lookahead Position yt
+               Lookahead Direction xt        xt   1
+                                                           EMA-Lookahead Direction mt
+
+
+
+                                                                                               High Loss
+                                        yt
+
+                                  xt                                         xt
+                  t                                         t                       yt
+                 x    1
+                                                           x    1
+
+
+
+
+                                                                                               Low Loss
+
+
+
+Figure 1: A hypothetical illustration of the training trajectory (x1 , x2 , f (x1 , x2 )) ∈ R3 , assuming
+river valley loss landscape and a training trajectory under the WSD learning rate scheduling [Wen et al.,
+2024]. We compare the function value of the lookahead position at (Left) yt = xt + β · (xt − xt−1 )
+which arrives at a high loss position (i.e., f (y1t , y2t ) > f (xt1 , xt2 )) and (Right) yt = xt + β · mt which
+progresses towards the trend of training trajectory where mt = γmt−1 + (1 − γ)(xt − xt−1 ) for
+γ ∈ (0, 1).
+
+
+trajectory-level momentum into deep learning optimization algorithms. In particular, recent works
+revisited Nesterov’s accelerated gradient method [Nesterov, 1983], which extrapolates optimization
+trajectories using past iterate information (a.k.a. lookahead) to achieve accelerated convergence in
+convex optimization. Moreover, acceleration phenomena have also been theoretically established
+beyond convex settings: Hinder et al. [2020], Gupta and Wojtowytsch [2024] showed acceleration for
+certain non-convex problems, while Vaswani et al. [2019] proved accelerated convergence rates for
+SGD under over-parameterized regimes.
+Generally speaking, lookahead acceleration constructs an extrapolated solution by moving beyond
+the current iterate along a direction induced by past optimization trajectories. In the classical
+Nesterov’s accelerated gradient method, this extrapolation direction is given by the difference
+between consecutive iterates, i.e., xt − xt−1 . One key insight behind why such lookahead direction
+can accelerate base optimizers is that extrapolating past iterates allows the algorithm to follow the
+persistent trend of the optimization trajectory, thereby moving more aggressively along stable descent
+directions. However, under the deep learning optimization trajectory, Nesterov’s lookahead can be
+unstable due to oscillating optimizer update that overshoots the minima under pre-conditioning, as
+similarly observed in stochastic optimization [Wang et al., 2022]. In fact, such a lookahead has not
+been widely used in contemporary large-scale deep neural network training. Instead, exponential
+moving average of the past (stochastic) gradients has been a key component for modern optimizers
+such as Adam and Muon. Muon uses the name Nesterov in its implementation3 but our careful
+inspection in Appdenix C.5 shows that it is actually an EMA of stochastic gradient with varying
+EMA rate, and has no connection to Nesterov’s momentum or Nesterov’s lookahead.
+To gain intuition on the training trajectory of deep learning optimization and how lookahead directions
+affect such trajectories, in Figure 1 we consider a simplified river-valley landscape, in which during
+the stable phase of training, the iterate oscillates around the local minima, yet the training progresses
+along the “river” when using the WSD learning rate scheduling [Wen et al., 2024]. When Nesterov’s
+lookahead is applied to this training trajectory, the extrapolation is steered toward the overshooting
+direction, causing the lookahead position to move into regions with higher objective values, see Figure
+1 (left). This phenomenon is further validated in Figure 2, where we measure the validation loss at
+the lookahead positions during NanoGPT training for different lookahead step sizes β. We observe
+that increasing the lookahead step size leads to a sharp increase in the validation loss evaluated at the
+extrapolated positions. This suggests that short-horizon lookahead directions become unreliable in
+deep learning optimization and may produce extrapolated solutions that are unsuitable for constructing
+the next optimization step.
+   3 According to Muon’s open-sourced implementation at https://github.com/KellerJordan/Muon.
+
+
+
+
+                                                       2
+                                                                                xt +      (xt     xt   1
+                                                                                                           )                xt +      mt
+
+                                    Iteration 200                                                 Iteration 400                                                         Iteration 800
+                                                                                4.24                                                                   3.87
+                  4.875
+                                                                                4.22                                                                   3.86
+
+
+
+
+                                                              Validation Loss
+
+
+
+
+                                                                                                                                     Validation Loss
+Validation Loss
+                  4.850                                                                                                                                3.85
+                                                                                4.20
+                  4.825                                                                                                                                3.84
+                                                                                4.18
+                  4.800                                                                                                                                3.83
+                                                                                4.16                                                                   3.82
+                  4.775
+                          0.00    0.25 0.50 0.75       1.00                            0.00    0.25 0.50 0.75                 1.00                            0.00    0.25 0.50 0.75           1.00
+                                 Lookahead Step Size                                          Lookahead Step Size                                                    Lookahead Step Size
+
+Figure 2: Under the NanoGPT setup, we measure the validation loss in different lookahead positions
+yt at iterations t = 200, 400, 800 using (Solid Red) yt = xt + β · (xt − xt−1 ) and (Dashed Green)
+yt = xt + β · mt where mt = γmt−1 + (1 − γ)(xt − xt−1 ) with γ = 0.995. The usual lookahead
+leads to sharp increase in loss and EMA finds stabilized lookahead direction to avoid a sharp increase.
+
+                                                                                                                                                                     Lookahead
+          Prior Works                                                                                      Lookahead Direction                                                     Adaptivity
+                                                                                                                                                                     Frequency
+          Nesterov’s Accelerated Gradient [Nesterov, 1983]                                                           xt − xt−1                                           1                 ✓
+          Pessimistic Lookahead [Zhang et al., 2019]                                                               −(xt − xt−K )                                        1/K                ✗
+          NALA [Zuo et al., 2024]                                                                                   xt − xt−K                                           1/K                ✗
+                                                                                                               t      t−K
+          SNOO [Kallusky et al., 2025] (see App. A.1)                                                      x −x             (Implicit)                                  1/K                ✗
+                                                                                                       zt − zt−1
+          GPA [Defazio et al., 2025] (see App. A.2)                                                                     (Implicit)                                       1                 ✗
+                                                                                                +β(zt − EMA({zr }t−1
+                                                                                                                 r=0 ))
+             EMA-Nesterov (Ours)                                                                       EMA({xr − xr−1 }tr=1 )                                             1                ✓
+
+Table 1: Comparison between lookahead algorithms on the direction and frequency of lookahead.
+Adaptivity refers to whether the lookahead direction can adapt to changes in the trend of training
+trajectory, e.g., as illustrated in Figure 3.
+
+Inspired by the above illustrations, we postulate that an appropriate way to accelerate deep learning
+model training is to smooth the lookahead directions through averaging the past lookahead directions.
+A line of recent works [Zhang et al., 2019, Douillard et al., 2023, Zuo et al., 2024, Kallusky et al.,
+2025] partially addressed this issue by incorporating an inner loop to accumulate (and thus average)
+the sequence of base optimizer updates and effectively performs long-horizon lookahead. These algo-
+rithms have demonstrated an empirical acceleration by adopting long-horizon lookahead. However, it
+is not fully understood how does the mechanism behind long-horizon lookahead enables acceleration.
+We draw insight from the perspective of low-pass filtering and provide a new understanding about
+long-horizon lookahead as a low-pass filter of the iterate updates.
+This work aims at designing a stablized lookahead algorithm that adapts to the varying training
+trajectory by the use of exponential moving average (EMA) recursion, i.e., in the form of mt =
+γmt−1 + (1 − γ)(xt − xt−1 ), γ ∈ (0, 1), to smooth the lookahead updates. As seen in Figure 1
+(right), the EMA recursion finds the direction with less fluctuations; and the dashed green curves in
+Figure 2 shows that the lookahead position generated by the EMA-Nesterov algorithm does not suffer
+from the same performance degradation as the usual lookahead direction in solid red curves, therefore
+can be reliably used to build the subsequent steps. As a comparison, we summarize the existing
+lookahead algorithms according to their lookahead direction, lookahead frequency and adaptivity in
+Table 1 (also see Section 2 and 3). These recent approaches either suffer from non-adaptive lookahead
+or short-horizon oscillation due to their implicit algorithmic structure.
+Our Contributions                              The contribution of this paper is summarized below.
+• We introduce a trajectory-based perspective of lookahead acceleration for deep learning opti-
+  mization. We show that classical short-horizon lookahead becomes unstable in deep learning
+  optimization due to oscillatory high-frequency trajectory components, motivating a low-pass
+  filtering view of acceleration.
+• We propose EMA-Nesterov, a lightweight single-loop acceleration method that replaces long-
+  horizon extrapolation with an exponential moving average of optimization trajectories, i.e., for a
+
+
+                                                                                                       3
+    given base optimizer function At : Rd → Rd , we perform
+                 xt+1 = At (xt + βt mt ),    mt+1 = γmt + (1 − γ)(xt+1 − xt ),                     (1)
+    see Algorithm 1 for details. EMA-Nesterov exhibits a low-passed lookahead direction that can
+    adapt to a varying trend in the training trajectory.
+• We prove that EMA-Nesterov retains accelerated p    convergence rates in convex optimization. In
+  particular, we establish accelerated rates of O((1 − (1 − γ)/κ)T ) for strongly convex objectives
+  with condition number κ > 0 and O(1/T 2 ) for convex objectives.
+• We demonstrate that EMA-Nesterov acts as a generic acceleration wrapper for modern neural
+  network optimizers, consistently improving Adam, SOAP, Muon, and NorMuon on NanoGPT
+  and Llama pre-training benchmarks. For example, in the NanoGPT benchmark4 , it improves the
+  fine-tuned Muon optimizer on NanoGPT (162M) by achieving a 6% acceleration (for reaching the
+  benchmark target of 3.28 validation loss). Our method outperforms existing lookahead algorithms
+  under a comprehensive hyperparameter sweep for all baselines (see Figure 5).
+
+More broadly, EMA-Nesterov can be viewed as a lightweight and optimizer-agnostic acceleration
+mechanism that can be combined with a broad class of modern neural network optimizers. Rather
+than redesigning optimizer-specific update rules, EMA-Nesterov operates directly at the trajec-
+tory level through stabilized lookahead extrapolation, making it naturally compatible with existing
+preconditioning, normalization, and momentum techniques.
+
+2     Understanding Lookahead Acceleration in Deep Learning
+This section studies the recent prior arts on lookahead acceleration and compares them with the
+classical Nesterov’s lookahead algorithm from a trajectory perspective. We then identify key insights
+in the prior arts and suggest how they may inspire new algorithms.
+To fix notations, we consider the stochastic optimization problem: for random sample ξ drawn from
+some distribution D,
+                              f ⋆ := minx∈Rd f (x) := Eξ∼D [f (x; ξ)],                         (2)
+where f (x; ξ) is differentiable w.r.t. x. Here, we may denote A(x; ξ, s) as an optimizer function
+that takes the current model state x and returns the next model state, via consuming a sample of
+stochastic objective function gradient evaluated on x with randomness ξ, while the optimizer update
+is conditioned on its internal states s. For example, A(x; ξ, s) = x − αt (γs + (1 − γ)∇f (x; ξ)) with
+learning rate αt > 0 produces the next model state using momentum SGD under gradient momentum
+rate γ ∈ [0, 1) and momentum buffer s ∈ Rd . For simplicity, in the rest of this paper, we shall use
+the notation At (x) := A(x; ξ t , st ).
+We begin our endeavor through studying the lookahead algorithm in Nichol et al. [2018], Zhang et al.
+[2019]. With a lookahead step size β > 0 and an optimizer At : Rd → Rd (e.g., vanilla/momentum
+SGD, Muon, etc.) for (2), they proposed
+            for every t = nK, n = 0, ..., ⌊T /K⌋,
+                                                                                                   (3)
+                x̃t+K = At+K−1 ( · · · At+1 (At (xt ))),   xt+K = xt + β(x̃t+K − xt ).
+
+For every K steps of optimizer update At , the accumulated update x̃t+K − xt is applied with a small
+step size β ≤ 1, which means that the algorithm’s solution only interpolates between x̃t+K and xt .
+The key property of (3) is that the long-horizon update direction x̃t+K − xt averages optimization
+trajectories across multiple iterations, thereby suppressing high-frequency oscillations in stochastic
+optimization. As a result, the extrapolation direction becomes substantially more stable than the
+one-step lookahead direction used in classical Nesterov acceleration (similar to the case of Figure
+1 (right)). Importantly, [Zhang et al., 2019, Proposition 2] demonstrated that the above scheme
+achieves a O(β)-factor variance reduction. That being said, as demonstrated in [Zhang et al., 2019,
+Appendix A], (3) only exhibits a slightly improved empirical convergence speed over vanilla SGD in
+the quadratic setting, suggesting an ‘unaccelerated’ rate of f (xT ) − f ⋆ = O((1 − 1/κ)T ), where κ
+is the condition number of f (x).
+    4 From https://github.com/KellerJordan/modded-nanogpt.
+
+
+
+
+                                                  4
+           Trajectory                                              Trajectory
+                                                                                                         High Loss
+           Lookahead Position yt                                   EMA-Lookahead Position yt
+                                      t           t   K                                             t
+           Lookahead Direction x              x                    EMA-Lookahead Direction m
+
+
+
+
+                                                                                              yt
+            xt   K
+                                  t           t
+                                 x        y
+                                                                                            xt
+                                                                                                         Low Loss
+
+
+Figure 3: A hypothetical illustration of the training trajectory (x1 , x2 , f (x1 , x2 )) ∈ R3 , assuming a
+U-shaped river valley loss landscape and a training trajectory under the WSD learning rate scheduling
+[Wen et al., 2024]. We compare the function value of the long-horizon lookahead position at (Left)
+yt = xt + β · (xt − xt−K ) which arrives at a high loss position and (Right) yt = xt + β · mt which
+progresses towards the trend of training trajectory where mt = γmt−1 + (1 − γ)(xt − xt−1 ) for
+γ ∈ (0, 1).
+
+
+For further insights, we compare (3) to the classical Nesterov’s accelerated gradient method by
+reducing (3) to the special case with K = 1. Notice that in this case, (3) is equivalent to:
+                 xt+1 = xt + β(At (xt ) − xt ) = At (xt ) + (β − 1)(At (xt ) − xt ) .
+                                                 |              {z               }                                   (4)
+                                                                               lookahead position
+
+On the other hand, Nesterov’s lookahead algorithm [Nesterov, 1983] can be written as:
+                             xt+1 = At ( xt + β ′ (xt − xt−1 ) ),                       β ′ > 0.                     (5)
+                                         |         {z       }
+                                                          lookahead position
+
+                                                        rate: with an appropriate β ′ and At utilizing
+It is known that (5) achieves an accelerated convergencep
+deterministic gradient, one has f (x ) − f = O((1 − 1/κ)T ) for strongly convex f .
+                                     T      ⋆
+
+Comparing (4) and (5) on their corresponding lookahead position, we note that (4) can be regarded
+as a pessimistic lookahead algorithm since it uses the reversed Nesterov’s lookahead direction when
+β − 1 becomes negative. This also implies that (4) may not be able to achieve acceleration when
+using a conservative lookahead step size β ≤ 1. Meanwhile, Nesterov’s lookahead (5) takes an
+optimistic lookahead direction as it fully trusts the update direction of past iteration with any β ′ > 0.
+
+3   Stabilized Nesterov’s Lookahead
+We will develop EMA-Nesterov using the insights from the trajectory perspective, and to present the
+convergence properties of EMA-Nesterov. The discussion from the previous section motivates us to
+look at an optimistic lookahead algorithm with K-step long-horizon lookahead:
+             for every t = nK, n = 0, ..., ⌊T /K⌋,
+                                                                                                                     (6)
+                 xt+K = At+K−1 ( · · · At+1 (At (xt + β ′ bt ))),                         bt+K = xt+K − xt .
+The same algorithm structure is used explicitly in NALA [Zuo et al., 2024] or implicitly in SNOO
+[Kallusky et al., 2025]. Particularly, Zuo et al. [2024] attempted to combine the advantages of
+Nesterov’s accelerated gradient method and long-horizon lookahead, yielding an algorithm similar to
+(6) where At is gradient descent for t mod K = 0 and At is a pre-conditioned stochastic algorithm
+for t mod K ̸= 0. Later, Kallusky et al. [2025] treated the long-horizon lookahead direction as a
+pseudo-gradient for Nesterov’s momentum algorithm [Sutskever et al., 2013], yielding an algorithm
+that is fundamentally similar to (6) as discussed in Appendix A.1. Defazio et al. [2025] developed
+a single-loop algorithm under the primal-averaging framework which implicitly approximated a
+mixture of short-horizon and long-horizon lookahead as discussed in Section A.2, where such mixture
+implies unstable oscillation from short-horizon lookahead. We summarize the above algorithms from
+the lookahead perspective in Table 1.
+
+
+                                                                  5
+To fully understand the long-horizon lookahead direction bt in (6), we rewrite bt in terms of one-step
+iterate update ∆xt := xt − xt−1 as
+                                                1
+                                                   Pt
+                        bt = xt − xt−K = K · K                      i
+                                                      i=t−K+1 ∆x , t ≥ K.                          (7)
+As seen, bt is the unweighted combination of the past K iterations of (one-step) lookahead directions,
+i.e., it is the output of an order-K moving average low-pass filter over the sequence {∆xi }i≥1 . The
+low-pass filter suppresses high-frequency fluctuations in consecutive iterate updates. This aligns
+with our prior understanding that long-horizon lookahead can reduce fluctuation in the lookahead
+updates. However, we argue that such unweighted combination induces a lookahead direction that is
+not adaptive to the local geometry. In particular, when the trend of training trajectory evolves over
+time, the unweighted average (7) with large K can only capture a global trend, which is not suitable
+for local extrapolation, as illustrated in the left figure of Figure 3.
+3.1 Exponential Moving Average Lookahead
+Alternative to long-horizon lookahead, we replace the lookahead direction with a low-pass filter that
+is adaptive to the recent signals — the exponential moving average (EMA) filter: for t ≥ 1 and let
+γ ∈ [0, 1),
+                       mt+1 = γmt + (1 − γ)∆xt+1 =: EMAγ ({∆xi }t+1         i=1 ).                 (8)
+                                      t+1                 t+1
+In particular, one has EMAγ ({∆xi }i=1 ) = (1 − γ) i=1 γ t+1−i ∆xi . Notice that (8) is a low-pass
+                                                        P
+filter with the geometric coefficients {γ i }i≥1 that is anticipated to filter out the high-frequency
+fluctuations while putting larger weights on recent lookahead signals ∆xi , i.e., it aligns more with
+the recent trend of ∆xi as illustrated in the right figure of Figure 3. The low-pass behavior of EMA
+                                                             1−γ
+filter can be analyzed by its transfer function H(z) = 1−γz     −1 on the input signal z = exp(iω) of
+
+frequency ω ∈ [0, π], where the output energy |H(exp(iω))| is decreasing as ω increases from 0 (low
+frequency) to π (high frequency). We replace the lookahead direction of Nesterov’s algorithm by mt
+and propose EMA-Nesterov in Algorithm 1.
+
+Algorithm 1 EMA-Nesterov Algorithm
+ 1: Input: Initial model x0 , lookahead step size βt ≥ 0, exponential moving average rate γ ∈ [0, 1),
+    base optimizer At (·), iterations T > 0.
+ 2: Initialization: m0 = 0.
+ 3: for t = 0, ..., T − 1 do
+ 4:   xt+1 = At (xt + βt mt )
+ 5:   mt+1 = γmt + (1 − γ)(xt+1 − xt )
+ 6: end for
+ 7: Output: Last iterate solution xT .
+
+
+Line 4 of Algorithm 1 performs an optimization step from the lookahead position xt + βt mt , using
+the EMA lookahead direction mt . With γ > 0, Algorithm 1 accumulates a stabilized lookahead
+direction in mt that effectively follows the trend of optimization trajectory, without being perturbed
+by the oscillation that enters the filter as high frequency noise.
+Comparison to Existing Algorithms. We can directly compare the differences between existing
+lookahead algorithms by reducing them into the lookahead form. For example, SNOO [Kallusky
+et al., 2025] can be reduced to the K-step long-horizon lookahead in (6) (see Appendix A.1 for the
+derivation) and GPA [Defazio et al., 2025] can be reduced to the following lookahead algorithm (see
+Appendix A.2 for the derivation):
+                  for every t = 0, ..., T − 1,
+                       zt+1 = zt − γp ∇f (yt ; ξ t ),     xt+1 = βxt + (1 − β)zt+1 ,               (9)
+                          t+1      t              t+1      t                 t+1      t
+                      y         = y + (1 − β)(z         − z ) + β(1 − β)(z         − x ).
+The lookahead direction of GPA is determined by zt+1 − zt and zt+1 − xt , where the former is
+vulnerable to high-frequency fluctuations while the latter is effectively a long-horizon lookahead
+with xt tracking the past trajectory of zt . A direct comparison on the numerical performance is
+provided in Figure 5, where our algorithm further improved GPA by 0.2 validation perplexity on
+NanoGPT. Theoretically, the convergence analysis of Defazio et al. [2025] does not guarantee
+
+
+                                                    6
+accelerated convergence rate. In contrary, our Algorithm 1 adopts a matching design with Nesterov’s
+accelerated algorithm which enables us to carry out convergence analysis with accelerated rate for
+convex optimization.
+3.2 Convergence Analysis
+In this subsection, we show that due to the optimistic design, EMA-Nesterov attains the same
+accelerated convergence as the classical Nesterov’s accelerated gradient algorithm when specialized
+to (2) with (strongly) convex objective function and the optimizer utilizes exact gradients of f (x). We
+focus on the special case of Algorithm 1 with the optimizer specified as the vanilla gradient descent:
+                                      A(x; ξ; s) = x − α∇f (x).                                      (10)
+We notice that Algorithm 1 with (10) and EMA rate γ = 0 reduces to the classical Nesterov’s
+accelerated gradient algorithm; yet when γ > 0, the two algorithms exhibit different lookahead
+behavior. Despite their similar algorithmic structure, we notice that extending the analysis in
+[Nesterov, 1983] to Algorithm 1 is highly non-trivial, especially for achieving the accelerated
+convergence rate(s). In this section, we proceed with the convergence guarantee of the above
+algorithm under a standard µ-strongly convex, L-smooth assumption for (2) as defined below.
+Assumption 1. For any L > µ ≥ 0, we assume the objective function f is µ-strongly convex and has
+L-Lipschitz gradient such that ∥∇f (x) − ∇f (y)∥2 ≤ L∥x − y∥2 ∀x, y ∈ Rd . We define κ := L/µ
+as the condition number of f .
+We remark that as the deep learning training problems are typically non-convex, the convexity
+assumption above may not be satisfied in practice. Nonetheless, they provide insights and theoretical
+support on the advantages of EMA-Nesterov, and the analysis can be of independent interests for
+studying perturbed Nesterov’s accelerated gradient. Our results are further split into two cases.
+Strongly Convex f (x). When µ > 0, we observe that
+                                                                           √      √ 2
+                                                                               1−γ− 1/κ
+Theorem 1. Under Assumption 1, by choosing α = 1/L and βt = (1−γ)(1−1/κ) for all t =
+0, ..., T − 1, the solution of Algorithm 1 with (10) satisfies
+                                       p               
+           f (xT ) − f (x⋆ ) = O (1 − (1 − γ)/κ)T            for any γ ∈ [0, 1 − 1/κ), T > 0.   (11)
+
+See Appendix
+    p        B.1 for the proof. The above guarantee reduces to the classical accelerated rate of
+(1 − 1/κ)T of Nesterov’s algorithm when γ = 0. Our analysis generalizes to EMA-Nesterov
+when γ > 0 and the acceleration upon the gradient descent rate of (1 − 1/κ)T happens when
+                              p
+                                (1 − γ)/κ > 1/κ ⇔ γ < 1 − 1/κ.                              (12)
+
+Non-strongly Convex f (x). When µ = 0, we observe that
+                                                                                     ct −γct+1
+Theorem 2. Under Assumption 1 with µ = 0, by choosing α = 1/L and βt = 1+(1−γ)c              t+1
+                                                                                                  for
+            γ      t
+ct = 1 + 4(1−γ) + 4 , the solution of Algorithm 1 with (10) satisfies
+              f (xT ) − f (x⋆ ) = O L/((1 − γ)3 T 2 )
+                                                      
+                                                          for any γ ∈ [0, 1), T > 0.             (13)
+
+See Appendix B.2 for the proof. Unlike the strongly convex case, Theorem 2 guarantees an accelerated
+convergence rate of O(1/T 2 ) for all γ ∈ [0, 1), i.e., it converges faster than gradient descent of rate
+O(1/T ) on convex objective function for large enough T = Ω(1/(1 − γ)3 ).
+3.3 Practical Implementation of Lookahead Step Size Scheduling
+It is generally understood that the early stage of deep learning optimization is unstable. As a remedy,
+we will schedule the lookahead step size βt by three stages: 1) the warm-up stage where βt = 0
+for t ≤ Tw ; 2) the lookahead stage where βt = β · αt /(maxk αk ) for Tw < t ≤ Tr such that the
+lookahead step size relatively follows αt /(maxk αk ) the learning rate schedule; and 3) the early rest
+stage where βt = 0 for t > Tr . The early rest stage is crucial to allow stable convergence to sharp
+local minima during the learning rate decay phase, as the EMA lookahead direction cannot quickly
+adapt to the local geometry near sharp minima. This is further validated by the observation in Figure
+8, where the EMA lookahead direction leads to sharp increase in loss in later stage of the training. In
+our experiments, the scheduling of βt (Tw and Tr ) roughly follows the learning rate schedule as the
+learning rate schedule implicitly controls when stable training occurs. Details of the actual schedule
+used in our experiments can be found in Appendix C.4.
+
+                                                   7
+                  3.48 NanoGPT Track 1 (124M) FineWeb                              3.48 NanoGPT Track 1 (124M) FineWeb                         3.3000 NanoGPT Track 3 (162M) FineWeb
+                  3.47                                                             3.47                                                        3.2975
+                  3.46                                                             3.46                                                        3.2950
+                  3.45                                                             3.45
+                  3.44                                                             3.44                                                        3.2925
+                  3.43                                                             3.43                                                        3.2900
+                  3.42                                                             3.42                                                        3.2875
+                  3.41                                                             3.41                                                        3.2850
+                  3.40                                                             3.40
+                  3.39                                                             3.39                                                        3.2825
+Validation Loss
+
+
+
+
+                                                                 Validation Loss
+
+
+
+
+                                                                                                                             Validation Loss
+                  3.38                                                             3.38                                                        3.2800
+                  3.37                                                             3.37                                                        3.2775
+                  3.36                                                             3.36                                                        3.2750
+                  3.35                                                             3.35                                                        3.2725
+                  3.34                                                             3.34                                                                     Muon
+                  3.33                                                             3.33                                                        3.2700
+                  3.32                                                             3.32                                                        3.2675       EMA-Nesterov + Muon
+                  3.31                                                             3.31                                                                     EMA-Nesterov + Muon
+                                                                                                                                               3.2650       with shorter iterations
+                  3.30      Muon                                                   3.30      SOAP                                              3.2625       Aurora
+                  3.29      EMA-Nesterov + Muon                                    3.29      EMA-Nesterov + SOAP                                            EMA-Nesterov + Aurora
+                  3.28      NorMuon                                                3.28      Adam                                              3.2600
+                                                                                                                                                            EMA-Nesterov + Aurora
+                  3.27      EMA-Nesterov + NorMuon                                 3.27      EMA-Nesterov + Adam                               3.2575       with shorter iterations
+                  3.26                                                             3.26                                                        3.2550
+                     3000 3500 4000 4500 5000 5500 6000                               3000 3500 4000 4500 5000 5500 6000                            2700 2800 2900 3000 3100 3200 3300
+                                     Iterations                                                       Iterations                                                     Iterations
+
+Figure 4: Training EMA-Nesterov with different base optimizers (Muon, NorMuon, SOAP and
+Adam) on NanoGPT Track 1 (124M) benchmark (Left, Middle) and with SOTA base optimizers (as
+of 05/18/2026) on NanoGPT Track 3 (162M) (Right). Results are reported by mean-variance plots of
+±1 standard deviation on multiple seeded runs for each algorithm.
+                                                                                      NanoGPT (124M) FineWeb
+                                     EMA-Nesterov + Muon    Pessimistic Lookahead + Muon                        SNOO + Muon                                      GPA + Muon
+                        27.0
+                        26.9
+                        26.8
+                        26.7
+Validation Perplexity
+
+
+
+
+                        26.6
+                        26.5
+                        26.4                                                                                    Muon
+                                                                                                                K = 10, = 0.5
+                                                                                                                K = 10, = 0.8
+                        26.3            Muon                                                                    K = 10, = 0.95                                  Muon
+                                         =0                                                                     K = 50, = 0.5                                   K = 8, x = y1/8
+                        26.2             = 0.9                               Muon                               K = 50, = 0.8                                   K = 16, x = y1/16
+                                         = 0.95                              K=8                                K = 50, = 0.95                                  K = 32, x = y1/32
+                                         = 0.99                              K = 32                             K = 100, = 0.5
+                        26.1             = 0.995                             K = 128                            K = 100, = 0.8                                  K = 64, x = y1/64
+                                         = 0.999                             K = 512                            K = 100, = 0.95                                 K = 128, x = y1/128
+                        26.0
+                               0.1     0.3 0.5 0.7 0.9      0.5 0.7 0.9 1.1 1.3 1.5 0.250 0.375 0.500 0.625 0.750 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8
+                                     Nesterov's Lookahead      Lookahead Step Size       SNOO Momentum                     EMA Rate y
+                                       Step Size max
+                                                   t  t
+
+
+Figure 5: Comparison on accelerating Muon base optimizer using EMA-Nesterov, pessimistic
+lookahead, GPA and SNOO on NanoGPT (124M) benchmark. The same vertical axis spans across
+four plots horizontally. Among all hyperparameter configurations, EMA-Nesterov + Muon with
+γ = 0.995, maxt βt = 0.5 achieves the lowest validation perplexity.
+
+4                        Experiments
+We validate the performance of Algorithm 1 on two language model pre-training settings: (I) training
+the NanoGPT models on FineWeb dataset5 and (II) training Llama models on C4-en dataset. Unless
+otherwise specified, all settings use a training budget of around 20 tokens-per-parameter as suggested
+by Hoffmann et al. [2022]. The main experiments are performed on 8× NVIDIA H200 GPUs (141
+GB memory). Our algorithm is implemented as a lightweight wrapper and does not impose extra
+overhead on the per-iteration time, we thus focus on comparing different algorithms’ performance
+after a fixed number of training iterations. The base optimizers’ hyperparameters are tuned without
+EMA-Nesterov and are unchanged when adding EMA-Nesterov externally. Our experiment is
+open-sourced at https://github.com/OptimAI-Lab/ema-nesterov.
+
+   5124M model is based on https://github.com/KellerJordan/modded-nanogpt/blob/master/records/
+
+track_1_short/2024-10-10_Muon/eb5659d0-fb6a-49e5-a311-f1f89412f726.txt while 162M model is based
+on https://github.com/KellerJordan/modded-nanogpt/tree/master/records/track_3_optimization.
+
+
+                                                                                                    8
+                                  Muon                                                       EMA-Nesterov + Muon   = 0.95                              EMA-Nesterov + Muon   = 0.995
+                                  EMA-Nesterov + Muon   = 0.9                                EMA-Nesterov + Muon   = 0.99                              EMA-Nesterov + Muon   = 0.999
+
+
+                                     Llama (60M) C4                                               Llama (130M) C4                                              Llama (350M) C4
+                               2500 Total Iter., 0.5M Token BS                           21.7 2500 Total Iter., 1M Token BS                           16.6 2500 Total Iter., 3M Token BS
+                        28.2
+                                                                                         21.6                                                         16.5
+
+
+
+
+                                                                 Validation Perplexity
+
+
+
+
+                                                                                                                              Validation Perplexity
+Validation Perplexity
+
+
+
+                        28.0                                                             21.5                                                         16.4
+
+                        27.8                                                             21.4                                                         16.3
+
+                                                                                         21.3                                                         16.2
+                        27.6
+                                                                                         21.2                                                         16.1
+                               0.1 0.3 0.5 0.7 0.9                                              0.1 0.3 0.5 0.7 0.9                                          0.1 0.3 0.5 0.7 0.9
+                               Lookahead Step Size max
+                                                    t  t                                        Lookahead Step Size max
+                                                                                                                     t  t                                    Lookahead Step Size max
+                                                                                                                                                                                  t  t
+
+Figure 6: Sensitivity of hyperparameters for EMA-Nesterov + Muon across different model sizes on
+the Llama setup. The value of maxt βt is searched in {0.1, 0.3, 0.5, 0.7, 0.9} across the horizontal
+axis and the value of γ is searched in {0.9, 0.95, 0.99, 0.995, 0.999} across different colors.
+
+
+Accelerating Common Optimizers. The first experiment aims to present the acceleration effects
+offered by applying EMA-Nesterov on common pre-conditioned optimizers as At — including
+Adam [Kingma and Ba, 2014], SOAP [Vyas et al., 2024], Muon [Jordan et al., 2024] and NorMuon
+[Li et al., 2025]. In Figure 4, we apply EMA-Nesterov with the best pair of hyperparameters
+(γ, maxt βt ) (selected from Figure 5) onto different choices of base optimizer At . Also from the
+figure, EMA-Nesterov improves the performances of these common optimizers ranging from 0.208
+perplexity drop (on Muon) to 1.305 perplexity drop (on Adam). For the larger model size of NanoGPT,
+we similarly apply EMA-Nesterov onto the SOTA optimization algorithms such as Muon and Aurora
+[Dewulf et al., 2026] and observe acceleration upon the base optimizers. Note that to achieve the
+maximal acceleration for arriving at a target loss value (e.g., the benchmark target of 3.28 validation
+loss in Figure 4), we adjust the total iterations accordingly as shown in the right figure of Figure 4.
+These evidences show that EMA-Nesterov can offer acceleration to existing fine-tuned optimizers.
+Comparison with Existing Lookahead Algorithms. Our second experiment compares
+EMA-Nesterov to existing baseline lookahead algorithms. For fairness, we also perform a hy-
+perparameter search on the NanoGPT setting for pessimistic lookahead [Zhang et al., 2019], SNOO
+[Kallusky et al., 2025] and GPA [Defazio et al., 2025] according to the corresponding suggested
+range of hyperparameters. As seen in Figure 5, EMA-Nesterov achieved the largest improvement
+among the other lookahead algorithms under the Muon base optimizer At .
+Model Scaling. This experiment investigates how sensitive the performance of EMA-Nesterov is
+on choosing the hyperparameters γ and maxt βt for different model sizes. We perform a set of
+hyperparameter sweep over 60M, 130M and 350M parameter Llama models on C4 pre-training. The
+batch sizes are scaled up accordingly to match the total training budget of 20× tokens-per-parameter.
+From Figure 6, when scaling to larger models, the optimal hyperparameters shift predictably. As the
+model size increases, the optimal γ tends to increase and the optimal maxt βt tends to decrease. By
+this set of results, default choices of maxt βt = 0.5, γ = 0.99 for model size ≤ 350M and γ = 0.995
+for model size > 350M are recommended for large batch setting. In Appendix C.3, we provide more
+hyperparameter sweeps to illustrate the hyperparameter sensitivity in other settings and our default
+hyperparameters deliver near-optimal performance. Finally, we scale up to 1B model in the left figure
+of Table 2, and summarizes the last iteration validation perplexity for different Llama models in Table
+2.
+Data / Batch Size Scaling. To stress test the performance of EMA-Nesterov on more realistic
+setting, we increase the training budget beyond 20× tokens-per-parameter in Figure 7. Under the
+optimal hyperparameters from Figure 6, we observe that EMA-Nesterov consistently improved the
+base optimizer in larger batch size setting, validating the practical advantage of EMA-Nesterov for
+large-scale data-parallel pre-training. We also observe that a (·)1/4 learning rate scaling rule delivers
+better performance than the square root scaling rule (see comparison in Figure 9).
+
+
+                                                                                                        9
+                         15.00 Llama (1B) C4, 4M Token Batch Size
+                                                                                                                                                                      Token
+                                                                                                            Algorithm        Val. Ppl.                      Iter.                  γ     maxt βt
+                                                                                                                                                                    Batch Size
+
+                                            Muon                                                                                       60M Model
+                         14.75              EMA-Nesterov + Muon                                               Muon              28.11
+                                                                                                                                                           2500       0.5M
+                                                                                                                                                                                   -        -
+
+                         14.50                = 0.999 max
+                                                       t  t = 0.5
+                                                                                                       EMA-Nesterov + Muon      27.62                                            0.99      0.7
+                                                                                                              Muon              24.09                                              -        -
+                                                                                                                                                           2500        4M
+                                                                                                       EMA-Nesterov + Muon      23.67                                            0.99      0.7
+                         14.25                                                                                Muon              28.21                                              -        -
+                                                                                                                                                           5000      0.26M
+                         14.00
+Validation Perplexity
+
+                                                                                                       EMA-Nesterov + Muon      27.27                                            0.995     0.7
+                                                                                                                                    130M Model
+                         13.75                                                                                Muon              21.59
+                                                                                                                                                           2500        1M
+                                                                                                                                                                                   -        -
+                                                                                                       EMA-Nesterov + Muon      21.26                                            0.99      0.7
+                         13.50                                                                                Muon              18.39
+                                                                                                                                                           2500        8M
+                                                                                                                                                                                   -        -
+                                                                                                       EMA-Nesterov + Muon      18.11                                            0.99      0.7
+                         13.25                                                                                Muon              21.15                                              -        -
+                                                                                                                                                           5000       0.5M
+                         13.00                                                                         EMA-Nesterov + Muon
+                                                                                                              Muon
+                                                                                                                                20.85
+                                                                                                                                17.78
+                                                                                                                                                                                 0.995
+                                                                                                                                                                                   -
+                                                                                                                                                                                           0.5
+                                                                                                                                                                                            -
+                                                                                                                                                           5000        4M
+                         12.75                                                                         EMA-Nesterov + Muon      17.59                                            0.995     0.5
+                                                                                                                                    350M Model
+                         12.50                                                                                Muon              16.12
+                                                                                                                                                           2500        3M
+                                                                                                                                                                                   -        -
+                                                                                                       EMA-Nesterov + Muon      15.86                                            0.99      0.5
+                         12.25                                                                                Muon              14.01
+                                                                                                                                                           2500       25M
+                                                                                                                                                                                   -        -
+
+                         12.00                                                                         EMA-Nesterov + Muon      13.82                                            0.99      0.5
+                             2000       3000        4000        5000                                                                       1B Model
+                                           Iterations                                                         Muon
+                                                                                                       EMA-Nesterov + Muon
+                                                                                                                                12.22
+                                                                                                                                12.12
+                                                                                                                                                           5000        4M
+                                                                                                                                                                                   -
+                                                                                                                                                                                 0.999
+                                                                                                                                                                                            -
+                                                                                                                                                                                           0.5
+  Table 2: (Left) Training curve of Muon and EMA-Nesterov + Muon on Llama 1B for 5000 iterations.
+  (Right) Validation perplexities of different sizes of Llama models.
+                                     Llama (60M) C4                                              Llama (130M) C4                                                  Llama (350M) C4
+                         29 2500 Total Iterations, = 1/4                                 22 2500 Total Iterations, = 1/4                                  17 2500 Total Iterations, = 1/4
+                                        Muon                                                             Muon                                                                Muon
+                         28
+ Validation Perplexity
+
+
+
+
+                                                                                                                                  Validation Perplexity
+                                                                 Validation Perplexity
+
+
+
+
+                                        EMA-Nesterov + Muon                                              EMA-Nesterov + Muon                                                 EMA-Nesterov + Muon
+                                         = 0.99 max  t = 0.7                             21               = 0.99 max  t = 0.7                             16                  = 0.99 max  t = 0.5
+                         27                      t                                                                t                                                                   t
+
+                         26                                                              20                                                               15
+                         25
+                                                                                         19                                                               14
+                         24
+                         23                                                              18                                                               13
+                            0.5M 1M      2M                 4M                                1M 2M        4M                8M                                3M 6M       12M                     25M
+                                    Token Batch Size                                                  Token Batch Size                                                 Token Batch Size
+  Figure 7: Data scaling to total training budgets of ≥ {20×, 40×, 80×, 160×} tokens-per-parameter
+  with increased token batch size and fixed 2500 total iterations. The learning rates are adapted under
+  the power scaling rule: for tuned learning rate α on batch size B, the adapted learning rate α′ for
+  larger batch size B ′ > B is α′ = α · (B ′ /B)δ with the learning rate scaling exponent δ = 1/4.
+
+
+  5                       Conclusion
+ We proposed a lightweight wrapper algorithm called EMA-Nesterov that is motivated by the low-
+ pass filtering of lookahead directions in deep learning setting. EMA-Nesterov utilizes a stabilized
+ lookahead direction by filtering the high frequency oscillation in the training trajectory. We show
+ that EMA-Nesterov achieved acceleration in practical deep learning problems and theoretical convex
+ problems.
+
+  References
+  Aaron Defazio, Konstantin Mishchenko, Parameswaran Raman, Hao-Jun Michael Shi, and Lin
+    Xiao. Smoothing diloco with primal averaging for faster training of llms. arXiv preprint
+    arXiv:2512.17131, 2025.
+  Alec Dewulf, Dhruv Pai, Li Yang, Ashley Zhang, and Ben Keigwin. Aurora: A leverage-aware
+    optimizer for rectangular matrices. 2026. URL https://tilderesearch.com/blog/aurora.
+  Arthur Douillard, Qixuan Feng, Andrei A Rusu, Rachita Chhaparia, Yani Donchev, Adhiguna
+    Kuncoro, Marc’Aurelio Ranzato, Arthur Szlam, and Jiajun Shen. Diloco: Distributed low-
+
+
+                                                                                                          10
+  communication training of language models. arXiv preprint arXiv:2311.08105, 2023.
+Kanan Gupta and Stephan Wojtowytsch. Nesterov acceleration in benignly non-convex landscapes.
+  arXiv preprint arXiv:2410.08395, 2024.
+Oliver Hinder, Aaron Sidford, and Nimit Sohoni. Near-optimal methods for minimizing star-convex
+  functions and beyond. In Conference on learning theory, pages 1894–1938. PMLR, 2020.
+Elad Hoffer, Itay Hubara, and Daniel Soudry. Train longer, generalize better: closing the generaliza-
+  tion gap in large batch training of neural networks. Advances in neural information processing
+  systems, 30, 2017.
+Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya, Trevor Cai, Eliza
+  Rutherford, DDL Casas, Lisa Anne Hendricks, Johannes Welbl, Aidan Clark, et al. Training
+  compute-optimal large language models. arXiv preprint arXiv:2203.15556, 10, 2022.
+Shengding Hu, Yuge Tu, Xu Han, Chaoqun He, Ganqu Cui, Xiang Long, Zhi Zheng, Yewei Fang,
+  Yuxiang Huang, Weilin Zhao, et al. Minicpm: Unveiling the potential of small language models
+  with scalable training strategies. arXiv preprint arXiv:2404.06395, 2024.
+Keller Jordan, Yuchen Jin, Vlado Boza, You Jiacheng, Franz Cesista, Laker Newhouse, and
+  Jeremy Bernstein. Muon: An optimizer for hidden layers in neural networks, 2024. URL
+  https://kellerjordan. github. io/posts/muon, 6(3):4, 2024.
+Dominik Kallusky, Vinay Rao, Vishal Nandavanam, and Hao-Jun Michael Shi. Snoo: Step-k nesterov
+  outer optimizer-the surprising effectiveness of nesterov momentum applied to pseudo-gradients.
+  arXiv preprint arXiv:2510.15830, 2025.
+Diederik P Kingma and Jimmy Ba. Adam: A method for stochastic optimization. arXiv preprint
+  arXiv:1412.6980, 2014.
+Zichong Li, Liming Liu, Chen Liang, Weizhu Chen, and Tuo Zhao. Normuon: Making muon more
+  efficient and scalable. arXiv preprint arXiv:2510.05491, 2025.
+Yurii Nesterov. A method for solving the convex programming problem with convergence rate
+  O(1/k 2 ). In Dokl akad nauk Sssr, volume 269, page 543, 1983.
+Alex Nichol, Joshua Achiam, and John Schulman. On first-order meta-learning algorithms. arXiv
+  preprint arXiv:1803.02999, 2018.
+Ilya Sutskever, James Martens, George Dahl, and Geoffrey Hinton. On the importance of initialization
+   and momentum in deep learning. In International conference on machine learning, pages 1139–
+   1147. pmlr, 2013.
+Sharan Vaswani, Francis Bach, and Mark Schmidt. Fast and faster convergence of sgd for over-
+  parameterized models and an accelerated perceptron. In The 22nd international conference on
+  artificial intelligence and statistics, pages 1195–1204. PMLR, 2019.
+Nikhil Vyas, Depen Morwani, Rosie Zhao, Mujin Kwun, Itai Shapira, David Brandfonbrener, Lucas
+  Janson, and Sham Kakade. Soap: Improving and stabilizing shampoo using adam. arXiv preprint
+  arXiv:2409.11321, 2024.
+Bao Wang, Tan Nguyen, Tao Sun, Andrea L Bertozzi, Richard G Baraniuk, and Stanley J Osher.
+  Scheduled restart momentum for accelerated stochastic gradient descent. SIAM Journal on Imaging
+  Sciences, 15(2):738–761, 2022.
+Kaiyue Wen, Zhiyuan Li, Jason Wang, David Hall, Percy Liang, and Tengyu Ma. Understanding
+  warmup-stable-decay learning rates: A river valley loss landscape perspective. arXiv preprint
+  arXiv:2410.05192, 2024.
+Michael Zhang, James Lucas, Jimmy Ba, and Geoffrey E Hinton. Lookahead optimizer: k steps
+ forward, 1 step back. Advances in neural information processing systems, 32, 2019.
+Xuan Zuo, Hui-Yan Li, Shan Gao, Pu Zhang, and Wan-Ru Du. Nala: a nesterov accelerated
+  look-ahead optimizer for deep learning. PeerJ Computer Science, 10:e2167, 2024.
+
+
+                                                 11
+A     Reduction of Existing Algorithms into Lookahead Form
+In this section, we include the missing proofs for reducing the existing algorithms into its lookahead
+form.
+
+A.1   SNOO
+
+SNOO [Kallusky et al., 2025] (originated from DiLoCo [Douillard et al., 2023] in federated learning)
+utilizes the K-step base optimizer update as a pseudo-gradient oracle for Nesterov’s algorithm. In
+particular, for any base optimizer At (·) and K > 0 inner steps, we can reduce the SNOO algorithm
+as the following lookahead algorithm with lookahead step size β > 0 by the derivation in Proof 1.
+                           for every t = nK, n = 0, ..., ⌊T /K⌋,
+                                 θ̃t+K = At+K−1 ( · · · At+1 (At (xt − βbt )))
+                                 bt+K = xt − θ̃t+K                                                            (14)
+                                  t+K               t+K
+                                 x           = θ̃
+                           end for;           return xT − βbT .
+Proof 1. The original SNOO algorithm can be summarized as follows:
+                             for every t = nK, n = 0, ..., ⌊T /K⌋,
+                                     θ̃t+K = At+K−1 ( · · · At+1 (At (θt )))
+                                     bt+K = βbt + (θt − θ̃t+K )                                               (15)
+                                         t+K          t                t+K       t       t+K
+                                     θ         = θ − η(βb                    + (θ − θ̃         ))
+                                                              T
+                             end for;           return θ .
+with momentum β > 0 and Nesterov’s learning rate η > 0. The base optimizer At is applied for K
+times consecutively from θt to produce θ̃t+K . However, it is non-trivial to understand the effect of
+Nesterov’s momentum that is updated only after every K stochastic gradient samples. To simplify
+the algorithm, we apply a change of variable θt = xt − βbt to revert the transformation of Sutskever
+et al. [2013] into the following lookahead formulation:
+                        for every t = nK, n = 0, ..., ⌊T /K⌋,
+                             θ̃t+K = At+K−1 ( · · · At+1 (At (xt − βbt )))
+                             bt+K = xt − θ̃t+K                                                                (16)
+                                 t+K           t                              t+K                     t
+                             x           = x + (β − ηβ − η)b                         − (β − ηβ)b
+                                                          T         T
+                       end for;              return x − βb .
+
+Then, when η = 1, we have xt+K = xt − bt+K and SNOO is reduced to (14).
+                                                                                                               □
+
+A.2   GPA
+
+GPA [Defazio et al., 2025] adopts the primal-averaging framework which approximate Nesterov’s
+lookahead. By the derivation in Proof 2, we can reduce GPA into the following lookahead algorithm
+for learning rate γp > 0 and EMA rate β > 0:
+
+                   for every t = 0, ..., T − 1,
+                        zt+1 = zt − γp ∇f (yt ; ξ t )
+                       xt+1 = βxt + (1 − β)zt+1                                                               (17)
+                           t+1           t                    t+1        t                      t+1       t
+                       y         = y + (1 − β)(z                    − z ) + β(1 − β)(z                −x )
+                                                T
+                  end for;       return x .
+
+                                                                  12
+Proof 2. We summarize the GPA algorithm as follows:
+                                  for every t = 0, ..., T − 1,
+                                          yt = βy xt + (1 − βy )zt
+                                       zt+1 = zt + At (yt ) − yt                               (18)
+                                        t+1         t              t+1
+                                      x       = βx x + (1 − βx )z
+                                  end for;    return xT .
+for momentum βx ∈ [0, 1), βy ∈ [0, 1]. Now apply [Defazio et al., 2025, Proposition 1] to obtain the
+following equivalent algorithm when At (y) = y − γp ∇f (y; ξ t ):
+                       for every t = 0, ..., T − 1,
+                            zt+1 = zt − γp ∇f (yt ; ξ t )
+                            xt+1 = βxt + (1 − β)zt+1
+                                    1                                                          (19)
+                              bt =    (xt − xt+1 ) = βbt−1 + ∇f (yt ; ξ t )
+                                   γm
+                            yt+1 = yt − γm (βbt + ∇f (yt ; ξ t ))
+                       end for;    return xT .
+with β = βx = βy and γm = (1 − β)γp . To obtain (17), we first prove that xt = zt + γp βbt−1
+because
+                                       β
+                 zt + γp βbt−1 = zt +      (xt−1 − xt )                                  (20)
+                                      1−β
+                                       β
+                               = zt +      (xt−1 − βxt−1 − (1 − β)zt )                   (21)
+                                      1−β
+                               = βxt−1 + (1 − β)zt = xt .                                (22)
+Then, to simplify yt+1 , we observe that
+                                                        1 t             1
+             bt = βbt−1 + ∇f (yt ; ξ t ) = βbt−1 +         (z − zt+1 ) = (xt − zt+1 ),         (23)
+                                                        γp              γp
+therefore,
+                    yt+1 = yt − γm βbt − γm ∇f (yt ; ξ t )                                     (24)
+                                γm β t             γm t
+                         = yt −     (x − zt+1 ) −         (z − zt+1 )                          (25)
+                                 γp                 γp
+                          = yt + (1 − β)(zt+1 − zt ) + β(1 − β)(zt+1 − xt ).                   (26)
+                                                                                                  □
+
+B     Convergence Proof
+Notation. We denote ∥ · ∥ = ∥ · ∥2 as the vector 2-norm.
+
+B.1   Strongly Convex
+
+Under an appropriate choice of Lyapunov function Et where
+                                                      µ
+                             Et := f (xt ) − f (x⋆ ) + ∥vt − x⋆ ∥2                            (27)
+                                                      2
+where vt := xt + cmt for some c > 0, we provide a proof of linear convergence towards the optimal
+solution as follows.
+First, we expand the one step evolution of every variable as follows:
+                        xt+1 = yt − α∇f (yt ) = xt + βmt − α∇f (yt ),                          (28)
+
+
+                                                   13
+                         mt+1 = γmt + (1 − γ)(xt+1 − xt )                                        (29)
+                                (28)
+                                 = γmt + (1 − γ)(βmt − α∇f (yt ))                                (30)
+                                                       t                 t
+                                = (γ + (1 − γ)β)m − (1 − γ)α∇f (y ).                             (31)
+Then, the one step evolution of vt can be derived as
+           vt+1 = xt+1 + cmt+1                                                                   (32)
+                 = xt + βmt − α∇f (yt ) + c (γ + (1 − γ)β)mt − (1 − γ)α∇f (yt )
+                                                                              
+                                                                                                 (33)
+                     t                             t                          t
+                = x + [β + c(γ + (1 − γ)β)]m − α[1 + c(1 − γ)]∇f (y ).                          (34)
+Now we wish to find some c > 0 such that the above equation can be equivalently reduced to
+                                                                     
+                               t+1            t        t    1       t
+                             v     = (1 − r)v + r y − ∇f (y )                                   (35)
+                                                            µ
+for some r > 0. In this regard, we expand the R.H.S. of (35) and obtain
+                                                                         
+                                   t     t          t       t   1       t
+                         (1 − r)(x + cm ) + r x + βm − ∇f (y )                                  (36)
+                                                                µ
+                                                        r
+                          = xt + [(1 − r)c + rβ]mt − ∇f (yt ).                                  (37)
+                                                        µ
+Then we are left with matching the coefficients between (34) and (37), i.e., we find a set of c, r, β
+such that
+                               β + c(γ + (1 − γ)β) = (1 − r)c + rβ                              (38)
+and
+                                             r
+                          α[1 + c(1 − γ)] = ⇔ r = αµ[1 + c(1 − γ)].                             (39)
+                                             µ
+By choosing
+                                               1−γ−r
+                                          c=              ,                                     (40)
+                                                (1 − γ)r
+we deduce that                                        
+                                            1−γ−r               1−γ
+                              r = αµ 1 +                   = αµ                                 (41)
+                                                  r               r
+                                        p
+                                 ⇔ r = αµ(1 − γ)                                                (42)
+will match the gradient term coefficient as written in (39). Meanwhile, back to the coefficient of mt
+term in (38), we get
+                      1−γ−r                                   1−γ−r
+                 β+              (γ + (1 − γ)β)) = (1 − r)              + rβ                      (43)
+                      (1 − γ)r                                (1 − γ)r
+                             1−γ−r               1−r 1−γ−r               1−γ−r
+                  ⇔ β(1 +               − r) =          ·          −γ·                            (44)
+                                  r                r        1−γ           (1 − γ)r
+                        1−γ            (1 − γ − r)2
+                  ⇔ β(         − r) =                                                             (45)
+                           r              r(1 − γ)
+                                        (1 − γ − r)2
+                  ⇔ β(1 − γ − r2 ) =                                                              (46)
+                                           (1 − γ)
+                               (1 − γ − r)2
+                  ⇔β=                                                                             (47)
+                           (1 − γ)(1 − γ − r2 )
+will match the mt term coefficient as well. Next, using (35) and the equality ∥(1 − θ)u + θw∥2 =
+(1 − θ)∥u∥2 + θ∥w∥2 − θ(1 − θ)∥u − w∥2 for any u, w ∈ Rd , θ ∈ [0, 1], we observe the evolution
+of the Lyapunov function by expanding
+    ∥vt+1 − x⋆ ∥2                                                                                 (48)
+                                            1
+     = ∥(1 − r)(vt − x⋆ ) + r(yt − x⋆ − ∇f (yt ))∥2                                               (49)
+                                           µ
+                                             1                                   1
+     = (1 − r)∥vt − x⋆ ∥2 + r∥yt − x⋆ − ∇f (yt )∥2 − r(1 − r)∥vt − yt + ∇f (yt )∥2 . (50)
+                                            µ                                    µ
+
+
+                                                 14
+Notice that
+                      1                            1               2
+     ∥yt − x⋆ −         ∇f (yt )∥2 = ∥yt − x⋆ ∥2 + 2 ∥∇f (yt )∥2 −   ∇f (yt ) yt − x⋆                 (51)
+                      µ                           µ                µ
+Under µ-strong convexity, we can combine the above with
+                                                                     µ t
+                      f (x⋆ ) ≥ f (yt ) + ∇f (yt ) x⋆ − yt +           ∥y − x⋆ ∥2                     (52)
+                                                                     2
+                                                                           µ
+                      ⇔ − ∇f (yt ) yt − x⋆            ≤ f (x⋆ ) − f (yt ) − ∥yt − x⋆ ∥2               (53)
+                                                                           2
+and obtain
+                                   1              1              2
+                  ∥yt − x⋆ −         ∇f (yt )∥2 ≤ 2 ∥∇f (yt )∥2 − (f (yt ) − f (x⋆ )).                (54)
+                                   µ             µ               µ
+Putting together (50) and (54) yields
+                                                  r               2r
+             ∥vt+1 − x⋆ ∥2 ≤ (1 − r)∥vt − x⋆ ∥2 +    ∥∇f (yt )∥2 − (f (yt ) − f (x⋆ ))                (55)
+                                                  µ2              µ
+                                                   1
+                              − r(1 − r)∥vt − yt + ∇f (yt )∥2 .                                       (56)
+                                                   µ
+Meanwhile, under L-smooth assumption,
+                                                                            L t+1
+         f (xt+1 ) − f (x⋆ ) ≤ f (yt ) + ∇f (yt ) xt+1 − yt +                 ∥x  − yt ∥2 − f (x⋆ )   (57)
+                                                                            2
+                                                                 α2 L
+                              = f (yt ) − α∥∇f (yt )∥2 +              ∥∇f (yt )∥2 − f (x⋆ )           (58)
+                                                                  2
+                                                        α
+                              ≤ f (yt ) − f (x⋆ ) −       ∥∇f (yt )∥2                                 (59)
+                                                        2
+when α2 L/2 ≤ α/2 ⇔ α ≤ 1/L. Combining (56) and (59) together gives us the recursion of the
+Lyapunov function as
+                                                   r  α               µ(1 − r) t
+         Et+1 ≤ (1 − r)(f (yt ) − f (x⋆ )) + (       − )∥∇f (yt )∥2 +         ∥v − x⋆ ∥2              (60)
+                                                  2µ  2                  2
+                      µr(1 − r) t       1
+                  −            ∥v − yt + ∇f (yt )∥2                                                   (61)
+                          2             µ
+                                                                       r  α
+                = (1 − r)Et + (1 − r)(f (yt ) − f (xt )) + (             − )∥∇f (yt )∥2               (62)
+                                                                      2µ  2
+                      µr(1 − r) t       1
+                  −            ∥v − yt + ∇f (yt )∥2                                                   (63)
+                          2             µ
+                                                      µ(1 − r) t
+                ≤ (1 − r)Et + (1 − r) ∇f (yt ) yt − xt −      ∥y − xt ∥2                              (64)
+                                                          2
+                      r  α               µr(1 − r) t        1
+                  +(    − )∥∇f (yt )∥2 −          ∥v − yt + ∇f (yt )∥2 ,                              (65)
+                     2µ  2                   2              µ
+where the last inequality is due to µ-strong convexity. Now recall by the definition of vt = xt + cmt ,
+we have
+                                     yt = xt + βmt = (1 − β/c) xt + β/c · vt                          (66)
+                                       t          t                     t
+                               ⇔ v = c/β · y − (c/β − 1) x                                            (67)
+                               t       t                     t    t
+                          ⇔ v − y = (c/β − 1) (y − x ).                                               (68)
+This allows us to expand
+                              1                       2              1
+                 ∥vt − yt +     ∇f (yt )∥2 = (c/β − 1) ∥yt − xt ∥2 + 2 ∥∇f (yt )∥2                    (69)
+                              µ                                      µ
+                                               2
+                                             + (c/β − 1) y − x ∇f (yt ) .
+                                                            t      t
+                                                                                                      (70)
+                                               µ
+
+
+                                                        15
+Putting it back to the recursion of the Lyapunov function, we get
+             Et+1 ≤ (1 − r)Et + [(1 − r) − (c/β − 1)r(1 − r)] ∇f (yt ) yt − xt                  (71)
+                                                        
+                        µ(1 − r)               µr(1 − r)
+                    −             + (c/β − 1)2              ∥yt − xt ∥2                         (72)
+                            2                      2
+                                             
+                           r    α r(1 − r)
+                    − −       + +               ∥∇f (yt )∥2 .                                   (73)
+                          2µ    2       2µ
+
+By ⟨∇f (yt ) | yt − xt ⟩ ≤ ∥∇f (yt )∥∥yt − xt ∥, we rewrite
+                                                                           defining C := (1 − r)(1 −
+                                                            the residual by 
+r(c/β − 1)), A := µ(1−r)
+                     2
+                                                     r
+                         (1 + r(c/β − 1)2 ), B := − 2µ + α2 + r(1−r)
+                                                                2µ   so that
+
+         Et+1 ≤ (1 − r)Et + |C|∥∇f (yt )∥ · ∥yt − xt ∥ − A∥yt − xt ∥2 − B∥∇f (yt )∥2 .          (74)
+To achieve Et+1 ≤ (1 − r)Et , our last step is to show
+
+             |C|∥∇f (yt )∥ · ∥yt − xt ∥ − A∥yt − xt ∥2 − B∥∇f (yt )∥2 ≤ 0                       (75)
+                                                                                      
+                                   |C|                                |C|
+              ⇔ A ∥yt − xt ∥2 −         · ∥∇f (yt )∥ · ∥yt − xt ∥ + (     ∥∇f (yt )∥)2          (76)
+                                    A                                 2A
+                       2
+                     C
+                + (−     + B)∥∇f (yt )∥2 ≥ 0                                                    (77)
+                     4A
+                                                 2
+                                                              C2
+                   
+                                  |C|
+              ⇔ A ∥yt − xt ∥ −         ∥∇f (yt )∥ + (B −          )∥∇f (yt )∥2 ≥ 0.             (78)
+                                  2A                          4A
+
+Since it is obvious that A ≥ 0, we are left with verifying B − C 2 /(4A) ≥ 0 ⇔ 4AB − C 2 ≥ 0. We
+begin by simplifying each constant as
+                           α   r2 (42) α αµ(1 − γ)   αγ (42)    r2 γ
+                     B=      −     =     −         =     =             ,                        (79)
+                           2   2µ      2    2µ        2      2(1 − γ)µ
+
+                                        (1 − γ)(1 − γ − r2 )
+                        (40),(47) 1 − γ − r                     1 − γ − r2
+                  c/β     =                   ·              =                                  (80)
+                             (1 − γ)r       (1 − γ − r)2       r(1 − γ − r)
+                                (1 − r)(1 − γ)
+                   ⇒ c/β − 1 =                                                                  (81)
+                                 r(1 − γ − r)
+
+                              (81)                 (1 − r)(1 − γ)
+                          C = (1 − r)(1 −                         )                             (82)
+                                                      1−γ−r
+                                 1−r
+                              =          · (1 − γ − r − 1 + r + γ − rγ)                         (83)
+                               1−γ−r
+                                 γr(1 − r)
+                              =−           ,                                                    (84)
+                                 1−γ−r
+
+                        (81) µ(1 − r)              (1 − r)2 (1 − γ)2
+                    A =                 (1 + r ·                     )                          (85)
+                              2                     r2 (1 − γ − r)2
+                             µ(1 − r)
+                        =                (r(1 − γ − r)2 + (1 − r)2 (1 − γ)2 ).                  (86)
+                          2r(1 − γ − r)2
+Therefore,
+                      rγ(1 − r)                                               γ 2 r2 (1 − r)2
+   4AB − C 2 =                      2
+                                      (r(1 − γ − r)2 + (1 − r)2 (1 − γ)2 ) −                    (87)
+                 (1 − γ)(1 − γ − r)                                           (1 − γ − r)2
+                                r(1 − γ − r)2
+                                                                               
+                  rγ(1 − r)                              2
+               =                               + (1 − r)   (1 − γ) − γr(1 −  r)   .             (88)
+                 (1 − γ − r)2       1−γ
+
+
+                                                      16
+Using
+                    r(1 − γ − r)2 + (1 − r)2 (1 − γ)2 − (1 − γ)γr(1 − r)                    (89)
+                                         2
+                    = r(1 − γ − r) + (1 − r)(1 − γ)[(1 − r)(1 − γ) − γr]                    (90)
+                                         2
+                    = r(1 − γ − r) + (1 − r)(1 − γ)(1 − r − γ)                              (91)
+                                                2
+                    = (1 − γ − r)(1 − γ − r ),                                              (92)
+to c we obtain
+                                          rγ(1 − r)(1 − γ − r2 )
+                             4AB − C 2 =                         .                    (93)
+                                            (1 − γ − r)(1 − γ)
+                                               p
+Since 0 ≤ r ≤ 1, 0 ≤ γ ≤ 1, by plugging in r = αµ(1 − γ) we have 1 − γ − r2 ≥ 0 ⇔ γ ≤ 1.
+Meanwhile, 1 − γ − r ≥ 0 ⇔ γ ≤ 1 − αµ. Therefore, we have 4AB − C 2 ≥ 0 and this completes
+the proof.                                                                              □
+
+B.2     General Convex
+
+For general convex objective function, we aim to adopt another choice of Lyapunov function Φt
+where
+                                                      1
+                        Φt := At (f (xt ) − f (x⋆ )) + ∥xt + ct mt − x⋆ ∥22                  (94)
+                                                      2
+with some At , ct > 0 determined later. Then, we can guarantee a sublinear convergence. Below we
+present the proof.
+Define the auxiliary sequence vt := xt + ct mt . We first expand the one step evolution of every
+variable as follows:
+                                                1
+                          xt+1 = xt + βt mt − ∇f (yt ),                                     (95)
+                                                L
+                                  (95)
+                          mt+1 = γmt + (1 − γ)(xt+1 − xt )                                  (96)
+                                                      1−γ
+                                 = γ + (1 − γ)βt mt −      ∇f (yt ).
+                                                   
+                                                                                            (97)
+                                                       L
+Then, the one step evolution of vt can be derived as
+          vt+1 = xt+1 + ct+1 mt+1                                                           (98)
+                                                                                 
+                    t       t  1      t
+                                                              t 1−γ            t
+                = x + βt m − ∇f (y ) + ct+1 γ + (1 − γ)βt m −             ∇f (y )           (99)
+                              L                                        L
+                                                      1 + (1 − γ)ct+1
+                = xt + βt + ct+1 γ + (1 − γ)βt mt −                   ∇f (yt ).
+                                             
+                                                                                           (100)
+                                                             L
+By the definition of βt ,
+                                                
+                              βt 1 + (1 − γ)ct+1 + γct+1 = ct .                            (101)
+Thus
+                                              1 + (1 − γ)ct+1
+                         vt+1 = xt + ct mt −                  ∇f (yt )                     (102)
+                                                     L
+                               = vt − ηt ∇f (yt ),                                         (103)
+where ηt := (1 + (1 − γ)ct+1 )/L.
+Since vt − xt = ct mt , we have
+                                                                    
+                                             βt t                 βt       βt
+                 yt = xt + βt mt = xt +         (v − xt ) =    1−      xt + v t .          (104)
+                                             ct                   ct       ct
+
+We now find a sequence At so that the following holds:
+                                          
+                                       βt                  βt
+                          At+1 1 −           ≤ At ,    At+1 = ηt .                         (105)
+                                        ct                 ct
+
+
+                                                    17
+In fact, define a sequence At = at /L as follows:
+                                                ct qt2
+                                   at+1 :=              ,             t ≥ 0,                    (106)
+                                             ct − γct+1
+where
+                                        qt := 1 + (1 − γ)ct+1 .                                 (107)
+Specifically, for t = 0, choose a0 ≥ a1 − q0 (for example, choose a0 = a1 ). For the given choice of
+ct , one can easily verify
+                                                                                       
+                                 t                                 5                    t
+     ct − γct+1 = (1 − γ) 1 +        ,    qt = 1 + (1 − γ)ct+1 = + (1 − γ) 1 +              . (108)
+                                 4                                 4                   4
+Therefore, by (106), (107) as well as the definition of βt and ηt ,
+                  βt     at+1 βt      1    ct qt2     ct − γct+1    qt
+                  At+1
+                     =       ·     =                ·            =     = ηt .          (109)
+                  ct       L   ct     L ct − γct+1        ct qt     L
+                        
+We now show At+1 1 − βctt ≤ At , or equivalently, at+1 − qt ≤ at . When t = 0, the inequality
+holds due to our choice of a0 . For t ≥ 1, put st := 1 + 4t . Then a direct calculation gives
+                                 8(1 − γ)3 st (16s2t − 1) + 36(1 − γ)2 st (4st − 1) + 25γ
+           at − (at+1 − qt ) =                                                            .     (110)
+                                                  64(1 − γ)2 st (4st − 1)
+Since t ≥ 1, we have st ≥ 5/4. Also 0 < 1 − γ ≤ 1. Therefore every term in the numerator is
+nonnegative and the denominator is positive. Hence at − (at+1 − qt ) ≥ 0. Thus (105) holds.
+Given the choice of At , we now prove the Lyapunov function Φt decreases.
+Since f is L-smooth and xt+1 = yt − L1 ∇f (yt ), we have
+                                                               1
+                                 f (xt+1 ) ≤ f (yt ) −           ∥∇f (yt )∥2 .                  (111)
+                                                              2L
+Furthermore, since
+                                                         
+                                                     βt              βt t
+                                     yt =       1−            xt +      v,                      (112)
+                                                     ct              ct
+we have by convexity that
+                          
+    t        ⋆          βt                     βt
+                             f (yt ) − f (x⋆ ) +     f (yt ) − f (x⋆ )
+                                                                      
+f (y ) − f (x ) = 1 −
+                        ct                       ct
+                          
+                        βt                                          βt
+                ≤ 1−         f (xt ) − f (x⋆ ) − ∇f (yt ) xt − yt +         ∇f (yt ) yt − x⋆
+                        ct                                               ct
+                                                                                            
+                        βt       t         ⋆
+                                                        t βt     t     ⋆         βt      t    t
+                = 1−         f (x ) − f (x ) + ∇f (y ) (y − x ) − 1 −                   (x − y )
+                        ct                                   ct                    ct
+                          
+                        βt                     βt
+                = 1−         f (xt ) − f (x⋆ ) +     ∇f (yt ) vt − x⋆ .                      (113)
+                        ct                       ct
+Multiplying (113) by At+1 and then using (105) and (111), we obtain
+                                                                             At+1
+ At+1 f (xt+1 ) − f (x⋆ ) ≤ At f (xt ) − f (x⋆ ) + ηt ⟨∇f (yt ), vt − x⋆ ⟩ −      ∥∇f (yt )∥2 .
+                                               
+                                                                              2L
+                                                                                           (114)
+On the other hand, by (103) we have
+          1 t+1               1                                   η2
+            ∥v     − x⋆ ∥2 = ∥vt − x⋆ ∥2 − ηt ∇f (yt ) vt − x⋆ + t ∥∇f (yt )∥2 .                (115)
+          2                   2                                   2
+Adding (114) and (115) yields
+                                                  
+                                      1 At+1
+                          Φt+1 ≤ Φt −         − ηt2 ∥∇f (yt )∥2 .                               (116)
+                                      2    L
+
+
+                                                     18
+It remains to check that
+                                                 At+1
+                                                      ≥ ηt2 .                                         (117)
+                                                  L
+Since At+1 = at+1 /L and ηt = qt /L, this is equivalent to at+1 ≥ qt2 , which apparently holds by
+our choice of at+1 in (106). Combining with (116), we show that
+                                         Φt+1 ≤ Φt .                                                  (118)
+                                  
+Consequently, At f (xt ) − f (x⋆ ) ≤ Φt ≤ Φ0 , and therefore
+                                                             Φ0   LΦ0
+                                      f (xt ) − f (x⋆ ) ≤       =     .                               (119)
+                                                             At    at
+
+Next, we lower bound at . For t ≥ 1, by (106) we have
+                                                             2
+                                                       ct−1 qt−1
+                                               at =              .                                    (120)
+                                                      ct−1 − γct
+Recalling st−1 = 1 + t−1
+                      4 , a direct calculation can verify
+
+              ct−1 ≥ st−1 ,          qt−1 ≥ (1 − γ)st−1 ,         ct−1 − γct = (1 − γ)st−1 .          (121)
+Thus
+                                                  2
+                              st−1 (1 − γ)st−1                             (1 − γ)t2
+                         at ≥                           = (1 − γ)s2t−1 ≥             .                (122)
+                                  (1 − γ)st−1                                 16
+Therefore by (119) and (122), we obtain
+                                                              16LΦ0
+                                       f (xt ) − f (x⋆ ) ≤             .                              (123)
+                                                             (1 − γ)t2
+(123) provides the O(1/t2 ) rate of the algorithm. We further upper bound Φ0 to provide the γ-
+dependency. Note that m0 = 0. Since f is convex and L-smooth and x⋆ is a minimizer, we
+have
+                                                   L
+                                f (x0 ) − f (x⋆ ) ≤ ∥x0 − x⋆ ∥22 .                       (124)
+                                                   2
+Combining (94) and (124) yields
+                      a0                    1                     a0 + 1 0
+                 Φ0 =     f (x0 ) − f (x⋆ ) + ∥x0 − x⋆ ∥22 ≤              ∥x − x⋆ ∥22 .               (125)
+                      L                          2                    2
+Now we calculate a0 . By the definition of ct , at and qt (recall (106) and (107)), we have
+                γ                    5     γ                                                  c0 q02
+ c0 = 1 +            ,        c1 =     +        ,           q0 = 1 + (1 − γ)c1 ,     a1 =            . (126)
+            4(1 − γ)                 4 4(1 − γ)                                             c0 − γc1
+We need a0 ≥ a1 − q0 . By simply choosing a0 = a1 , a direct calculation yields
+                                          (4 − 3γ)(9 − 4γ)2       81
+                             a0 = a1 =                  2
+                                                            ≤            .                            (127)
+                                              64(1 − γ)       16(1 − γ)2
+Therefore, by combining (123), (125) and (127), we get
+                                              16L       a0 + 1 0
+                         f (xt ) − f (x⋆ ) ≤          ·        ∥x − x⋆ ∥22
+                                           (1 − γ)t2       2
+                                              16L       ∥x0 − x⋆ ∥22        97
+                                         ≤          2
+                                                      ·               ·                               (128)
+                                           (1 − γ)t          2          16(1 − γ)2
+                                               97L
+                                         =              ∥x0 − x⋆ ∥22 .
+                                           2(1 − γ)3 t2
+This completes the proof.                                                                                □
+
+
+                                                       19
+C                   Additional Experiments Details
+C.1                   Validation Loss at Lookahead Positions
+
+                                                                                                 xt +      (xt     xt    1
+                                                                                                                               )                        xt +       mt
+
+                                                                                                                                                                                                    Iteration 6200
+                                   Iteration 5600                                                                                                                                          1e 5+3.2784
+                  3.316                                                                                    +3.285 Iteration 6000
+                                                                                                 0.00100                                                                            2.50
+
+
+
+
+                                                                                                                                                                  Validation Loss
+                                                                                                                                                                                    2.25
+Validation Loss
+
+
+
+
+                  3.315                                                                          0.00095
+
+
+
+
+                                                                               Validation Loss
+                                                                                                 0.00090                                                                            2.00
+                  3.314                                                                          0.00085                                                                            1.75
+                                                                                                 0.00080                                                                            1.50
+                  3.313
+                          0.00    0.25 0.50 0.75                        1.00                               0.00    0.25 0.50 0.75                          1.00                            0.00    0.25 0.50 0.75       1.00
+                                 Lookahead Step Size                                                              Lookahead Step Size                                                             Lookahead Step Size
+
+Figure 8: Under the NanoGPT setup, we measure the validation loss in lookahead positions yt =
+xt + βdt at iterations t = 5600, 6000, 6200 using (Solid Red) yt = xt + β · (xt − xt−1 ) and (Dashed
+Green) yt = xt + β · mt where mt = γmt−1 + (1 − γ)(xt − xt−1 ) with γ = 0.995.
+
+In Figure 8, we measure the validation loss at different lookahead positions during the learning rate
+decay phase when the learning rate is very small. Since the loss landscape changes rapidly near the
+local minima, our EMA lookahead direction mt with large γ retained the lookahead momentum
+from past iterations which is not applicable to the sharp local minima. This motivates the decaying
+schedule of βt and the early rest stage described in Section 3.3.
+
+C.2                   Learning Rate Scaling with Batch Size
+
+                                                                       Llama (60M) C4                                                                       Llama (60M) C4
+                                                           29 2500 Total Iterations, = 1/2                                                      29 2500 Total Iterations, = 1/4
+                                                                          Muon                                                                                 Muon
+                                                           28                                                                                   28
+                                   Validation Perplexity
+
+
+
+
+                                                                                                                        Validation Perplexity
+
+
+
+
+                                                                          EMA-Nesterov + Muon                                                                  EMA-Nesterov + Muon
+                                                                           = 0.99 max  t = 0.7                                                                  = 0.99 max  t = 0.7
+                                                           27                      t                                                            27                      t
+
+                                                           26                                                                                   26
+                                                           25                                                                                   25
+                                                           24                                                                                   24
+                                                           23                                                                                   23
+                                                              0.5M 1M      2M                 4M                                                   0.5M 1M      2M                 4M
+                                                                      Token Batch Size                                                                     Token Batch Size
+Figure 9: Data scaling to total training budgets of ≥ {20×, 40×, 80×, 160×} tokens-per-parameter
+with increased token batch size {0.5M, 1M, 2M, 4M} respectively and fixed 2500 total iterations.
+The learning rates are adapted under the power scaling rule: for tuned learning rate α on batch size
+B, the adapted learning rate α′ for larger batch size B ′ > B is α′ = α · (B ′ /B)δ with the learning
+rate scaling exponent (Left) δ = 1/2 and (Right) δ = 1/4.
+
+In Figure 9, we compare the two learning rate scaling rules under different scaling exponents.
+Compared to the usual scaling exponent δ = 1/2 used in SGD [Hoffer et al., 2017], we tried
+alternative scaling exponent δ = 1/4 and observed a better performance for Muon especially on
+larger batch sizes.
+
+C.3                   Hyperparameter Sensitivity on Model Scaling
+
+In Figure 10 we provide additional results on the hyperparameter sweep for EMA-Nesterov when
+training the Llama model for 5000 iterations. Compared to the 2500 iterations setup in Figure 6
+where the optimal EMA rate γ = 0.99, the optimal EMA rate in Figure 10 shifts to γ = 0.995. This
+
+
+                                                                                                                        20
+           Muon                                                    EMA-Nesterov + Muon                          = 0.95         EMA-Nesterov + Muon   = 0.995
+           EMA-Nesterov + Muon                      = 0.9          EMA-Nesterov + Muon                          = 0.99         EMA-Nesterov + Muon   = 0.999
+
+                                                     Llama (60M) C4                                                Llama (130M) C4
+                                              5000 Total Iter., 0.26M Token BS                           21.4 5000 Total Iter., 0.5M Token BS
+                                          28.4
+                                                                                                         21.3
+                                          28.2
+
+
+
+
+                                                                                 Validation Perplexity
+                  Validation Perplexity
+                                          28.0                                                           21.2
+                                          27.8                                                           21.1
+                                          27.6
+                                                                                                         21.0
+                                          27.4
+                                          27.2                                                           20.9
+                                          27.0                                                           20.8
+                                               0.1 0.3 0.5 0.7 0.9                                              0.1 0.3 0.5 0.7 0.9
+                                               Lookahead Step Size max  t   t                                   Lookahead Step Size max
+                                                                                                                                     t  t
+
+
+Figure 10: Sensitivity of hyperparameters for EMA-Nesterov + Muon across different model sizes
+on the Llama setup. The value of maxt βt is searched in {0.1, 0.3, 0.5, 0.7, 0.9} across the horizontal
+axis and the value of γ is searched in {0.9, 0.95, 0.99, 0.995, 0.999} across different colors. The
+learning rates are adapted under the power scaling rule: for tuned learning rate α on batch size B, the
+adapted learning rate α′ for larger batch size B ′ > B is α′ = α · (B ′ /B)δ with δ = 1/2.
+
+
+indicates that the choice of γ is determined by the temporal behavior of the training trajectory, such
+that the different training trajectories due to different total iterations and learning rate schedule lead
+to different optimal choice of γ.
+
+
+
+
+                                                                                 21
+C.4   Experiment Setting
+
+In experiment (I) training NanoGPT (124M) model on FineWeb dataset, our setting strictly follows
+an early version (track_1_short/2024-10-10_Muon) of the NanoGPT Track 1 benchmark, including
+the implementation of the Muon algorithm. A total of 6200 iterations is trained with batch size 512
+on sequence length of 1024 tokens, approximately 0.5M token batch size. The learning rate is kept
+constant from the beginning and a linear decay to 0 for the last 1800 iterations is adopted. In Table 3,
+we summarize the hyperparameters of the base optimizers used in this setting. For EMA-Nesterov,
+we adopted the same βt scheduling of Tw = 1800 and Tr = 6200 − 600 = 5600 for all NanoGPT
+(124M) experiments. Since no learning rate warm-up is applied, we expect the training takes longer to
+enter the stable stage and therefore the slightly larger Tw . Meanwhile, as the learning rate decay phase
+is long, a late Tr is adopted to accelerate the mid-to-late stage training. The time for each experiment
+run varies for different base optimizers, ranging from 24 minutes for Muon and 37 minutes for SOAP
+in Figure 4.
+We also conducted experiments using the NanoGPT Track 3 setup6 , which differs from Track
+1 by increasing the number of trainable parameters to 162M through detaching the parameters
+of input and output layer. For the base optimizers in Track 3 of Figure 4, we adopted Muon
+from leaderboard entry #12 and Aurora from pull request entry #300. For the βt scheduling in
+EMA-Nesterov, we used Tw = 500, Tr = 3150 − 750 = 2400, maxt βt = 0.6 for Muon and
+Tw = 300, Tr = 2900 − 950 = 1950, maxt βt = 0.3 for Aurora. We used γ = 0.99 for
+EMA-Nesterov in both algorithms.
+
+             Muon LR         Adam LR      Muon Momentum     Adam 1st Momentum       Adam 2nd Momentum
+                      −4             −3
+  Muon       3.6 × 10       3.6 × 10           0.95                 0.9                    0.95
+  NorMuon    3.6 × 10−4     3.6 × 10−3         0.95                 0.9                    0.95
+                LR         1st Momentum   2nd Momentum     Precondition Frequency           -
+  SOAP         10−3            0.9             0.95                  10                     -
+  Adam         10−3            0.9             0.95                   -                     -
+
+Table 3: Hyperparameter values of the base optimizers used in NanoGPT Track 1 (Figure 4 and 5).
+
+
+In experiment (II) training Llama models on C4 dataset, we used a sequence length of 256 tokens.
+Total training iterations and batch sizes vary between different experiment runs, as described in the
+title of Figure 7, 6, 9 and 10. The learning rate follows a warmup-stable-decay scheduling [Hu et al.,
+2024], with the first 10% of iterations performing linear warm-up, followed with staying constant in
+the middle 80% of iterations and ends with an exponential decay to a minimum of 0.1× the maximum
+learning rate for the last 10% of iterations. For the scheduling of βt in EMA-Nesterov, when the
+total iteration is 2500, we used Tw = 750 and Tr = 2500 − 500 = 2000. When the total iteration
+is 5000, it is relatively scaled up to Tw = 1500 and Tr = 5000 − 1000 = 4000. This βt schedule
+roughly follows the learning rate schedule with an additional safe margin, i.e., βt used a 30% of
+early iterations to warm-up (i.e., βt = 0 for t ≤ 0.3 · T ) and uses a 20% of late iterations to rest
+(i.e., βt = 0 for t > 0.8 · T ). We only used Muon7 as the base optimizer in this setting and it used a
+momentum of 0.95 for intermediate layers, a 1st and 2nd order momentum of 0.9, 0.95 for first/last
+layers, see Algorithm 2 for a detailed description. We summarize the remaining hyperpameters for
+each figure in Table 4. The time for experiment varies across model sizes, ranging from 40 mintues
+for 60M model in Figure 6 to 24 hours for 1B model in Table 2.
+
+
+
+
+   6 NanoGPT Track 3 benchmark from https://github.com/KellerJordan/modded-nanogpt/tree/master/
+
+records/track_3_optimization.
+   7 For all Llama experiments, we adopted the open-sourced implementation of Muon in https://github.com/
+
+KellerJordan/Muon.
+
+
+                                                   22
+                          Model Size   Total Iterations   Token Batch Size    Muon LR       Adam LR
+                                                                                    −2
+  Figure 6                   60M            2500               0.5M            3 × 10       3 × 10−2
+  Figure 6                  130M            2500                1M           4.24 × 10−2   4.24 × 10−2
+  Figure 6                  350M            2500                3M           7.35 × 10−2   7.35 × 10−2
+  Figure 9 (δ = 1/2)                                           0.5M           3 × 10−2      3 × 10−2
+  Figure 9 (δ = 1/2)        60M             2500                1M           4.24 × 10−2   4.24 × 10−2
+  Figure 9 (δ = 1/2)                                            2M            6 × 10−2      6 × 10−2
+  Figure 9 (δ = 1/2)                                            4M           8.49 × 10−2   8.49 × 10−2
+  Figure 7, 9 (δ = 1/4)                                        0.5M           3 × 10−2      3 × 10−2
+  Figure 7, 9 (δ = 1/4)                                         1M           3.56 × 10−2   3.56 × 10−2
+                            60M             2500
+  Figure 7, 9 (δ = 1/4)                                         2M           4.24 × 10−2   4.24 × 10−2
+  Figure 7, 9 (δ = 1/4)                                         4M           5.05 × 10−2   5.05 × 10−2
+  Figure 7 (δ = 1/4)                                            1M           4.24 × 10−2   4.24 × 10−2
+  Figure 7 (δ = 1/4)                                            2M           5.05 × 10−2   5.05 × 10−2
+                            130M            2500
+  Figure 7 (δ = 1/4)                                            4M            6 × 10−2      6 × 10−2
+  Figure 7 (δ = 1/4)                                            8M           7.14 × 10−2   7.14 × 10−2
+  Figure 7 (δ = 1/4)                                           3M              3 × 10−2     3 × 10−2
+  Figure 7 (δ = 1/4)        350M            2500               6M            3.57 × 10−2   3.57 × 10−2
+  Figure 7 (δ = 1/4)                                           12M           4.24 × 10−2   4.24 × 10−2
+  Figure 7 (δ = 1/4)                                           25M           5.05 × 10−2   5.05 × 10−2
+  Figure 10                  60M                              0.26M          2.12 × 10−2   2.12 × 10−2
+                                            5000
+  Figure 10                 130M                              0.5M             3 × 10−2     3 × 10−2
+  Table 2                    1B             5000                4M            5 × 10−2      5 × 10−2
+Table 4: Hyperparameter values of the base optimizers used in Figure 6, 7, 9, 10 and Table 2. The
+learning rates are adapted under the power scaling rule: for tuned learning rate α on batch size B, the
+adapted learning rate α′ for larger batch size B ′ > B is α′ = α · (B ′ /B)δ with a default choice of
+δ = 1/2.
+
+
+
+
+                                                    23
+C.5    Muon Optimizer
+
+For completeness, we provide the exact open-sourced implementation of Muon8 in Algorithm 2.
+Unless otherwise specified, we do not apply weight decay in the base optimizer, i.e., we use λ = 0 as
+default. We denote ⊙ as the element-wise product operator.
+
+Algorithm 2 Muon
+ 1: Input: Muon learning rates αt > 0, Adam learning rates α              bt > 0, weight decay λ ≥ 0, Muon
+    momentum ϕ ∈ [0, 1), Adam momentum ϕ1 , ϕ2 ∈ [0, 1).
+ 2: Initialize: Model parameters x0 = [x01 , ..., x0L ] for L layers s.t. x0ℓ ∈ RMℓ ×Nℓ with input
+    dimension Mℓ and output dimension Nℓ . Muon gradient momentum v0 = [v20 , ..., vL−1                0
+                                                                                                            ] = 0.
+                                                          0        0         0        0       0          0
+    Adam 1st and 2nd order gradient momentum w = [w1 , ..., wL ] = 0, w              b = [w b 1 , ..., w
+                                                                                                       b L ] = 0.
+ 3: for t = 0, ..., T − 1 do
+ 4:   for ℓ = 1, ..., L do
+ 5:      if ℓ ∈ [2, L − p1] and Mℓ > 1 and Nℓ > 1 then
+ 6:         αt,ℓ = αt · max(1, Nℓ /Mℓ )
+ 7:         xt+1
+              ℓ    = (1 − αt λ)xtℓ − αt,ℓ · Newton-Schulz5(ϕ2 vℓt + (1 − ϕ2 )∇f (xt ; ξ t )ℓ )
+              t+1
+ 8:         vℓ = ϕvℓt + (1 − ϕ)∇f (xt ; ξ t )ℓ
+ 9:      else
+10:         wℓt+1 = ϕ1 wℓt + (1 − ϕ1 )∇f (xt ; ξ t )ℓ
+11:         wb ℓt+1 = ϕ2 w
+                         b ℓt + (1 − ϕ2 )∇f (xt ; ξ t )ℓ ⊙ f (xt ; ξ t )ℓ
+                                                     wt+1 /(1−ϕt1 )
+12:          xt+1         bt λ)xtℓ,ij − α
+              ℓ,ij = (1 − α             bt · q t+1ℓ,ij                     for    i = 1, ..., Mℓ , j = 1, ..., Nℓ .
+                                                  b ℓ,ij /(1−ϕt2 )+10−10
+                                                  w
+13:      end if
+14:   end for
+15: end for
+16: Output: last iterate solution xT .
+
+
+Notice that Algorithm 2 relies on the following 5-steps Newton-Schulz iteration algorithm to approxi-
+mately normalize the spectral values of the update direction.
+
+Algorithm 3 Newton-Schulz5
+ 1: Input: X ∈ RM ×N .
+ 2: if N > M then
+ 3:    b = X⊤
+       X
+ 4: else
+ 5:    X
+       b =X
+ 6: end if
+ 7: X0 = X/(∥
+           b     b F + 10−7 )
+                 X∥
+ 8: for t = 0 to 4 do
+ 9:    At = Xt (Xt )⊤
+10:    Bt = (2.0315 · At − 4.7750 · I)At
+11:    Xt+1 = (3.4445 · I + Bt )Xt
+12: end for
+13: if N > M then
+14:    e = (X5 )⊤
+       X
+15: else
+16:    e = X5
+       X
+17: end if
+18: Output: X.e
+
+
+We remark that in the source code of Muon, the convex combination between vℓt and ∇f (xt ; ξ t )ℓ
+in line 7 of Algorithm 2 is referred to as using "Nesterov". In contrary to the description of its
+source code, we demonstrate explicitly that line 7 of Algorithm 2 is still based on EMA of stochastic
+   8 See the open-sourced implementation here https://github.com/KellerJordan/Muon.
+
+
+
+
+                                                       24
+gradient with different EMA rate. In particular, vℓt is an EMA of rate ϕ for {∇f (xr ; ξ r )}t−1
+                                                                                              r=0 which
+is combined on-the-fly with the current stochastic gradient ∇f (xt ; ξ t )ℓ of a larger weighting 1 − ϕ2
+because 1 − ϕ2 > 1 − ϕ for ϕ ∈ (0, 1). The larger weighting 1 − ϕ2 controls a bias-variance tradeoff
+as the current stochastic gradient is unbiased to the current solution xt .
+
+
+
+
+                                                  25
+

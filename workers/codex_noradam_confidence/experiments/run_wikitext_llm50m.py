@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -47,6 +48,10 @@ class TrialConfig:
     fallback_mode: str = "atan2"
     soda_lambda_scale: float = 1.0
     soda_lambda_power: float = 1.0
+    ema_beta: float = 0.0
+    ema_gamma: float = 0.99
+    ema_warmup_frac: float = 0.30
+    ema_rest_frac: float = 0.20
     seed: int = 123
     steps: int = 800
     eval_every: int = 100
@@ -77,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--trial-json", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("workers/codex_noradam_confidence/results/wikitext103_llm50m_20260529"))
-    parser.add_argument("--preset", choices=["smoke", "main", "anchor_deep", "anchor_harder", "fineweb_long", "fineweb_anchor_hpo"], default="anchor_deep")
+    parser.add_argument("--preset", choices=["smoke", "main", "anchor_deep", "anchor_harder", "fineweb_long", "fineweb_anchor_hpo", "muown_ema_hpo"], default="anchor_deep")
     parser.add_argument("--dataset-source", choices=["wikitext", "hf_text"], default="wikitext")
     parser.add_argument("--wiki-config", default="wikitext-103-raw-v1")
     parser.add_argument("--hf-dataset", default="HuggingFaceFW/fineweb-edu")
@@ -212,6 +217,185 @@ def prepare_text_cache(args: argparse.Namespace) -> tuple[Path, Path]:
     return prepare_hf_text_cache(args)
 
 
+class Muown(PlainMuon):
+    """Muon with implicit row-norm control from arXiv:2605.10797.
+
+    This intentionally stays local to the benchmark runner. It mirrors the
+    existing PlainMuon grouping and fallback path, but replaces matrix updates
+    with Muown's implicit W = diag(g / ||R||row) R parameterization.
+    """
+
+    def _step_muon_group(self, group: dict[str, Any]) -> None:
+        lr = float(group["lr"])
+        wd = float(group.get("weight_decay", 0.0))
+        beta = float(group["momentum"])
+        eps = 1e-8
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+
+            w = root_optimizer._matrix_view(p.detach()).to(torch.float32)
+            grad_w = root_optimizer._matrix_view(p.grad.detach()).to(torch.float32)
+            rows, cols = w.shape
+            state = self.state[p]
+            row_norm = w.norm(dim=1).clamp_min(eps)
+
+            if "g_mag" not in state or tuple(state["g_mag"].shape) != (rows,):
+                state["g_mag"] = row_norm.clone()
+                state["r_norm"] = row_norm.clone()
+                state["momentum_buffer"] = torch.zeros_like(w, dtype=torch.float32)
+                state["mag_exp_avg"] = torch.zeros_like(row_norm, dtype=torch.float32)
+                state["mag_exp_avg_sq"] = torch.zeros_like(row_norm, dtype=torch.float32)
+                state["mag_step"] = 0
+
+            g_mag = state["g_mag"]
+            r_norm = state["r_norm"]
+            momentum = state["momentum_buffer"]
+            mag_exp_avg = state["mag_exp_avg"]
+            mag_exp_avg_sq = state["mag_exp_avg_sq"]
+
+            # Reconstruct the hidden direction variable R from the effective
+            # model weight W and cached ||R||row, then project away the radial
+            # row component before applying Muon to R.
+            safe_g = g_mag.clamp_min(eps)
+            safe_r = r_norm.clamp_min(eps)
+            R = w * (safe_r / safe_g).unsqueeze(1)
+            D = R / safe_r.unsqueeze(1)
+            radial = (grad_w * D).sum(dim=1, keepdim=True)
+            grad_g = radial.squeeze(1)
+            grad_R = (safe_g / safe_r).unsqueeze(1) * (grad_w - radial * D)
+
+            momentum.lerp_(grad_R, 1.0 - beta)
+            source = torch.lerp(grad_R, momentum, beta)
+            update = self._orthogonalizer(source)
+            update = update * (0.2 * math.sqrt(max(rows, cols)))
+            R.add_(update, alpha=-lr)
+
+            state["mag_step"] = int(state["mag_step"]) + 1
+            mag_step = int(state["mag_step"])
+            beta1, beta2 = 0.9, 0.95
+            mag_exp_avg.mul_(beta1).add_(grad_g, alpha=1.0 - beta1)
+            mag_exp_avg_sq.mul_(beta2).addcmul_(grad_g, grad_g, value=1.0 - beta2)
+            m_hat = mag_exp_avg / max(1.0 - beta1**mag_step, 1e-16)
+            v_hat = mag_exp_avg_sq / max(1.0 - beta2**mag_step, 1e-16)
+            g_mag.add_(m_hat / v_hat.sqrt().clamp_min(eps), alpha=-lr)
+            g_mag.clamp_(min=eps)
+
+            new_r = R.norm(dim=1).clamp_min(eps)
+            w_new = R * (g_mag / new_r).unsqueeze(1)
+            if wd:
+                # Muown is usually run without weight decay. If enabled for an
+                # ablation, keep the implicit state consistent with the decayed
+                # effective weight rather than preserving stale hidden scales.
+                w_new.mul_(1.0 - lr * wd)
+                new_r = w_new.norm(dim=1).clamp_min(eps)
+                g_mag.copy_(new_r)
+            r_norm.copy_(new_r)
+            p.copy_(w_new.reshape_as(p).to(p.dtype))
+
+
+class EMANesterovOptimizer:
+    """Lightweight EMA-Nesterov lookahead wrapper from arXiv:2605.25395.
+
+    The benchmark calls zero_grad() immediately before the forward pass. That
+    is the right point to move parameters from x_t to the lookahead y_t. The
+    wrapped optimizer then computes x_{t+1}; step() updates the EMA direction
+    from x_{t+1} - x_t and leaves parameters at x_{t+1}.
+    """
+
+    def __init__(
+        self,
+        base_optimizer: torch.optim.Optimizer,
+        *,
+        total_steps: int,
+        beta: float,
+        gamma: float,
+        warmup_frac: float,
+        rest_frac: float,
+    ) -> None:
+        self.base_optimizer = base_optimizer
+        self.param_groups = base_optimizer.param_groups
+        self.state: dict[nn.Parameter, dict[str, Any]] = {}
+        self.total_steps = int(total_steps)
+        self.beta = float(beta)
+        self.gamma = float(gamma)
+        self.warmup_steps = int(round(self.total_steps * float(warmup_frac)))
+        self.rest_start = int(round(self.total_steps * max(0.0, 1.0 - float(rest_frac))))
+        self.step_index = 0
+
+    def _beta_t(self) -> float:
+        if self.beta <= 0.0:
+            return 0.0
+        if self.step_index < self.warmup_steps:
+            return 0.0
+        if self.step_index >= self.rest_start:
+            return 0.0
+        return self.beta
+
+    def _beta_t_for_group(self, group: dict[str, Any]) -> float:
+        beta_t = self._beta_t()
+        if not beta_t:
+            return 0.0
+        base_lr = float(group.get("_bench_base_lr", group.get("initial_lr", group.get("lr", 1.0))))
+        if base_lr <= 0.0:
+            return beta_t
+        return beta_t * float(group.get("lr", base_lr)) / base_lr
+
+    @torch.no_grad()
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        self.base_optimizer.zero_grad(set_to_none=set_to_none)
+        for group in self.param_groups:
+            beta_t = self._beta_t_for_group(group)
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                state = self.state.setdefault(p, {})
+                if state.pop("lookahead_active", False):
+                    p.copy_(state["base_param"].to(p.dtype))
+                base_param = state.get("base_param")
+                if base_param is None or base_param.shape != p.shape:
+                    base_param = state["base_param"] = torch.empty_like(p, dtype=torch.float32)
+                base_param.copy_(p.detach().to(torch.float32))
+                ema_delta = state.get("ema_delta")
+                if ema_delta is None or ema_delta.shape != p.shape:
+                    ema_delta = state["ema_delta"] = torch.zeros_like(p, dtype=torch.float32)
+                if beta_t:
+                    p.add_(ema_delta.to(p.dtype), alpha=beta_t)
+                state["lookahead_active"] = True
+
+    @torch.no_grad()
+    def step(self, closure: Any | None = None) -> Any:
+        loss = self.base_optimizer.step(closure=closure)
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state.get(p)
+                if not state or not state.get("lookahead_active", False):
+                    continue
+                base = state["base_param"]
+                delta = p.detach().to(torch.float32) - base
+                state["ema_delta"].mul_(self.gamma).add_(delta, alpha=1.0 - self.gamma)
+                state["lookahead_active"] = False
+        self.step_index += 1
+        return loss
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "base_optimizer": self.base_optimizer.state_dict(),
+            "state": self.state,
+            "step_index": self.step_index,
+            "total_steps": self.total_steps,
+            "beta": self.beta,
+            "gamma": self.gamma,
+            "warmup_steps": self.warmup_steps,
+            "rest_start": self.rest_start,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.base_optimizer.load_state_dict(state_dict["base_optimizer"])
+        self.state = state_dict.get("state", {})
+        self.step_index = int(state_dict.get("step_index", 0))
+
+
 def make_optimizer(model: nn.Module, trial: TrialConfig) -> torch.optim.Optimizer:
     if trial.family == "adamw":
         return torch.optim.AdamW(
@@ -225,6 +409,31 @@ def make_optimizer(model: nn.Module, trial: TrialConfig) -> torch.optim.Optimize
     if trial.family == "muon":
         matrix, fallback = split_muon_groups(model, trial.weight_decay)
         return PlainMuon(matrix, fallback, lr=trial.lr, weight_decay=trial.weight_decay)
+    if trial.family == "muown":
+        matrix, fallback = split_muon_groups(model, trial.weight_decay)
+        return Muown(matrix, fallback, lr=trial.lr, weight_decay=trial.weight_decay)
+    if trial.family == "ema_muon":
+        matrix, fallback = split_muon_groups(model, trial.weight_decay)
+        base = PlainMuon(matrix, fallback, lr=trial.lr, weight_decay=trial.weight_decay)
+        return EMANesterovOptimizer(
+            base,
+            total_steps=trial.steps,
+            beta=trial.ema_beta,
+            gamma=trial.ema_gamma,
+            warmup_frac=trial.ema_warmup_frac,
+            rest_frac=trial.ema_rest_frac,
+        )
+    if trial.family == "ema_muown":
+        matrix, fallback = split_muon_groups(model, trial.weight_decay)
+        base = Muown(matrix, fallback, lr=trial.lr, weight_decay=trial.weight_decay)
+        return EMANesterovOptimizer(
+            base,
+            total_steps=trial.steps,
+            beta=trial.ema_beta,
+            gamma=trial.ema_gamma,
+            warmup_frac=trial.ema_warmup_frac,
+            rest_frac=trial.ema_rest_frac,
+        )
     if trial.family == "anchormuon":
         return root_optimizer.AnchorMuon(
             model,
@@ -383,6 +592,9 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
         return [
             TrialConfig("smoke_adamw", "adamw", 5e-4, steps=4, eval_every=2),
             TrialConfig("smoke_anchor", "anchormuon", 1e-3, steps=4, eval_every=2),
+            TrialConfig("smoke_muown", "muown", 1e-3, weight_decay=0.0, steps=4, eval_every=2),
+            TrialConfig("smoke_ema_muon", "ema_muon", 1e-3, ema_beta=0.3, steps=4, eval_every=2),
+            TrialConfig("smoke_ema_muown", "ema_muown", 1e-3, weight_decay=0.0, ema_beta=0.3, steps=4, eval_every=2),
         ]
 
     trials: list[TrialConfig] = []
@@ -500,6 +712,82 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
                                 fallback_lr_mult=0.5,
                                 fallback_mode="atan2",
                                 soda_lambda_scale=0.003,
+                                steps=args.hpo_steps,
+                            )
+                        )
+
+        trials = list(by_name.values())
+        if args.max_hpo_trials:
+            trials = trials[: args.max_hpo_trials]
+        eval_every = max(1, args.hpo_steps // max(args.eval_bins, 1))
+        warmup = min(args.warmup_steps, max(1, args.hpo_steps // 4))
+        return [replace(trial, eval_every=eval_every, warmup_steps=warmup) for trial in trials]
+
+    if args.preset == "muown_ema_hpo":
+        by_name: dict[str, TrialConfig] = {}
+
+        def add(trial: TrialConfig) -> None:
+            by_name.setdefault(trial.name, trial)
+
+        # Keep the previous FineWeb winner in the comparison so the new paper
+        # variants are judged against the strongest local baseline, not only
+        # plain Muon.
+        add(
+            TrialConfig(
+                "fineweb_anchor_best_lr0.0012_rg0.45_soda0.003_pb0.9_nb0.93_flr1_rms",
+                "anchormuon",
+                0.0012,
+                row_gamma=0.45,
+                pmuoneq_beta=0.90,
+                normuon_beta2=0.93,
+                fallback_lr_mult=1.0,
+                fallback_mode="rms",
+                soda_lambda_scale=0.003,
+                steps=args.hpo_steps,
+            )
+        )
+        for lr in (3e-4, 4e-4, 5e-4):
+            add(TrialConfig(f"fineweb_adamw_lr{lr:g}", "adamw", lr, steps=args.hpo_steps))
+            add(TrialConfig(f"fineweb_adamatan2_lr{lr:g}", "adamatan2", lr, steps=args.hpo_steps))
+        for lr in (1.0e-3, 1.1e-3, 1.2e-3, 1.35e-3):
+            add(TrialConfig(f"fineweb_muon_lr{lr:g}", "muon", lr, weight_decay=0.05, steps=args.hpo_steps))
+
+        # Muown's paper reports the best default without weight decay, but the
+        # benchmark's Muon baseline uses decay. Sweep both to check whether the
+        # implicit row-magnitude path really removes the need for it here.
+        for lr in (9e-4, 1.1e-3, 1.3e-3, 1.6e-3, 2.0e-3):
+            for wd in (0.0, 0.01, 0.05):
+                add(TrialConfig(f"fineweb_muown_lr{lr:g}_wd{wd:g}", "muown", lr, weight_decay=wd, steps=args.hpo_steps))
+
+        # EMA-Nesterov is a wrapper around a tuned base optimizer. The paper's
+        # useful region is beta in 0.1..0.5 and gamma near 0.99 for short runs.
+        for lr in (1.0e-3, 1.1e-3, 1.2e-3):
+            for ema_beta in (0.1, 0.3, 0.5):
+                for ema_gamma in (0.99, 0.995):
+                    add(
+                        TrialConfig(
+                            f"fineweb_ema_muon_lr{lr:g}_b{ema_beta:g}_g{ema_gamma:g}",
+                            "ema_muon",
+                            lr,
+                            weight_decay=0.05,
+                            ema_beta=ema_beta,
+                            ema_gamma=ema_gamma,
+                            steps=args.hpo_steps,
+                        )
+                    )
+
+        for lr in (1.1e-3, 1.3e-3, 1.6e-3):
+            for wd in (0.0, 0.01):
+                for ema_beta in (0.1, 0.3):
+                    for ema_gamma in (0.99, 0.995):
+                        add(
+                            TrialConfig(
+                                f"fineweb_ema_muown_lr{lr:g}_wd{wd:g}_b{ema_beta:g}_g{ema_gamma:g}",
+                                "ema_muown",
+                                lr,
+                                weight_decay=wd,
+                                ema_beta=ema_beta,
+                                ema_gamma=ema_gamma,
                                 steps=args.hpo_steps,
                             )
                         )
@@ -700,7 +988,7 @@ def final_trials_from_hpo(args: argparse.Namespace, hpo_rows: list[dict[str, Any
     eval_every = max(1, args.final_steps // max(args.eval_bins, 1))
     warmup = min(args.warmup_steps, max(1, args.final_steps // 4))
     trials: list[TrialConfig] = []
-    for family in ("anchormuon", "adamw", "adamatan2", "muon"):
+    for family in ("anchormuon", "muown", "ema_muown", "ema_muon", "adamw", "adamatan2", "muon"):
         if family not in best:
             continue
         row = best[family]
@@ -717,6 +1005,10 @@ def final_trials_from_hpo(args: argparse.Namespace, hpo_rows: list[dict[str, Any
                 fallback_mode=str(row.get("fallback_mode", "atan2")),
                 soda_lambda_scale=float(row.get("soda_lambda_scale", 1.0)),
                 soda_lambda_power=float(row.get("soda_lambda_power", 1.0)),
+                ema_beta=float(row.get("ema_beta", 0.0)),
+                ema_gamma=float(row.get("ema_gamma", 0.99)),
+                ema_warmup_frac=float(row.get("ema_warmup_frac", 0.30)),
+                ema_rest_frac=float(row.get("ema_rest_frac", 0.20)),
                 seed=args.seed,
                 steps=args.final_steps,
                 eval_every=eval_every,
@@ -865,7 +1157,15 @@ def make_plots(args: argparse.Namespace, final_rows: list[dict[str, Any]]) -> No
 
     plots_dir = args.output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
-    labels = {"anchormuon": "AnchorMuon", "adamw": "AdamW", "adamatan2": "AdamW-Atan2", "muon": "Muon"}
+    labels = {
+        "anchormuon": "AnchorMuon",
+        "adamw": "AdamW",
+        "adamatan2": "AdamW-Atan2",
+        "muon": "Muon",
+        "muown": "Muown",
+        "ema_muon": "EMA-Nesterov + Muon",
+        "ema_muown": "EMA-Nesterov + Muown",
+    }
     for metric, ylabel, out_name in [
         ("val_loss", "Validation loss", "val_loss_curve.png"),
         ("val_acc", "Byte accuracy", "val_acc_curve.png"),
@@ -900,7 +1200,15 @@ def make_plots(args: argparse.Namespace, final_rows: list[dict[str, Any]]) -> No
 
 
 def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], final_rows: list[dict[str, Any]]) -> None:
-    labels = {"anchormuon": "AnchorMuon", "adamw": "AdamW", "adamatan2": "AdamW-Atan2", "muon": "Muon"}
+    labels = {
+        "anchormuon": "AnchorMuon",
+        "adamw": "AdamW",
+        "adamatan2": "AdamW-Atan2",
+        "muon": "Muon",
+        "muown": "Muown",
+        "ema_muon": "EMA-Nesterov + Muon",
+        "ema_muown": "EMA-Nesterov + Muown",
+    }
     final_sorted = sorted(final_rows, key=lambda r: float(r["final_val_loss"]))
     lines = [
         "# Byte-Level 50M LLM Optimizer Comparison",
@@ -933,6 +1241,8 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
                 f"normuon_beta2={float(row['normuon_beta2']):g}, fallback={row['fallback_mode']}@{float(row['fallback_lr_mult']):g}x, "
                 f"soda={float(row.get('soda_lambda_scale', 1.0)):g}"
             )
+        if row["family"] in ("ema_muon", "ema_muown"):
+            config += f", ema_beta={float(row['ema_beta']):g}, ema_gamma={float(row['ema_gamma']):g}"
         lines.append(
             f"| {rank} | {labels.get(str(row['family']), row['family'])} | {config} | "
             f"{float(row['final_val_loss']):.4f} | {float(row['best_val_loss']):.4f} | "

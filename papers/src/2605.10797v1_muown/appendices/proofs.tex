@@ -1,0 +1,63 @@
+
+\subsection{Proposition~\texorpdfstring{\ref{prop:spectral-norm-decomposition}}{1}}
+\label{ref:proof-spectral-norm-decomposition}
+
+\begin{proof}
+Since each row of $\W_t$ is nonzero, the vector $\g_t=\RowNorm{\W_t}$ is well-defined and has strictly positive entries. Hence
+$$
+\D_t=\mathrm{Diag}\!\left(1/\g_t\right)\W_t
+$$
+is well-defined, and for each row $i$,
+$$
+\dd_{t,i} = \frac{\ww_{t,i}}{\norm{\ww_{t,i}}_2},
+$$
+so $\norm{\dd_{t,i}}_2=1$. Therefore,
+$$
+\W_t=\mathrm{Diag}(\g_t)\D_t.
+$$
+
+Using this factorization, we compute
+$$
+\W_t\W_t^\top
+=
+\mathrm{Diag}(\g_t)\D_t\D_t^\top\mathrm{Diag}(\g_t)
+=
+\mathrm{Diag}(\g_t)\,\C_t\,\mathrm{Diag}(\g_t).
+$$
+By definition of the spectral norm,
+$$
+\opnorm{\W_t}^2
+=
+\lambda_{\max}(\W_t\W_t^\top),
+$$
+and therefore
+$$
+\opnorm{\W_t}^2
+=
+\lambda_{\max}\!\bigl(\mathrm{Diag}(\g_t)\,\C_t\,\mathrm{Diag}(\g_t)\bigr).
+$$
+
+It remains to factor out the maximal row magnitude. Since $\g_t=\RowNorm{\W_t}$, its entries are nonnegative, so $|\g_t|=\g_t$. By the definition of $\p_t$,
+$$
+\g_t=\norm{\g_t}_\infty\,\p_t,
+\qquad\text{hence}\qquad
+\mathrm{Diag}(\g_t)=\norm{\g_t}_\infty\,\PP_t.
+$$
+Substituting this into the previous identity yields
+$$
+\mathrm{Diag}(\g_t)\,\C_t\,\mathrm{Diag}(\g_t)
+=
+\norm{\g_t}_\infty^2\,\PP_t\,\C_t\,\PP_t.
+$$
+Since scaling a matrix by a positive scalar scales all eigenvalues by the same scalar, we obtain
+$$
+\lambda_{\max}\!\bigl(\mathrm{Diag}(\g_t)\,\C_t\,\mathrm{Diag}(\g_t)\bigr)
+=
+\norm{\g_t}_\infty^2\,\lambda_{\max}\!\bigl(\PP_t\,\C_t\,\PP_t\bigr).
+$$
+Recalling that the LHS of the equation above is equal to $\opnorm{\W_t}^2$ proves the claim.
+\end{proof}
+
+\subsection{Deterministic Convergence (Theorem~\texorpdfstring{\ref{thm:det_convergence}}{1})}
+\label{sec:app.conv_analysis}
+\input{appendices/convergence_proofs}

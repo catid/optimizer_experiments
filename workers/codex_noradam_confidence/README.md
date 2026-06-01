@@ -42,6 +42,9 @@ commit b009f03 Compare NorMuon base against AdamW
   schedule-winner replay.
 - `results/sfplus_combo20_20260529/`: 20-epoch exhaustive ScheduleFree+
   mechanism-combination sweep around the AnchorMuon matrix direction.
+- `results/finewebedu_llm50m_muown_ema_20260601/`: 50M byte-level FineWeb-Edu
+  comparison of Muown and EMA-Nesterov wrappers against AnchorMuon, Muon, AdamW,
+  and AdamW-Atan2 controls.
 
 ## Main Result
 
@@ -77,6 +80,34 @@ Latest diagrams:
   `results/root_lr_schedule_sweep_20260529/final50_schedule_winners/val_acc.png`
 - Latest LR-schedule iteration speed:
   `results/root_lr_schedule_sweep_20260529/final50_schedule_winners/step_time_ms_bar.png`
+
+### FineWeb-Edu Muown / EMA-Nesterov Result
+
+The newest LM optimizer check adds two paper-derived variants in the local
+byte-LM runner only:
+
+- `Muown` from arXiv `2605.10797v1`, implemented as optimizer-side row-norm
+  control for Muon.
+- `EMA-Nesterov` from arXiv `2605.25395v1`, implemented as a pre-forward
+  lookahead wrapper around Muon or Muown.
+
+Protocol: 49.4M byte-level GPT, FineWeb-Edu byte cache, batch `32 x 128`,
+BF16, WSD with 100-step warmup, 1.2K-step HPO and 6K-step final replay, two RTX
+PRO 6000 Blackwell GPUs scheduled one trial per GPU.
+
+| Rank | Optimizer | Selected config | Final val loss | Final byte acc | Step | Throughput |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | EMA-Nesterov + Muown | `lr=0.0016`, `wd=0`, `ema_beta=0.3`, `ema_gamma=0.995` | 1.2131 | 63.30% | 21.91 ms | 187.0k byte/s |
+| 2 | Muown | `lr=0.0016`, `wd=0` | 1.2156 | 63.23% | 20.69 ms | 198.0k byte/s |
+| 3 | AnchorMuon | `lr=0.0012`, `row_gamma=0.45`, `soda=0.003`, `fallback=RMS@1.0x` | 1.2312 | 62.84% | 14.83 ms | 276.2k byte/s |
+| 4 | Plain Muon | `lr=0.0011`, `wd=0.05` | 1.2338 | 62.76% | 16.89 ms | 242.5k byte/s |
+| 5 | EMA-Nesterov + Muon | `lr=0.001`, `wd=0.05`, `ema_beta=0.5`, `ema_gamma=0.995` | 1.2340 | 62.72% | 18.51 ms | 221.3k byte/s |
+
+Takeaway: on this 6K-step proxy, Muown is the best new direction by loss.
+EMA-Nesterov adds a small loss improvement on top of Muown, but it is slower
+because it keeps full-parameter EMA lookahead state. This is not a replacement
+for the CIFAR-10 AnchorMuon winner; it is evidence for the next language-model
+optimizer round.
 
 ### ScheduleFree+ Combination Sweep
 

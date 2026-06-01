@@ -1,0 +1,2030 @@
+                                          Muown: Row-Norm Control for Muon Optimization
+                                                                    Kai Lion1 Florian Hübler1,2 Bingcong Li1
+                                                                           Antonio Orvieto3 Niao He1
+                                                                1
+                                                                 Department of Computer Science, ETH Zurich, Switzerland
+                                                   2
+                                                       Department of Mathematics, School of Computation, Information and Technology;
+                                                                         Technical University of Munich, Germany
+                                                             3
+                                                               ELLIS Institute Tübingen, MPI-IS, Tübingen AI Center, Germany
+                                                          {kai.lion,florian.huebler,bingcong.li,niao.he}@inf.ethz.ch
+                                                                             antonio@tue.ellis.eu
+
+
+                                                                                      Abstract
+arXiv:2605.10797v1 [cs.LG] 11 May 2026
+
+
+
+
+                                                  Muon has emerged as a strong competitor to AdamW for language model pre-
+                                                  training, yet its behavior at scale is sensitive to weight decay. Recent work has
+                                                  observed that, for Muon without decoupled weight decay, the spectral norm of
+                                                  weight matrices drifts upward over training. Through a decomposition of the
+                                                  spectral norm into a row-magnitude factor and a row-coherence factor, we iden-
+                                                  tify the former as the empirical driver of this drift under Muon, while the latter
+                                                  remains well-behaved along the trajectory. Motivated by this diagnosis, we in-
+                                                  troduce Muown, a drop-in replacement for Muon that treats the row-magnitude
+                                                  vector as an explicit optimizer variable, updating it under the ℓ∞ geometry in-
+                                                  duced by the decomposition, while applying Muon unchanged to the remaining
+                                                  direction component. We prove that Muown attains the optimal non-convex rates
+                                                  in both deterministic and stochastic regimes under a dual norm aligned with the
+                                                  underlying geometries and with a stochastic noise coefficient that empirically
+                                                  remains below that of Muon throughout training. Across GPT-style pre-training
+                                                  on FineWeb-Edu with model sizes from 124M up to 2.7B parameters, Muown
+                                                  improves perplexity over Muon, SOAP, AdamW, and Lion. It also widens the
+                                                  plateau of near-optimal learning rates across model scales, reduces sensitivity to
+                                                  weight decay, and avoids the spectral norm drift at negligible step-time overhead
+                                                  when appropriately sharded.
+
+
+                                         1   Introduction
+
+                                         Moving beyond the diagonal conditioning inherent to Adam and its variants (Kingma and Ba,
+                                         2015; Loshchilov and Hutter, 2019), an emerging class of optimizers is engineered to respect the
+                                         matrix-shaped structure of the linear layers of the Transformer architecture. Notable examples
+                                         include Shampoo (Gupta et al., 2018), SOAP (Vyas et al., 2025), Scion (Pethick et al., 2025) and
+                                         Muon (Jordan et al., 2024b). In particular, Muon has been motivated through the perspective
+                                         of steepest spectral descent (Carlson et al., 2015), which computes the update direction as the
+                                         solution to the optimization problem arg min∆W∈Rm×n ⟨G, ∆W⟩ s.t. ∥∆W∥S∞ ≤ 1 where G
+                                         is the matrix-shaped gradient of the loss with respect to W ∈ Rm×n and ∥·∥S∞ is the spectral
+                                         (Schatten-∞) norm.
+                                         Despite the encouraging empirical success of Muon, it has been observed that, at scale, its formu-
+                                         lation can suffer from numerical overflows in bfloat16 (Liu et al., 2025) and exploding attention
+                                         logits (Kimi-Team et al., 2025). At the same time, the spectral norm of weight matrices has been
+                                         documented to grow consistently throughout training under Muon without weight decay (Pethick
+                                         et al., 2025, Fig. 9), violating thep
+                                                                             spectral condition for stable feature
+                                                                                                             p learning (Yang et al., 2024b),
+                                         which prescribes ∥W∥S∞ = Θ( m/n) and ∥∆W∥S∞ = Θ( m/n). This drift away from the
+                                         stable feature-learning regime could potentially be linked to the pathologies mentioned above.
+                                         A standard remedy is decoupled weight decay (Chen et al., 2025; 2024; Pethick et al., 2025), which
+                                         keeps ∥Wt ∥S∞ in check by shrinking the weight matrix uniformly at every step. This interven-
+                                         tion is non-targeted, scaling the entire spectrum uniformly, irrespective of which directions are
+
+
+                                                                                            1
+                                                                                                                                                     2.4
+        60       Spectral Norm kWkS                                         25       Spectral Norm kWkS                                                                       Muown, Fixed g                                                            Muown, Fixed g
+                                                                                                                                                                                                                               2.2
+                                                                                                                                                                              Muown, λ = 0.0                                                            Muown, λ = 0.0
+                                      ∞                                                                   ∞
+
+                 Max Row Norm kgk∞                                                   Max Row Norm kgk∞                                               2.2
+        50
+                 Muown, Fixed g                                             20       Muown, Fixed g                                                  2.0
+                                                                                                                                                                              Muon, λ = 0.1                                    2.0                      Muon, λ = 0.1
+                                                                                                                                                                              Muon, λ = 0.0                                                             Muon, λ = 0.0
+
+
+
+
+                                                                                                                                        λmax (PCP)
+
+
+
+
+                                                                                                                                                                                                                  λmax (PCP)
+        40       Muown, λ = 0.0                                                      Muown, λ = 0.0
+                 Muon, λ = 0.1                                                       Muon, λ = 0.1                                                   1.8                                                                       1.8
+
+
+
+
+Value
+
+
+
+
+                                                                    Value
+                                                                            15
+        30       Muon, λ = 0.0                                                       Muon, λ = 0.0                                                   1.6                                                                       1.6
+                                                                            10
+        20
+
+
+
+
+                                                                                                                                        p
+
+
+
+
+                                                                                                                                                                                                                  p
+                                                                                                                                                     1.4                                                                       1.4
+        10                                                                   5
+                                                                                                                                                     1.2
+                                                                                                                                                                                                                               1.2
+         0                                                                   0
+                                                                                                                                                     1.0
+             0   2500   5000   7500 10000 12500 15000 17500 20000                0   2500   5000   7500 10000 12500 15000 17500 20000                      0   2500   5000   7500 10000 12500 15000 17500 20000                      0   2500   5000   7500 10000 12500 15000 17500 20000
+                                   Step                                                                Step                                                                      Step                                                                      Step
+
+                 (a) MLP Layer                                               (b) Output Projection                                                             (c) MLP Layer                                                   (d) Output Projection
+
+ Figure 1: Left two: Drift of the maximum row norm ∥gt ∥∞ drives the growth of the spectral
+ norm ∥Wt ∥S∞ for an MLP and attention output projection layer in a 500M transformer. When
+ intervening by changing the parameterization s.t. the row magnitudes are fixed to the value at
+ initialization, the systematic spectral norm increase vanishes. Right two: The remaining coherence
+ factor λmax Pt Ct Pt in the spectral norm exhibits no drift. λ denotes the weight decay, for more
+                         
+ details, see Appendix A.4
+
+ responsible for spectral-norm growth, and has been observed to slow convergence in the early
+ phase of training (Liu et al., 2025, Fig. 2), (Pethick et al., 2025, Fig. 8). We introduce a comple-
+ mentary perspective: rather than constraining the spectrum as a whole, we identify systematic
+ row-norm growth as the empirical mechanism driving the spectral-norm drift (Fig. 1a, 1b) and
+ control it by reparameterizing the weight so that the row scales become explicitly trainable. To
+ remain agnostic to the model architecture, this reparameterization is realized implicitly inside the
+ optimizer, leaving the forward pass unchanged. The resulting procedure achieves consistent gains
+ in perplexity across all tested model scales and learning rates, at a minimal step-time overhead
+ compared to Muon.
+
+ 1.1             Contribution
+                        • We decompose the spectral norm into a row-magnitude factor and a row-coherence factor
+                          (Proposition 1), which singles out the row magnitude as the component whose evolution
+                          tracks the spectral norm under Muon. Building on this perspective, we propose Muown, a
+                          drop-in replacement for Muon that promotes the row magnitudes to an explicit optimizer
+                          variable, while Muon is applied unchanged to the directional component.
+                        • Muown retains the optimal non-convex rates of Muon in both deterministic and stochastic
+                          settings (Theorems 1, 2), but established in the mixed dual norm matching the two
+                          update geometries. The result supports the empirical improvements of Muown through
+                          an improved noise term.
+                        • On FineWeb-Edu pre-training from 124M to 2.7B parameters, Muown consistently im-
+                          proves perplexity over Muon, SOAP, AdamW, and Lion, maintaining a consistent per-
+                          plexity advantage over the best-tuned Muon baseline. Further, it broadens the plateau
+                          of near-optimal learning rates across model widths (Fig. 5), and alleviates the need for
+                          weight-decay tuning (Fig. 4b). The method adds only minor step-time overhead once
+                          sharded (Table 3), matching Muon’s runtime in practical scenarios.
+
+ The remainder of this work is structured as follows. In Section 2, we review relevant background.
+ We then introduce Muown in Section 3 and motivate it from the perspective of approximate
+ spectral norm control via trainable row-scales. In Section 4, we establish convergence of Muown
+ and conclude by comparing its effectiveness against Muon, SOAP, and AdamW in Section 5.
+
+
+ 2               Related Work
+
+ Shaping Gradient Spectra. Pre-conditioning is a central tool in optimization for machine learn-
+ ing (Bottou et al., 2018): while early approaches focus on efficient use of the Hessian or the Fisher
+ Information (Martens and Grosse, 2015), contemporary methods directly operate on gradients,
+ taking their matrix structure into account. An early notable work in gradient-based structure-
+ aware optimizers is Shampoo (Gupta et al., 2018). Rather than applying pre-conditioning on
+ flattened, structureless parameter vectors, Shampoo employs two matrix-shaped pre-conditioners.
+ An idealized variant of Shampoo can be cast as performing steepest spectral descent under the
+ spectral norm, effectively setting the singular values of the parameter update matrix to unity (Bern-
+
+
+                                                                                                                                    2
+             23.0                                                              23.0
+             22.5                                                              22.5
+             22.0                                                              22.0
+
+Perplexity
+
+
+
+
+                                                                  Perplexity
+             21.5                                                              21.5
+             21.0                                                              21.0
+             20.5           Muon                                               20.5           Muon
+                            Muown                                                             Muown
+             20.0           SOAP                                               20.0           SOAP
+                            Lion                                                              Lion
+             19.5                                                              19.5
+                       04                          01       0.0
+                                                               1                         04                       01             0.0
+                                                                                                                                    1
+                    1e-                         0.0                                   1e-                      0.0
+                                           Learning Rate                                                  Learning Rate
+                                    (a) With weight decay                                        (b) Without weight decay
+
+  Figure 3: Perplexity as a function of learning rate for Muon, Muown, Lion, and SOAP on a 124M
+  model. Muown achieves lower perplexity across all learning rates and is more robust to the choice
+  of learning rate, maintaining strong performance even at higher values where Muon diverges. We
+  repeat the average of two seeds, reporting min and max as shaded area. Details are reported in
+  Appendix C.
+
+  stein and Newhouse, 2024). SOAP (Vyas et al., 2025) optimizes singular values adaptively with
+  Adam. Most prominently, Muon (Jordan et al., 2024b; Tuddenham et al., 2022) shapes the spectrum
+  through orthogonalization of the momentum state, approximating the normalized steepest descent
+  direction (Boyd and Vandenberghe, 2004) under a spectral norm constraint (Carlson et al., 2015).
+
+                                                                                              Muown                       Muon
+  Operator Norm Perspective. This viewpoint
+  is formalized by the operator-norm framework
+  of metrized deep learning (Large et al., 2024;
+  Bernstein and Newhouse, 2025), where each             row-scale  direction     full weight
+
+  layer is equipped with a geometry derived
+  from its input-output semantics, and gradients,
+  treated as dual vectors, are transported back compute           from                       use
+  to the primal weight space by a layerwise du-
+  ality map (Nemirovski and Yudin, 1983; Beck compute             from
+  and Teboulle, 2003). For MLP layers under
+  a rescaled spectral norm, this map recovers
+  Muon’s orthogonalization (Bernstein and New- Figure 2: Abstract Illustration of Muown and
+  house, 2024; Jordan et al., 2024b). Both sides Muon, showing the parameterization (top), se-
+  of the spectral condition then live in this layer- mantics and geometry (middle), and the opti-
+  wise operator norm: the size prescriptions on mizer step (bottom).
+  W and ∆W, as well as the steepest-descent
+  rule that produces compatible updates. Steepest descent, however, only bounds ∥∆W∥S∞ per
+  step, leaving the control of ∥W∥S∞ along the trajectory as a separate problem.
+  Spectral Control. Existing mechanisms for keeping ∥W∥S∞ bounded during training fall into
+  three broad families. Decoupled weight decay shrinks W uniformly at every step. Chen et al. (2025)
+  cast Muon with decoupled weight decay as a member of the Lion-K family (Chen et al., 2024)
+  whose trajectories converge to KKT points of a spectral-norm-constrained problem, with related
+  Frank–Wolfe interpretations developed in (Sfyraki and Wang, 2025; Pethick et al., 2025). Spectral
+  reparameterizations hardwire the singular spectrum of W, e.g. as orthogonal under Parseval/Stiefel
+  parameterizations (Cisse et al., 2017). Spectral-norm caps act on the top singular value via soft penal-
+  ties (Yoshida and Miyato, 2017), post-hoc normalization (Miyato et al., 2018), or odd-polynomial
+  clipping (Newhouse et al., 2025). All three families act on the singular spectrum of W as an
+  aggregate quantity, leaving open which component of W empirically drives spectral-norm growth
+  under Muon.
+   Our work answers this open question at the parameterization level. We identify the maximal
+   row magnitude ∥gt ∥∞ as the empirical driver of ∥Wt ∥S∞ drift under Muon (Section 3.1) and
+   reparameterize W so that this driver is promoted to an explicit optimizer variable, updated
+   under its natural ℓ∞ geometry. Spectral-norm control thus emerges from the construction of the
+
+
+                                                                  3
+parameterization rather than from an aggregate constraint on W, avoiding both the indiscriminate
+shrinkage of decoupled weight decay and the orthogonality prior of spectral reparameterizations.
+
+
+3     Method
+
+Notation. Let Wt ∈ Rm×n denote the current iterate of a weight matrix of a linear layer with m
+and n output and input neurons, respectively, and Gt = ∇W L(Wt ) ∈ Rm×n its corresponding
+gradient at iteration t with respect to a scalar loss L(·). Division by vectors is elementwise.
+We write diag(A) ∈ Rk for the vector of diagonal entries of a square matrix A ∈ Rk×k , and
+Diag(a) ∈ Rk×k for the diagonal matrix with diagonal given by a ∈ Rk . For p ∈ [1, ∞], ∥a∥p
+denotes the ℓp -norm of a vector a ∈ Rk , and ∥A∥Sp the Schatten-p norm of a matrix A ∈ Rm×n ,
+i.e. the ℓp -norm of its singular values σ1 (A) ≥ · · · ≥ σmin(m,n) (A) ≥ 0. In particular ∥A∥S∞
+is the spectral norm and ∥A∥S1 the nuclear norm. The canonical (Frobenius) inner product on
+Rm×n is ⟨A, B⟩ := tr(A⊤ B) with induced norm ∥A∥F , and ⟨a, b⟩ = a⊤ b on Rk . We write
+λmax (M) for the largest eigenvalue of a symmetric matrix M. With slight abuse of notation, we
+denote the row-norm vector ∥A∥row = (∥A1,: ∥2 , . . . , ∥Am,: ∥2 )⊤ ∈ Rm . For A ∈ Rm×n , we
+define the projection which removes the    per-row radial component with respect to X ∈ R
+                                                                                             m×n
+
+as ProjX (A) := A − Diag diag(AX⊤ ) X. In other words, for each row ai , ProjX (A) subtracts
+⟨ai , xi ⟩xi .
+
+3.1   Motivation
+
+Row Norm Drift. The constrained optimization and metrized-deep-learning arguments in Sec-
+tion 2 single out ∥Wt ∥S∞ as the quantity that governs stability of feature propagation, yet steepest
+spectral descent only bounds ∥∆Wt ∥S∞ per step. Before prescribing a separate control mech-
+anism for ∥Wt ∥S∞ itself, we ask a more basic question: which component of Wt is responsible for
+the observed spectral-norm drift under Muon? The following decomposition isolates two candidate
+mechanisms.
+Proposition 1 (Spectral Norm Decomposition into Row Magnitude and Coherence). Let Wt ∈
+Rm×n and suppose each row of Wt is nonzero. Define the row-magnitude vector gt := ∥Wt ∥row ∈ Rm ,
+and the row-normalized matrix Dt := Diag(1/gt ) Wt ∈ Rm×n , so that Wt = Diag(gt )Dt . Let
+Ct := Dt D⊤ t ∈ R
+                  m×m
+                        be the Gram matrix of the unit-norm rows, and define pt := |gt |/ ∥gt ∥∞ ∈
+      m
+[0, 1] with Pt := Diag(pt ). Then the spectral norm of Wt admits the decomposition
+                                    2           2                 
+                              ∥Wt ∥S∞ = ∥gt ∥∞ λmax Pt Ct Pt .
+                                                                  2
+In particular, the spectral norm splits into a row-scale term ∥gt ∥∞ and a normalized alignment term
+λmax (Pt Ct Pt ).
+
+The proof is deferred to Appendix B.1. We remark that the two factors are disjoint by design: any
+positive uniform row-rescaling of Wt moves only ∥gt ∥∞ , while any directional change to the
+rows moves only λmax (Pt Ct Pt ). The alignment factor λmax (Pt Ct Pt ) ≥ 1 measures coherence
+of the unit-norm neurons in Dt , weighted by the normalized row-scale profile pt . It collapses to 1
+if and only if the (non-negligible) rows are orthonormal, in which case ∥Wt ∥S∞ = ∥gt ∥∞ and
+the layer’s operator norm is determined entirely by its maximal row scale.
+Row Norm Control. Across the attention and MLP linear layers of a 500M model trained with
+Muon, we find that ∥Wt ∥S∞ and ∥gt ∥∞ move in lock-step throughout training (Fig. 1a, 1b;
+Fig. 10, 11), whereas λmax (Pt Ct Pt ) only exhibits a brief transient rise early in training, remaining
+bounded thereafter (Fig. 1c, 1d; Fig. 12). A simple causal intervention confirms that the row scales
+drive the spectral norm drift: freezing gt = g1 after initialization, a minimal intervention that
+touches only the row-scale factor, eliminates the systematic growth of ∥Wt ∥S∞ (Figs. 1, 10).
+With ∥gt ∥∞ identified as the empirical driver of ∥Wt ∥S∞ under Muon, we respond by promoting
+it from a byproduct of the W-update to a trainable variable, optimized under its own geometry.
+Existing spectral-control schemes instead intervene at coarser granularities of Proposition 1.
+Trainable row magnitudes, by contrast, act only on the identified driver ∥gt ∥∞ , without the
+
+
+                                                   4
+             18                                                          21.2
+                                     Muon
+             17                      Muown
+             16                                                          21.0
+             15                                                                                                                               Muon, =0
+                                                                         20.8                                                                 Muon, =0.01
+
+
+
+
+                                                            Perplexity
+Perplexity   14                                                                                                                               Muon, =0.03
+                                                                                                                                              Muon, =0.1
+             13                                                          20.6                                                                 Muon, =0.3
+                                                                                                                           = 0.134
+                                                                                                                                              Muown, =0
+                                                                                                                                              Muown, =0.01
+             12                                                          20.4                                                                 Muown, =0.03
+                                                                                                                                              Muown, =0.1
+             11                                                                                                                               Muown, =0.3
+             10                                                          20.2
+              9    0    1      2        3    4   5                              7.5×10 4   10 3        2×10 3     4×10 3             6×10 3
+                                   Tokens            1e10                                         Learning Rate
+                            (a) 2.7B Model                                           (b) Weight Decay Ablation for 124M
+
+  Figure 4: Left: Perplexity of Muon and Muown on a 2.7B transformer trained on FineWeb-Edu.
+  Right: Ablation of weight decay and learning rate for Muon and Muown on 124M models after 5B
+  tokens.
+
+   orthogonality prior of reparameterizations and without the indiscriminate shrinkage of weight
+   decay.
+
+
+   3.2            Muown
+
+  To turn ∥gt ∥∞ into a controllable variable, we reparameterize each linear layer as W(g, R) =
+  Diag(g/ ∥R∥row )R with g ∈ Rm and R ∈ Rm×n , i.e. weight normalization (Salimans and
+  Kingma, 2016), under which g coincides exactly with the row-magnitude vector of Proposition 1.
+  To remain agnostic to the model implementation, we realize the reparameterization implicitly
+  inside the optimizer: g is held as an additional optimizer state, R is reconstructed from the stored
+  effective weight W on each step, and the forward pass is left unchanged. The resulting procedure
+  (Algorithm 1, Fig. 2) is therefore a drop-in replacement for Muon, which decomposes each layer
+  into a direction R, already metrized by the spectral norm, and a diagonal per-neuron gain Diag(g).
+  It remains to choose a geometry for g. Composability in the modular-duality framework (Bernstein
+  and Newhouse, 2025, Def. 6) requires that the output space of R and the input space of Diag(g)
+  carry the same norm, so the natural metric on g is the induced operator norm ∥Diag(∆g)∥S∞ .
+  Since the operator norm of a diagonal matrix equals the largest entry in absolute value, this
+  yields ∥Diag(∆g)∥S∞ = ∥∆g∥∞ , i.e., the ℓ∞ geometry on g. This is independently confirmed by
+  Proposition 1, which identifies ∥gt ∥∞ as the row-scale factor of ∥Wt ∥S∞ .
+   Steepest descent under ℓ∞ is SignSGD (Bernstein et al., 2018), with the entrywise sign as the duality
+   map (Bernstein and Newhouse, 2025, Ex. 2). Its update ∆g = −η sgn(∇g ) satisfies ∥∆g∥∞ =
+   η by construction, so the row-scale contribution ∥Diag(∆g)∥S∞ = ∥∆g∥∞ to ∥∆Wt ∥S∞ is
+   bounded at every step. In practice, SignSGD is the stateless analogue of Adam with both EMAs
+   disabled (Balles et al., 2020; Xie and Li, 2024), and AdamW has been shown to converge to
+   KKT points of an ℓ∞ -constrained problem (Xie and Li, 2024). We therefore adopt Adam as the
+   magnitude optimizer in Algorithm 1, as it inherits the ℓ∞ geometry while adding momentum-
+   based smoothing against stochastic-gradient noise.
+  We initialize R1 ← W1 and cached row norms and magnitudes as r, g1 ← ∥W1 ∥row , so that
+  W(g1 , R1 ) = W1 , making Muown start from exactly the same point as Muon under any non-zero
+   initialization scheme.
+                      p All remaining optimizer states are zero. Following Liu et al. (2025), we scale
+   the R-step by 0.2 max(m, n) to match the RMS norm of a typical Adam update, so that a single
+   learning rate ηt drives both the direction and magnitude updates and no separate learning rate
+   for g is introduced. The resulting algorithm can be found in Algorithm 1.
+
+
+   4              Convergence Analysis
+
+  We establish that Muown attains the optimal non-convex rate in the stochastic setting (Theorem 1)
+  in a dual norm matching the two update geometries.
+
+
+                                                            5
+                                                    Muown                                                          Muon
+                                                                   d = 512 (64M)                               d = 512 (64M)
+                         5.0
+                                                                   d = 768 (124M)                              d = 768 (124M)
+                                                                   d = 1280 (300M)                             d = 1280 (300M)
+                         4.5
+
+
+
+
+       Validation Loss
+                         4.0
+
+                         3.5
+
+                         3.0
+
+                               2 16   2 14   2 12      2 10   28       26            24       2 16   2 14   2 12      2 10       28   26   24
+                                             Learning Rate                                                  Learning Rate
+
+Figure 5: Validation loss of Muon and Muown at three different model widths of 512, 768, 1280
+with 12 layers each. We observe that Muown yields close to optimal validation loss for a wide
+range of learning rates from 2−10 up to 2−5 , irrespective of model width.
+
+
+Following the prevalent view of Adam as a smoothed sign method (Kunstner et al., 2023), we
+analyze SignSGD with momentum (Signum) as its proxy on g. SignSGD preserves the relevant
+ℓ∞ geometry dynamics which largely explain Adam’s behavior in Transformer training (Kunstner
+et al., 2023), while making the underlying ℓ∞ geometry explicit (Bernstein et al., 2018; Balles et al.,
+2020; Xie and Li, 2024).
+The deterministic case follows and all proofs are deferred to Appendix B.
+Setup and Geometry. Working in the re-
+parameterized variables g ∈ Rm , R ∈ Algorithm 1 Step of Muon with integrated Weight
+Rm×n             m×n                          Normalization (Muown)
+  row>0 , where Rrow>0 denotes the set of m×n
+matrices with strictly positive row norms, we Require: W ∈ Rm×n , gradient ∇W L(W) ∈
+consider L e : Rm × Rm×n → R, L(g, e R) :=      Rm×n , states g, r, mg , vg ∈ Rm , M ∈ Rm×n ,
+                      row>0
+                                        
+L (W (g, R)) = L Diag ∥R∥g             R .                                                learning rate ηt , weight decay λ, momentum β1
+                                  row
+Since the g- and R-updates take unit-                                                     R ← Diag( gr )W
+sized steps in the ℓ∞ - and spectral norms                                                D ← Diag(1/r)R
+respectively, we equip the joint variable
+with the product max-norm ∥(g, R)∥ =                                                      # obtain decoupled gradients
+max{∥g∥∞ , ∥R∥S∞ } and the canonical in-                                                  ∇g L(W) ← (∇W L(W) ⊙ D)1n
+ner product ⟨(g, R), (g′ , R′ )⟩ := ⟨g, g′ ⟩ +                                            ∇R L(W) ← Diag( gr )ProjD (∇W L(W))
+⟨R, R′ ⟩. The corresponding dual norm is                                                  # run muon w/ nesterov on direction
+∥(g, R)∥∗ = ∥g∥1 + ∥R∥S1 , combining the
+ℓ1 -norm on Rm with the Schatten-1 (nuclear)                                              M ← β1 M + ∇R L(W)
+norm on Rm×n . Each summand is the dual of                                                O ← arg min∥O∥S ≤1 ⟨β1 M + ∇R L(W), O⟩
+the norm in which the corresponding update                                                              p ∞
+                                                                                          R ← R + 0.2 max(m, n)ηt O
+is bounded, so the product norm simply lifts
+the modular-duality viewpoint of Section 2 to                                             # run adam on magnitude
+the joint variable (g, R).                                                                g ← Adam(∇g L(W), mg , vg , ηt )
+Stochastic Convergence.           We consider                                             # obtain effective weight
+the objective L(W)        := Eξ [L(W; ξ)]                                                 r ← ∥R∥row
+with access only to stochastic gradients                                                  W ← Diag( gr )R
+∇L(W, ξ), and use the re-parametrized gra-
+dient oracles ∇g L(g                                         t ) and ∇R L(gt , Rt , ξt )
+                   e t , Rt , ξt ) = diag(∇L(W(gt , Rt ), ξt )D⊤          e                                                                     =
+             gt
+Diag       ∥Rt ∥row               ProjDt (∇L(W(gt , Rt ), ξt )), where Dt = Diag(1/ ∥Rt ∥row )Rt is the row-
+normalization of Rt .
+
+
+Theorem 1 (Stochastic Convergence of Muown). Assume L        e is L-smooth along the trajectory, lower
+bounded by L⋆ and the gradient oracles have σg and σR bounded variance accordingly (see Assumption 1).
+           e
+Denote ∆1 ≥ L(ge 1 , R1 ) − Le⋆ and the norm equivalence constants ζg := maxg ∥g∥1/∥g∥2 , ζR :=
+                                                                       q
+                                                                                                                      ∆1 (1−β1 )
+maxR ∥R∥S1/∥R∥F . Then the iterates of Algorithm 2 with ηt ≡                                                              LT     and β1     = 1 −
+
+
+                                                                                 6
+                 q      
+min 1, max T −2/3 , ∆  1L
+                       2
+                     σ̂ T    , where σ̂ := ζg σg + ζR σR , satisfy
+
+                    T                            r                        1/4
+                                                                 ∆1 Lσ̂ 2
+                                                               
+                1X h                        i       ∆1 L                         4σ̂
+                       E ∇L (gt , Rt )
+                             e                ≤6          +8                   + 1/3
+                T t=1                     ∗          T               T          T
+                                     1/4 
+                               ∆1 Lσ 2
+which matches the optimal O      T            non-convex rate up to constants.
+
+The guarantee is stated for the dual norm of the re-parameterized gradient, and the dominant term
+matches the optimal stochastic non-convex rate up to constants (Arjevani et al., 2023), mirroring
+the rate established for Muon by (Shen et al., 2025, Corollary 4.4). Moreover, since ∥·∥1 ≥ ∥·∥2 and
+∥·∥S1 ≥ ∥·∥F , the bound is strictly stronger than its ℓ2 /Frobenius counterpart. We caution that the
+bound concerns ∇L   e. Although L(g,
+                                  e R) = L(W) pointwise, ∇Le and ∇L need not be directly
+comparable. The only algorithm-dependent factor is the noise coefficient σ̂ = ζg σg + ζR σR ,
+where the norm-equivalence constants ζg , ζR arise, as in recent Muon analyses (Shen et al., 2025,
+Theorem 4.3), from controlling the stochastic error in ℓ1 /Schatten-1 from ℓ2 /Frobenius variance
+bounds. In comparison, the corresponding factor for Muon is ζW σW , hence our theory predicts
+an improvement of Muown over Muon whenever ζg σg + ζR σR < ζW σW . Section 5 and Fig. 7
+verify this inequality empirically throughout training, with the gap widening up to a factor of
+1.6×, offering reduced gradient noise in the (g, R)-parameterization as a candidate mechanism
+for explaining the observed perplexity gains.
+In the proof, we first use our choice of geometry to split the descent Lemma into independent g-
+and R-terms (Lemma 1). We then apply the steepest-descent analyses of SignSGD and Muon,
+and recombine without cross-terms. The full proof can be found in Appendix B.2.
+
+
+5   Experiments
+
+In this section, we evaluate Muown on language-model pre-training with modern GPT-style
+architectures on FineWeb-Edu. This section is designed to answer (i) whether Muown can improve
+convergence relative to current state-of-the-art geometry-aware optimizers at a fixed token budget,
+(ii) whether it reduces sensitivity to learning rate and weight decay tuning, and (iii) whether its
+convergence behavior is better conditioned, as indicated by gradient rank and gradient noise. We
+conclude this section with a discussion of the computational overhead.
+Setup. We adopt the experimental Table 1: Perplexity for Muown, Muon, and SOAP on
+setup of Ajroldi (2024) which is a 500M model for different learning rates. We report
+based on a nanoGPT (Karpathy, average and standard deviation across 3 seeds.
+2022) implementation augmented
+with recent architectural improve-        η          Muown               Muon              SOAP
+ments such as RoPE (Su et al., 2024),
+                                                     λ = 0.0     λ = 0.1      λ = 0.0    λ = 10−4
+RMSNorm normalization (Zhang
+and Sennrich, 2019), and SwiGLU           4 × 10−3 14.13±0.004 28.37±23.59 88.15±3.869 14.53±0.017
+                                          2 × 10−3 14.14±0.027 14.37±0.028 14.40±0.042 14.47±0.022
+activations (Shazeer, 2020). We use       1 × 10−3 14.24±0.026 14.44±0.039 14.54±0.041 14.49±0.036
+a warmup-stable-decay learning rate
+schedule (Hu et al., 2024) and train most models at four sizes: 124M, 500M, 1B, and 2.7B. We
+focus on perplexity at a fixed token budget as a primary evaluation criterion. All training details
+can be found in Appendix C.
+Pre-training Perplexity. We organize pre-training results by scale: a full learning-rate sweep at
+124M (Fig. 3), a multi-seed comparison at 500M (Table 1), and single-seed runs at 1B and 2.7B
+(Table 2, Fig. 4a). Unless explicitly stated otherwise, Muown is run without weight decay (λ = 0).
+For Muon we use λ = 0.1. Both of these we find to be optimal across λ ∈ {0, 0.01, 0.03, 0.1, 0.3}
+on the 124M grid (Fig. 4b; discussed in detail below). We additionally include λ = 0 for Muon.
+At the 124M scale, Fig. 3 compares Muown against Muon, SOAP, and Lion across eight log-spaced
+learning rates, both with and without weight decay on the Muon-family optimizers. Muown
+attains the lowest perplexity at every learning rate in the grid and degrades gracefully at the top of
+the range, whereas Muon diverges for learning rates at which Muown is still near-optimal.
+
+
+                                                  7
+                                                                                                                            Muon, λ = 0.0                                                                   0.8
+                                                                                                                  0.6       Muon, λ = 0.1
+                            0.5                                                                                             Muown, λ = 0.0
+
+
+
+
+Normalized Effective Rank
+
+
+
+
+                                                                                      Normalized Effective Rank
+
+
+
+
+                                                                                                                                                                                Normalized Effective Rank
+                                                                                                                                                                                                            0.7
+                                                                                                                  0.5
+                            0.4                                                                                                                                                                             0.6
+                                                                                                                  0.4                                                                                       0.5                                 Muon, λ = 0.0
+                            0.3                                                                                                                                                                                                                 Muon, λ = 0.1
+                                                                                                                  0.3                                                                                       0.4                                 Muown, λ = 0.0
+                            0.2                                                                                   0.2                                                                                       0.3
+                                                                                                                                                                                                            0.2
+                            0.1                                   Muon, λ = 0.0                                   0.1
+                                                                  Muon, λ = 0.1                                                                                                                             0.1
+                                                                  Muown, λ = 0.0                                  0.0
+                            0.0                                                                                                                                                                             0.0
+                                  0   2000     4000       6000   8000         10000                                     0           2000       4000       6000   8000   10000                                     0   2000   4000       6000   8000         10000
+                                               Training step                                                                                   Training step                                                                 Training step
+
+                                             (a) Query                                                                                       (b) Output                                                               (c) MLP Layer 1
+
+       Figure 6: Normalized effective rank (Roy and Vetterli, 2007) of minibatch gradients for a 124M
+       model. At a given training step, we sample 8 gradients and average their effective ranks.
+
+      At 500M (Table 1), Muown retains at least a 0.2 perplexity improvement over the best Muon
+      configuration at every matched learning rate, significantly larger than the per-seed standard
+      deviation of stable non-divergent runs. The stability gap widens at η = 4 × 10−3 : Muon diverges
+      (88.15 at λ = 0) or exhibits large seed variance (28.37 ± 23.59 at λ = 0.1), while Muown gets
+      closer to optimality, corroborating the robustness signature seen at 124M.
+      The gap persists at the 1B and 2.7B scale. At 1B (Table 2), Muown attains 11.90 perplexity at
+      η = 3 × 10−3 , improving upon the best Muon run (12.20 at η = 2 × 10−3 , λ = 0) by 0.30. At
+      2.7B (Fig. 4a), Muown reaches 9.57 at η = 2 × 10−3 while the best stable Muon run lands at 9.82
+      (η = 10−3 , λ = 0), preserving a 0.25 perplexity advantage for Muown. The consistent perplexity
+      gap from 500M up to 2.7B suggests that the improvement does not attenuate with scale within the
+      regime we reach.
+      Two additional experiments probe whether these gains transfer beyond the architecture and
+      the four baselines above. On a Qwen2-0.5B (Yang et al., 2024a) architecture (Appendix A.2),
+      Muown preserves a 0.25 perplexity advantage over the best-tuned Muon configuration. Moreover,
+      compared to NorMuon (Li et al., 2025), a per-row Muon variant that adapts the orthogonalized
+      momentum via a row-wise second-moment statistic (Appendix A.3), Muown matches or improves
+      perplexity in the near-optimal range and exhibits a wider basin of stability at 124M.
+      Robustness to Hyperparameter Table 2: Perplexity for Muown and Muon on 1B and 2.7B
+      Choices. We assess robustness models across learning rates. We also report perplexity of
+      along two axes: width-dependence
+                                            AdamW at 1B. † Run aborted after 12h on 16 GPUs as valida-
+      of the optimal learning rate (Fig. 5)
+                                            tion loss was diverging.
+      and sensitivity to weight decay
+      (Fig. 4b). Following the protocol
+      of Pethick et al. (2025), we sweep a    Scale η             Muown          Muon         AdamW
+      log-spaced learning-rate grid from                           λ=0     λ = 0.1 λ = 0 λ = 0.1
+      2−16 to 2−5 across three widths of                    −3
+                                                      3 × 10       11.90    44.89    110.19    303.16
+      512, 768, and 1280 (corresponding               2 × 10−3     11.93    12.33     12.20     12.69
+      to 67M, 124M, and 308M parame-          1B
+                                                      1 × 10−3     12.01    12.27     12.32     12.93
+      ters) at Chinchilla-optimal token               5 × 10−4     12.18    12.35     12.44     12.85
+      count. Muown yields near-optimal
+                                                            −3                  †         †
+      validation loss over a wide plateau             2 × 10         9.57    —         —
+      of learning rates spanning 2−10         2.7B    1 × 10−3       9.63   10.01     9.82
+      to 2−5 at every width, whereas                  7.5 × 10−4     9.66    9.96     9.87
+      Muon’s optimal learning rate shifts
+      downward with increasing width
+      and its near-optimal plateau narrows. This indicates that Muown slightly alleviates the need for
+      per-scale learning-rate retuning. To rule out an implementation-specific artefact, we reproduce
+      the same qualitative phenomenon using the widely-used modded-nanogpt (Jordan et al., 2024a)
+      setup (Fig. 8).
+       Fig. 4b sweeps a two-dimensional grid of learning rate and weight decay λ                  ∈
+       {0, 0.01, 0.03, 0.1, 0.3} for Muon and Muown at the 124M scale. At optimally tuned learning
+       rate, weight decay provides a sizeable improvement in perplexity for Muon and is minimized
+       at λ = 0.1, justifying the Muon baseline configuration used in the pre-training perplexity
+       comparisons above. In contrast, the same sweep of weight decay strength yields no significant
+       gain for Muown.
+
+
+                                                                                                                                                8
+Effective Rank and Stochastic Noise. We probe two properties of the stochastic minibatch
+gradients each optimizer orthogonalizes, ∇W L for Muon and ∇R L for Muown, to investigate
+the perplexity gains reported above. First, following Ahn et al.P(2025), we track the normalized
+effective rank erank(σ)/ min(m, n) with erank(σ) = exp(− i pi log pi ), pi = σi /∥σ∥1 (Roy
+and Vetterli, 2007) which can be read as the fraction of directions the optimizer effectively explores.
+Fig. 6 shows that Muown sustains a higher effective rank than Muon on every reported weight
+type throughout training. Second, Section 4 showed that Muown’s stochastic rate scales with
+σ̂ = ζg σg + ζR σR while Muon’s scales with ζW σW (Shen et al., 2025), leaving the theoretical
+edge conditional on σ̂ < ζW σW . Fig. 7 verifies this inequality per weight matrix along the
+training trajectory: Muown’s noise term stays below Muon’s and the gap widens over training.
+Together, higher spectral diversity and lower stochastic noise in the (g, R)-parameterization offer
+a mechanistic explanation for the observed perplexity gains.
+Resource Overhead. Table 3 reports median end-to-end step time on a 500M model
+(forward and backward passes, gradient synchronization, and optimizer update).
+Relative to Muon, Muown adds only element-
+wise O(mn) work per layer (the weight-norm
+                                                   0.10      W W (Muon)
+decomposition and recomposition together                     g g + R R (Muown)
+
+with the Adam update on g ∈ R ) asymptoti-
+                                  m                0.09
+cally dominated by the shared Newton-Schulz        0.08
+iteration at O(m2 n) for m ≤ n. We bench-
+                                                   0.07
+
+                                                  Value
+mark two variants: a replicated baseline that
+runs the optimizer step on every rank, and a       0.06
+distributed variant (under DDP) that follows       0.05
+Jordan et al. (2024a), sharding the per-layer
+                                                   0.04
+optimizer work round-robin across ranks and
+concluding with an all-gather. In the replicated   0.03
+                                                        2000 3000 4000 5000 6000 7000 8000 9000
+setting the surplus materializes as a measur-                                  Step
+able ≈ 20 ms (1.5%) per step; once sharded
+in the same pass as Newton-Schulz, step times Figure 7: Comparison of the noise coefficients
+for Muon and Muown become indistinguish- for Muon and Muown. Shaded areas mark the
+able, with the gap shrinking further as the rank interquartile range over weights.
+count grows. This amortization relies on exposing the reparameterization inside the optimizer: at
+the module level, every rank would redundantly recompute the decomposition on its local replica
+of W at every forward pass. Communication is unchanged from Muon: only W is all-gathered,
+while g and the reconstructed R remain rank-local.
+Muown introduces no additional O(mn) state on top of Muon, since R is reconstructed inside the
+optimizer from the stored effective weight W. The only new states are four Rm vectors per linear
+layer (g, the cached row norm ∥R∥row , and the Adam first- and second-moment buffers for g)
+amounting to ≈ 2 MB of additional peak memory in the runs of Table 3, negligible next to Muon’s
+momentum buffer.
+
+6   Conclusion
+
+We show that the spectral-norm drift observed under Muon is not Table 3: Median step time
+an irreducible property of the optimizer. Instead, the decomposi- (s) for Muown and Muon on
+tion of Proposition 1 isolates the maximal row magnitude ∥gt ∥∞ a 500M model (1K steps, 4
+as its empirical driver, while the row-coherence factor remains GH200 GPUs).
+stable along the trajectory. We propose Muown, which acts on
+this driver at the parameterization level, lifting g to an optimizer Setting     Muon Muown
+variable updated under the ℓ∞ geometry singled out by modular
+duality and leaving Muon unchanged on the direction. We pro- Replicated          1.34   1.36
+                                                                     Distributed 1.27   1.27
+vide evidence that this intervention can improve perplexity, widen
+the plateau of near-optimal learning rates across model widths, and alleviate the need to tune
+weight decay. These gains come at a memory cost linear in the number of rows and negligible
+step-time overhead once the optimizer is sharded across ranks.
+Limitations and Future Work. The decomposition W = Diag(g/ ∥R∥row )R is undefined when
+a row of W is exactly zero at initialization, making the direction unidentifiable. Architectures that
+
+
+                                                  9
+depend on zero-initialized weight matrices, such as zero-initialized residual output projections or
+some LoRA adapters, therefore require either a small non-zero initialization or an opt-out from the
+reparameterization for the affected layers. Our empirical study is also confined to dense GPT-style
+architectures and pre-training horizons up to 53B tokens. The behavior on convolutional, mixture-
+of-experts, and substantially longer-horizon regimes remains open. A first natural direction for
+future work is to vary the geometry imposed on g. Replacing ℓ∞ with sparsity-inducing ℓ1 -updates
+would transform magnitude control into structured row-wise sparsity, offering an optimizer-level
+route to neuron pruning and therefore potentially more efficient inference.
+
+
+Acknowledgments
+
+This work was supported under project ID a0184 as part of the Swiss AI Initiative, through a small
+grant from the ETH Domain and computational resources provided by the Swiss National Super-
+computing Centre (CSCS) under the Alps infrastructure. Kai Lion is supported by Swiss National
+Science Foundation (SNSF) Sinergia Funding No. 216600. Florian Hübler acknowledges financial
+support from the ETH research grant and Swiss National Science Foundation (SNSF) Project
+Funding No. 200021-207343, the Alexander von Humboldt Foundation, the European Union’s
+Horizon Europe research and innovation programme under grant agreements No. 101120237
+(ELIAS), and No. 101070617 (ELSA). Views and opinions expressed are however those of the
+author only and do not necessarily reflect those of the European Union or European Commission.
+Neither the European Union nor the granting authority can be held responsible for them. Antonio
+Orvieto acknowledges the financial support of the Hector Foundation. Niao He is supported by an
+ETH research grant funded through the ETH Zurich Foundation and by an SNSF Starting Grant.
+
+
+References
+Kwangjun Ahn, Byron Xu, Natalie Abreu, and John Langford. Dion: Distributed Orthonormalized
+ Updates, 2025. arXiv:2504.05295.
+
+Niccolò Ajroldi. plainLM: Language Model Pretraining in PyTorch. https://github.com/
+  Niccolo-Ajroldi/plainLM, 2024.
+Yossi Arjevani, Yair Carmon, John C. Duchi, Dylan J. Foster, Nathan Srebro, and Blake Woodworth.
+  Lower Bounds for Non-Convex Stochastic Optimization. Mathematical Programming, 199(1):
+  165–214, 2023.
+
+Lukas Balles, Fabian Pedregosa, and Nicolas Le Roux. The Geometry of Sign Gradient Descent,
+  2020. arXiv:2002.08056.
+
+Amir Beck and Marc Teboulle. Mirror Descent and Nonlinear Projected Subgradient Methods for
+ Convex Optimization. Operations Research Letters, 31(3):167–175, 2003.
+
+Yoshua Bengio, Nicolas Boulanger-Lewandowski, and Razvan Pascanu. Advances in Optimizing
+  Recurrent Networks. In IEEE Trans. Acoust., Speech, Sig. Process., 2013.
+
+Jeremy Bernstein and Laker Newhouse. Old Optimizer, New Norm: An Anthology. In OPT 2024:
+   16th Annual Workshop on Optimization for Machine Learning, 2024.
+
+Jeremy Bernstein and Laker Newhouse. Modular Duality in Deep Learning. In Proc. Int. Conf. on
+   Machine Learning (ICML), 2025.
+
+Jeremy Bernstein, Yu-Xiang Wang, Kamyar Azizzadenesheli, and Animashree Anandkumar.
+   signSGD: Compressed Optimisation for Non-Convex Problems. In Proc. Int. Conf. on Machine
+   Learning (ICML), 2018.
+
+Sidney Black, Stella Biderman, Eric Hallahan, Quentin Anthony, Leo Gao, Laurence Golding,
+  Horace He, Connor Leahy, Kyle McDonell, Jason Phang, Michael Pieler, Usvsn Sai Prashanth,
+  Shivanshu Purohit, Laria Reynolds, Jonathan Tow, Ben Wang, and Samuel Weinbach. GPT-
+  NeoX-20B: An Open-Source Autoregressive Language Model. In Proceedings of BigScience Episode
+  #5 – Workshop on Challenges & Perspectives in Creating Large Language Models. ACL, 2022.
+
+
+                                                10
+Léon Bottou, Frank E Curtis, and Jorge Nocedal. Optimization Methods for Large-scale Machine
+  Learning. SIAM review, 60(2):223–311, 2018.
+
+Stephen Boyd and Lieven Vandenberghe. Convex Optimization. Cambridge University Press, 2004.
+
+David Carlson, Volkan Cevher, and Lawrence Carin. Stochastic Spectral Descent for Restricted
+  Boltzmann Machines. In Proc. Int. Conf. on Artificial Intelligence and Statistics (AISTATS), 2015.
+
+Lizhang Chen, Bo Liu, Kaizhao Liang, and Qiang Liu. Lion Secretly Solves Constrained Optimiza-
+  tion: As Lyapunov Predicts. In Proc. Int. Conf. on Learning Representations (ICLR), 2024.
+
+Lizhang Chen, Jonathan Li, and Qiang Liu. Muon Optimizes Under Spectral Norm Constraints.
+  In OPT 2025: 17th Annual Workshop on Optimization for Machine Learning, 2025.
+
+Xiangning Chen, Chen Liang, Da Huang, Esteban Real, Kaiyuan Wang, Hieu Pham, Xuanyi Dong,
+  Thang Luong, Cho-Jui Hsieh, Yifeng Lu, and Quoc V Le. Symbolic Discovery of Optimization
+  Algorithms. In Proc. Neural Information Processing Systems (NeurIPS), 2023.
+
+Moustapha Cisse, Piotr Bojanowski, Edouard Grave, Yann Dauphin, and Nicolas Usunier. Parseval
+ Networks: Improving Robustness to Adversarial Examples. In Proc. Int. Conf. on Machine Learning
+ (ICML), 2017.
+
+Ashok Cutkosky and Harsh Mehta. Momentum Improves Normalized SGD. In Proc. Int. Conf. on
+  Machine Learning (ICML), 2020.
+
+Vineet Gupta, Tomer Koren, and Yoram Singer. Shampoo: Preconditioned Stochastic Tensor
+  Optimization. In Proc. Int. Conf. on Machine Learning (ICML), 2018.
+
+Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya, Trevor Cai, Eliza
+  Rutherford, Diego de Las Casas, Lisa Anne Hendricks, Johannes Welbl, Aidan Clark, Tom
+  Hennigan, Eric Noland, Katie Millican, George van den Driessche, Bogdan Damoc, Aurelia
+  Guy, Simon Osindero, Karen Simonyan, Erich Elsen, Oriol Vinyals, Jack W. Rae, and Laurent
+  Sifre. Training Compute-optimal Large Language Models. In Proc. Neural Information Processing
+  Systems (NeurIPS), 2022.
+
+Shengding Hu, Yuge Tu, Xu Han, Chaoqun He, Ganqu Cui, Xiang Long, Zhi Zheng, Yewei Fang,
+  Yuxiang Huang, Weilin Zhao, Xinrong Zhang, Zheng Leng Thai, Kaihuo Zhang, Chongyi Wang,
+  Yuan Yao, Chenyang Zhao, Jie Zhou, Jie Cai, Zhongwu Zhai, Ning Ding, Chao Jia, Guoyang
+  Zeng, Dahai Li, Zhiyuan Liu, and Maosong Sun. MiniCPM: Unveiling the Potential of Small
+  Language Models with Scalable Training Strategies. In Proc. Conf. on Language Modeling (COLM),
+  2024.
+
+Keller Jordan, Jeremy Bernstein, Brendan Rappazzo, @fernbear.bsky.social, Boza Vlado, You
+  Jiacheng, Franz Cesista, Braden Koszarsky, and @Grad62304977. modded-nanoGPT: Speedrun-
+  ning the NanoGPT Baseline. GitHub repository, 2024a. URL https://github.com/
+  KellerJordan/modded-nanogpt.
+Keller Jordan, Yuchen Jin, Vlado Boza, Jiacheng You, Franz Cesista, Laker Newhouse, and Jeremy
+  Bernstein. Muon: An Optimizer for Hidden Layers in Neural Networks, 2024b. URL https:
+  //kellerjordan.github.io/posts/muon/.
+Andrej Karpathy. nanoGPT: The Simplest, Fastest Repository for Training/Finetuning Medium-
+ sized GPTs. GitHub repository, 2022. URL https://github.com/karpathy/nanoGPT.
+
+Kimi-Team, Yifan Bai, Yiping Bao, Guanduo Chen, Jiahao Chen, Ningxin Chen, Ruijue Chen, and
+  Yanru Chen et al. Kimi K2: Open Agentic Intelligence, 2025. arXiv:2507.20534.
+
+Diederik P. Kingma and Jimmy Ba. Adam: A Method for Stochastic Optimization. In Proc. Int.
+  Conf. on Learning Representations (ICLR), 2015.
+
+Frederik Kunstner, Jacques Chen, Jonathan Wilder Lavington, and Mark Schmidt. Noise Is Not
+  the Main Factor Behind the Gap Between Sgd and Adam on Transformers, But Sign Descent
+  Might Be. In Proc. Int. Conf. on Learning Representations (ICLR), 2023.
+
+
+                                                11
+Tim Large, Yang Liu, Minyoung Huh, Hyojin Bahng, Phillip Isola, and Jeremy Bernstein. Scalable
+  Optimization in the Modular Norm. In Proc. Neural Information Processing Systems (NeurIPS),
+  2024.
+
+Zichong Li, Liming Liu, Chen Liang, Weizhu Chen, and Tuo Zhao. NorMuon: Making Muon
+  More Efficient and Scalable, 2025. arXiv:2510.05491.
+
+Jingyuan Liu, Jianlin Su, Xingcheng Yao, Zhejun Jiang, Guokun Lai, Yulun Du, Yidao Qin, Weixin
+   Xu, Enzhe Lu, Junjie Yan, Yanru Chen, Huabin Zheng, Yibo Liu, Shaowei Liu, Bohong Yin,
+   Weiran He, Han Zhu, Yuzhi Wang, Jianzhou Wang, Mengnan Dong, Zheng Zhang, Yongsheng
+   Kang, Hao Zhang, Xinran Xu, Yutao Zhang, Yuxin Wu, Xinyu Zhou, and Zhilin Yang. Muon is
+   Scalable for LLM Training, 2025. arXiv:2502.16982.
+
+Ilya Loshchilov and Frank Hutter. Decoupled Weight Decay Regularization. In Proc. Int. Conf. on
+   Learning Representations (ICLR), 2019.
+
+Anton Lozhkov, Loubna Ben Allal, Leandro von Werra, and Thomas Wolf. FineWeb-Edu: The
+ Finest Collection of Educational Content, 2024. URL https://huggingface.co/datasets/
+ HuggingFaceFW/fineweb-edu.
+James Martens and Roger Grosse. Optimizing Neural Networks with Kronecker-factored Approx-
+  imate Curvature. In Proc. Int. Conf. on Machine Learning (ICML), 2015.
+
+Takeru Miyato, Toshiki Kataoka, Masanori Koyama, and Yuichi Yoshida. Spectral Normalization
+  for Generative Adversarial Networks, 2018. arXiv:1802.05957.
+
+Arkadi Nemirovski and David B. Yudin. Problem Complexity and Method Efficiency in Optimization.
+  Wiley-Interscience Series in Discrete Mathematics. Wiley-Interscience, 1983.
+
+Yu.E. Nesterov. A Method for Solving the Convex Programming Problem with Convergence Rate
+  $O(1/K^2)$. Doklady Akademii Nauk SSSR, 269(3):543–547, 1983. ISSN 0002-3264.
+
+Laker Newhouse, R. Preston Hess, Franz Cesista, Andrii Zahorodnii, Jeremy Bernstein, and Phillip
+  Isola. Training Transformers with Enforced Lipschitz Constants, 2025. arXiv:2507.13338.
+
+Thomas Pethick, Wanyun Xie, Kimon Antonakopoulos, Zhenyu Zhu, Antonio Silveti-Falls, and
+  Volkan Cevher. Training Deep Learning Models with Norm-Constrained LMOs. In Proc. Int.
+  Conf. on Machine Learning (ICML), 2025.
+
+Olivier Roy and Martin Vetterli. The Effective Rank: A Measure of Effective Dimensionality. In
+  15th European Signal Processing Conference, pages 606–610. IEEE, 2007.
+
+Tim Salimans and Durk P Kingma. Weight Normalization: A Simple Reparameterization to
+  Accelerate Training of Deep Neural Networks. In Proc. Neural Information Processing Systems
+  (NeurIPS), 2016.
+
+Maria-Eleni Sfyraki and Jun-Kun Wang. Lions and Muons: Optimization via Stochastic Frank-
+ Wolfe, 2025. arXiv:2506.04192.
+
+Noam Shazeer. GLU Variants Improve Transformer, 2020. arXiv:2002.05202.
+
+Wei Shen, Ruichuan Huang, Minhui Huang, Cong Shen, and Jiawei Zhang. On the Convergence
+ Analysis of Muon, 2025. arXiv:2505.23737.
+
+Jianlin Su, Murtadha Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, and Yunfeng Liu. RoFormer:
+   Enhanced Transformer with Rotary Position Embedding. Neurocomput., 2024.
+
+Mark Tuddenham, Adam Prügel-Bennett, and Jonathan Hare. Orthogonalising gradients to speed
+ up neural network optimisation, 2022. arXiv:2202.07052.
+
+Nikhil Vyas, Depen Morwani, Rosie Zhao, Itai Shapira, David Brandfonbrener, Lucas Janson, and
+  Sham Kakade. SOAP: Improving and Stabilizing Shampoo using Adam. In Proc. Int. Conf. on
+  Learning Representations (ICLR), 2025.
+
+
+                                              12
+Shuo Xie and Zhiyuan Li. Implicit Bias of AdamW: $\ell_\infty$ Norm Constrained Optimization,
+  2024. arXiv:2404.04454.
+
+An Yang, Baosong Yang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Zhou, Chengpeng Li,
+ Chengyuan Li, Dayiheng Liu, Fei Huang, Guanting Dong, Haoran Wei, Huan Lin, Jialong
+ Tang, Jialin Wang, Jian Yang, Jianhong Tu, Jianwei Zhang, Jianxin Ma, Jianxin Yang, Jin Xu,
+ Jingren Zhou, Jinze Bai, Jinzheng He, Junyang Lin, Kai Dang, Keming Lu, Keqin Chen, Kexin
+ Yang, Mei Li, Mingfeng Xue, Na Ni, Pei Zhang, Peng Wang, Ru Peng, Rui Men, Ruize Gao,
+ Runji Lin, Shijie Wang, Shuai Bai, Sinan Tan, Tianhang Zhu, Tianhao Li, Tianyu Liu, Wenbin Ge,
+ Xiaodong Deng, Xiaohuan Zhou, Xingzhang Ren, Xinyu Zhang, Xipin Wei, Xuancheng Ren,
+ Xuejing Liu, Yang Fan, Yang Yao, Yichang Zhang, Yu Wan, Yunfei Chu, Yuqiong Liu, Zeyu Cui,
+ Zhenru Zhang, Zhifang Guo, and Zhihao Fan. Qwen2 Technical Report, 2024a. arXiv:2407.10671.
+
+Greg Yang, James B. Simon, and Jeremy Bernstein. A Spectral Condition for Feature Learning,
+  2024b. arXiv:2310.17813.
+
+Yuichi Yoshida and Takeru Miyato. Spectral Norm Regularization for Improving the Generaliz-
+  ability of Deep Learning, 2017. arXiv:1705.10941.
+
+Biao Zhang and Rico Sennrich. Root Mean Square Layer Normalization. In Proc. Neural Information
+  Processing Systems (NeurIPS), 2019.
+
+
+
+
+                                              13
+                     Supplementary Document for Muown
+
+Contents
+
+1   Introduction                                                                                        1
+    1.1   Contribution . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .    2
+
+2   Related Work                                                                                        2
+
+3   Method                                                                                              4
+    3.1   Motivation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .    4
+    3.2   Muown . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .     5
+
+4   Convergence Analysis                                                                                5
+
+5   Experiments                                                                                         7
+
+6   Conclusion                                                                                          9
+
+A Additional Experiments                                                                               15
+    A.1 nanoGPT Speedrunning . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 15
+    A.2 Qwen2-0.5B . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 15
+    A.3 Comparison with NorMuon . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 15
+    A.4 Spectral Analysis . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 16
+    A.5 Magnitude Learning . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 16
+    A.6 Effective Rank of Minibatch Gradients . . . . . . . . . . . . . . . . . . . . . . . . . 17
+
+B Proofs                                                                                               18
+    B.1 Proposition 1 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 18
+    B.2 Deterministic Convergence (Theorem 2) . . . . . . . . . . . . . . . . . . . . . . . . 19
+    B.3 Stochastic Convergence (Theorem 1) . . . . . . . . . . . . . . . . . . . . . . . . . . 21
+
+C Experimental Details                                                                                 24
+
+
+
+
+                                                   14
+                                         4.0
+                                                   Muown, d = 768
+                                                   Muown, d = 1280
+                                                   Muon, d = 768
+                                         3.8       Muon, d = 1280
+
+
+
+
+                       Validation Loss
+                                         3.6
+
+
+                                         3.4
+
+
+                                         3.2
+
+
+                                         3.02 13   2 12    2 11      2 10     29            28     27   26   25   24
+                                                                            Learning Rate
+
+Figure 8: Learning rate and width ablation for Muon and Muown using the modded-nanoGPT
+codebase.
+
+
+A     Additional Experiments
+
+A.1   nanoGPT Speedrunning
+
+We compare Muown and Muon for different learn- Table 4: Perplexity for Muown and Muon on
+ing rates and widths using the modded-nanoGPT Qwen2-0.5B pre-training.
+codebase and report the results in Fig. 8. Simi-
+lar to Pethick et al. (2025), we choose a log-space
+                                                    η         Muown         Muon
+learning grid from 2−12 to 2−5 . Fig. 8 confirms
+the conclusions drawn in the main text regarding              λ = 0.0 λ = 0.1 λ = 0.0
+the greater robustness with respect to ill-chosen
+                                                    1 × 10 −2
+                                                               14.57      –        –
+learning rates.                                            −3
+                                                                                                 8 × 10      14.59     46.77   94.02
+                                                                                                 4 × 10−3    14.65     14.86   14.83
+A.2   Qwen2-0.5B                                                                                 2 × 10−3    14.76     14.82   14.88
+                                                                                                 1 × 10−3    14.95     14.91   15.03
+As an additional architectural datapoint, we pre-
+train a Qwen2-0.5B (Yang et al., 2024a) model,
+reporting results in Table 4. We remark that for
+all but one learning rate considered, Muown outperforms Muon and maintains a 0.25 perplexity
+advantage when comparing the best-performing hyperparameters.
+
+A.3   Comparison with NorMuon
+
+Both NorMuon (Li et al., 2025) and Muown
+augment plain Muon with a per-row mecha-          23.0
+                                                                                        Muown
+nism on the rows of the 2D weight matrices,       22.5                                  NorMuon
+but they intervene at different points in the
+                                                  22.0
+update. Plain Muon orthogonalizes the mo-
+                                                                               Perplexity
+
+
+
+
+mentum of ∇W L via Newton–Schulz and ap-          21.5
+plies it directly to the parameter without a row- 21.0
+wise state. NorMuon instead applies a post-       20.5
+processing step to the update, maintaining a
+                                                  20.0
+per-row EMA of the mean-squared entries of
+the orthogonalized update, dividing the up-       19.5
+                                                                 01               0.0
+                                                                                      1
+date element-wise by its square root, and renor-             0.0
+                                                                    Learning Rate
+malizing back to the original Frobenius norm.
+This procedure effectively redistributes mass Figure 9: Comparison of NorMuon and Muown
+of the update across rows. In contrast, rather on a 124M model.
+than redistributing mass of the update Muown
+changes the parameterization to control the row-norms of the weight. In essence, both methods
+equip every row with a scalar quantity (a second-moment statistic for NorMuon and a learned
+magnitude for Muown). Nevertheless, these row variables serve different purposes. We compare
+
+
+                                                                              15
+                                                                                   Muown, fixed scale                Muown                     Muon, = 0.1         Muon, = 0.0
+                                   Q                                     K                                     V                                      Out                              FC1                                   FC2
+                30                                                                          30                                    25
+                                                      25                                                                                                                 60
+                25                                                                                                                20                                                                       60
+                                                                                            25                                                                           50
+                                                      20
+
+
+Spectral norm
+                20                                                                          20                                    15                                     40                                40
+
+   Block 4
+                15                                    15                                    15
+                                                                                                                                  10                                     30
+                10                                    10                                    10                                                                           20                                20
+                                                                                                                                   5
+                 5                                     5                                     5                                                                           10
+                                                                                                                                   0                                      0                                 0
+                30                                                                          30                                    20                                     60
+                                                      25
+                25                                                                                                                                                                                         60
+                                                                                            25                                                                           50
+                                                      20                                                                          15
+Spectral norm
+
+
+
+
+                20                                                                          20                                                                           40
+                                                                                                                                                                                                           40
+   Block 8
+
+
+
+
+                                                      15
+                15                                                                          15                                    10                                     30
+                10                                    10                                    10                                                                           20
+                                                                                                                                   5                                                                       20
+                 5                                     5                                     5                                                                           10
+                                                                                             0                                     0                                      0                                 0
+                                                      25                                                                          25                                                                       80
+                25                                                                                                                                                       60
+                                                      20                                    30                                    20                                     50
+                20                                                                                                                                                                                         60
+Spectral norm
+
+
+
+
+                                                      15                                                                          15                                     40
+  Block 12
+
+
+
+
+                15                                                                          20                                                                                                             40
+                                                                                                                                  10                                     30
+                10                                    10
+                                                                                            10                                                                           20                                20
+                 5                                     5                                                                           5
+                                                                                                                                                                         10
+                                                                                             0                                     0                                      0                                 0
+                     0       5000 10000 15000 20000        0       5000 10000 15000 20000        0       5000 10000 15000 20000        0        5000 10000 15000 20000        0   5000 10000 15000 20000        0       5000 10000 15000 20000
+                                  Step                                  Step                                  Step                                   Step                              Step                                  Step
+
+
+       Figure 10: ∥Wt ∥S∞ for the layers in the 4th, 8th, and 12th transformer block of a 500M model.
+
+                                                                                   Muown, fixed scale                Muown                     Muon, = 0.1         Muon, = 0.0
+                                    Q                                     K                                     V                                     Out                               FC1                                   FC2
+                15.0                                  15.0                                                                                                                                                  60
+                                                                                             12                                    15                                     15
+                12.5                                  12.5                                                                                                                                                  50
+                                                                                             10
+Max row norm
+
+
+
+
+                10.0                                  10.0                                                                                                                                                  40
+                                                                                              8                                    10                                     10
+  Block 4
+
+
+
+
+                 7.5                                   7.5                                                                                                                                                  30
+                                                                                              6
+                 5.0                                   5.0                                                                             5                                                                    20
+                                                                                              4                                                                               5
+                 2.5                                   2.5                                                                                                                                                  10
+                                                                                              2
+                                                                                                                                     0                                        0                              0
+                                                       12                                                                         15.0
+                                                                                                                                                                         15.0
+                   12                                                                        12                                   12.5                                                                      50
+                                                       10                                                                                                                12.5
+                   10                                                                        10                                   10.0                                                                      40
+    Max row norm
+
+
+
+
+                                                           8                                                                                                             10.0
+                    8                                                                         8
+      Block 8
+
+
+
+
+                                                           6                                                                       7.5                                                                      30
+                    6                                                                         6                                                                           7.5
+                                                                                                                                   5.0                                                                      20
+                    4                                      4                                  4                                                                           5.0
+                                                                                                                                   2.5                                    2.5                               10
+                    2                                      2                                  2
+                                                                                                                                   0.0                                                                          0
+
+                   12                                                                       15.0                                   20
+                                                      12.5                                                                                                              15.0
+                   10                                                                       12.5                                                                                                            60
+                                                      10.0                                                                         15                                   12.5
+    Max row norm
+
+
+
+
+                     8                                                                      10.0
+                                                                                                                                                                        10.0
+      Block 12
+
+
+
+
+                                                       7.5                                                                                                                                                  40
+                     6                                                                       7.5                                   10
+                                                                                                                                                                         7.5
+                     4                                 5.0                                   5.0                                                                         5.0                                20
+                                                                                                                                       5
+                     2                                 2.5                                   2.5                                                                         2.5
+                                                                                                                                       0                                                                        0
+                         0   5000 10000 15000 20000            0   5000 10000 15000 20000            0   5000 10000 15000 20000            0     5000 10000 15000 20000 0.0 0     5000 10000 15000 20000            0   5000 10000 15000 20000
+                                  Step                                  Step                                  Step                                    Step                             Step                                  Step
+
+
+                Figure 11: ∥gt ∥∞ for the layers in the 4th, 8th, and 12th transformer block of a 500M model.
+
+
+  both methods on a 124M model across eleven learning rates spanning 2.5 × 10−4 to 4 × 10−2 .
+  Muown matches or improves on NorMuon at most learning rates that lie near the optimum and
+  exhibits a noticeably wider basin of stability.
+
+  A.4                        Spectral Analysis
+                                                                                                                                                                                              2
+ We provide more detailed results for the empirical association between ∥Wt ∥2 and ∥gt ∥∞ . Figs. 10,
+                                           2
+ 11, and 12, show the evolution of ∥Wt ∥2 , ∥gt ∥∞ , and λmax (Pt Ct Pt ), respectively. Each row
+ depicts the quantities mentioned above computed on the weights of a transformer block of a 500M
+ model trained with either of Muon and Muown. We remark that for all layers and weight types con-
+ sidered the spectral norm and maximal row norm are moving in lock step, while λmax (Pt Ct Pt )
+ remains bounded.
+  Moreover, we provide more detailed results on the spectral distribution of the layers in the 16th
+  transformer block in Figs. 13, 14, and 15.
+
+  A.5                        Magnitude Learning
+
+  In Section 3.1, we identify ∥gt ∥∞ as the empirical driver of ∥Wt ∥S∞ drift under Muon and remark
+  that freezing gt = g1 at initialization eliminates the systematic growth in spectral norm. Neverthe-
+  less, it remains open how effective such a strategy is in terms of perplexity. As Table 5 demonstrates
+
+
+                                                                                                                           16
+                                                                                                   Muown, fixed scale                   Muown                         Muon, = 0.1               Muon, = 0.0
+                                           Q                                            K                                          V                                            Out                                       FC1                                         FC2
+                                                                3.5                                                                                         3.0
+                  3.00                                                                                         2.4                                                                                     5.5
+                                                                                                                                                                                                                                                     3.0
+                  2.75                                          3.0                                            2.2                                                                                     5.0
+                                                                                                                                                            2.5
+                                                                                                                                                                                                                                                     2.5
+
+
+      max (PCP)
+                  2.50                                                                                                                                                                                 4.5
+
+Block 4
+                                                                2.5                                            2.0
+                  2.25                                                                                                                                      2.0                                        4.0                                           2.0
+                                                                2.0                                            1.8
+                  2.00                                                                                                                                                                                 3.5                                           1.5
+                                                                                                                                                            1.5
+                  1.75                                          1.5                                            1.6                                                                                     3.0
+                                                                                                                                                                                                                                                     1.0
+                                                                4.0                                            2.6
+                                                                                                                                                        2.50                                           4.5
+                       3.0                                                                                     2.4                                                                                                                                   3.0
+                                                                3.5                                                                                     2.25
+                                                                                                               2.2                                                                                     4.0
+                                                                                                                                                                                                                                                     2.5
+           max (PCP)
+
+
+
+
+                       2.5                                      3.0                                                                                     2.00
+  Block 8
+
+
+
+
+                                                                                                               2.0                                                                                     3.5
+                                                                2.5                                                                                     1.75                                                                                         2.0
+                                                                                                               1.8                                      1.50                                           3.0
+                       2.0                                                                                                                                                                                                                           1.5
+                                                                2.0                                            1.6                                      1.25
+                                                                                                                                                                                                       2.5
+                                                                1.5                                            1.4                                      1.00                                                                                         1.0
+                  3.25                                                                                                                                   3.0                                                                                         3.0
+                                                                                                               3.0
+                  3.00                                          3.0                                                                                                                                     5
+                                                                                                               2.5                                          2.5                                                                                      2.5
+                  2.75
+      max (PCP)
+Block 12
+
+
+
+
+                                                                2.5                                                                                                                                     4
+                  2.50                                                                                                                                      2.0                                                                                      2.0
+                                                                                                               2.0
+                  2.25                                          2.0                                                                                                                                     3
+                                                                                                                                                                                                                                                     1.5
+                  2.00                                                                                         1.5                                          1.5
+                                                                1.5                                                                                                                                     2
+                             0      5000 10000 15000 20000            0   5000 10000 15000 20000                     0       5000 10000 15000 20000               0      5000 10000 15000 20000              0   5000 10000 15000 20000                    0     5000 10000 15000 20000
+                                         Step                                  Step                                               Step                                        Step                                    Step                                            Step
+
+                                             p
+  Figure 12:                                          λmax (Pt Ct Pt ) for the layers in the 4th, 8th, and 12th transformer block of a 500M
+  model.
+
+           50                                                                                                                                               25
+                             Spectral Norm kWkS   ∞                                     25       Spectral Norm kWkS      ∞                                              Spectral Norm kWkS  ∞
+                                                                                                                                                                                                                                  30       Spectral Norm kWkS    ∞
+
+
+
+           40
+                             Max Row Norm kgk∞                                                   Max Row Norm kgk∞                                          20          Max Row Norm kgk∞                                         25       Max Row Norm kgk∞
+                             Muown, Fixed g                                             20       Muown, Fixed g                                                         Muown, Fixed g                                                     Muown, Fixed g
+                             Muown, λ = 0.0                                                      Muown, λ = 0.0                                             15          Muown, λ = 0.0                                            20       Muown, λ = 0.0
+           30
+                             Muon, λ = 0.1                                              15       Muon, λ = 0.1                                                          Muon, λ = 0.1                                                      Muon, λ = 0.1
+Value
+
+
+
+
+                                                                                Value
+
+
+
+
+                                                                                                                                                                                                                          Value
+                             Muon, λ = 0.0                                                       Muon, λ = 0.0                                      Value               Muon, λ = 0.0                                             15       Muon, λ = 0.0
+           20                                                                           10                                                                  10
+                                                                                                                                                                                                                                  10
+           10                                                                            5                                                                   5                                                                     5
+
+            0                                                                            0                                                                   0                                                                     0
+                       0     2500   5000   7500 10000 12500 15000 17500 20000                0   2500   5000   7500 10000 12500 15000 17500 20000                 0    2500   5000   7500 10000 12500 15000 17500 20000                0   2500   5000   7500 10000 12500 15000 17500 20000
+                                               Step                                                                  Step                                                                Step                                                                  Step
+
+                             (a) MLP Layer 1                                                 (b) Query Projection                                                     (c) Key Projection                                               (d) Value Projection
+
+  Figure 13: Evolution of spectral norm ∥Wt ∥S∞ and maximum row norm ∥gt ∥∞ over the course
+  of training for linear layers of the 16th transformer block of a 500M model.
+
+
+ empirically, suppressing row-norm growth alone already accounts for a significant part of the
+ improvement over Muon: Fixed, which freezes row magnitudes at initialization, outperforms
+ Muon at the smaller learning rates and prevents the divergence at η = 4 × 10−3 (Table 5), without
+ learning the magnitudes. Training g on top, with either of SignSGD+Momentum (Signum) or
+ Adam, refines the result further, with the ordering between Adam, Signum, and Fixed preserved
+ across all three learning rates. While we find the Fixed variant to perform slightly worse than
+ the ones with trainable magnitudes, it can serve as a more lightweight alternative that does not
+ require storage of the Adam states and further simplifies the update procedure.
+
+  A.6                            Effective Rank of Minibatch Gradients
+
+  Combined with Fig. 6 in the main text, Fig. 16 covers all six linear weight types of the transformer
+  block (queries, keys, values, output projection, and both MLP layers). The same pattern holds
+  across types: Muown sustains a higher normalized effective rank than Muon throughout training
+  on every weight type considered, with the gap opening early in training and persisting for the
+  entire run.
+
+
+           Table 5: Perplexity for Muown on a 500M model using different magnitude optimizer choices.
+
+                                                                                                        η                                                   Muown
+                                                                                                                                    Fixed Signum Adam
+                                                                                                        4 × 10   14.22       −3
+                                                                                                                                                                 14.21                  14.11
+                                                                                                        2 × 10−3 14.21                                           14.18                  14.11
+                                                                                                        1 × 10−3 14.30                                           14.27                  14.24
+
+
+                                                                                                                                              17
+                                                  Muown, Fixed Magnitude           700                            Muown, Fixed Magnitude                                               Muown, Fixed Magnitude                                                 Muown, Fixed Magnitude
+          800                                                                                                                                      600                                                                    700
+                                                  Muown, = 0.0                                                    Muown, = 0.0                                                         Muown, = 0.0                                                           Muown, = 0.0
+                                                  Muon, = 0.1                      600                            Muon, = 0.1                                                          Muon, = 0.1                                                            Muon, = 0.1
+          700                                                                                                                                      500                                                                    600
+                                                  Muon, = 0.0                                                     Muon, = 0.0                                                          Muon, = 0.0                                                            Muon, = 0.0
+          600                                                                      500
+                                                                                                                                                                                                                          500
+                                                                                                                                                   400
+          500                                                                      400
+
+
+
+
+                                                                                                                                           Count
+ Count
+
+
+
+
+                                                                           Count
+
+
+
+
+                                                                                                                                                                                                                  Count
+                                                                                                                                                                                                                          400
+          400                                                                                                                                      300
+                                                                                   300                                                                                                                                    300
+          300                                                                                                                                      200
+                                                                                   200                                                                                                                                    200
+          200
+                                                                                   100                                                             100                                                                    100
+          100
+                 0   0      10   20         30            40         50              0   0   5   10       15           20         25                 0   0      5      10         15            20           25             0   0   5   10        15          20      25        30
+                                 Singular Value                                                  Singular Value                                                       Singular Value                                                         Singular Value
+
+
+                         (a) MLP Layer 1                                                 (b) Query Projection                                                (c) Key Projection                                                 (d) Value Projection
+
+    Figure 14: Histogram of singular values for linear layers of the 16th transformer block of a 500M
+    model.
+
+                                                                       Muown, Fixed Magnitude                               Muown, = 0.0                            Muon, = 0.1                        Muon, = 0.0
+
+                                             L16.attn.w_q                                                                              L16.attn.w_k                                                                                 L16.attn.w_v
+                     101                                                                          101                                                                                        101
+                  100                                                                             100                                                                                        100
+Singular value
+
+
+
+
+                 10 1                                                                            10 1
+                                                                                                                                                                                            10 1
+                 10 2                                                                            10 2
+                                                                                                                                                                                            10 2
+                 10 3                                                                            10 3
+                                                                                                 10 4                                                                                       10 3
+                 10 4                                                                                                                                                                       10 4
+                                                                                                 10 5
+                            0    250        500 750 1000 1250                                              0            250            500 750 1000 1250                                                 0                 250      500 750 1000 1250
+                                           L16.attn.w_out                                                                              L16.mlp.fc1                                                                                  L16.mlp.fc2
+                  101
+                  100                                                                                                                                                                         101
+Singular value
+
+
+
+
+                                                                                                  101
+                 10 1
+                 10 2                                                                                                                                                                         100
+                 10 3                                                                             100
+                 10 4                                                                                                                                                                       10 1
+                            0    250          500 750 1000 1250                                            0            250            500 750 1000 1250                                                 0                 250      500 750 1000 1250
+                                                 Index                                                                                    Index                                                                                        Index
+
+    Figure 15: Singular value distribution for linear layers of the 16th transformer block of a 500M
+    model. attn refers to the attention block with w_q, w_k, w_v, w_out denoting query, key, value,
+    and output projections, respectively. fc1 and fc2 refer to the first and second MLP layers of the
+    block.
+
+
+    B                    Proofs
+
+    B.1                    Proposition 1
+
+   Proof. Since each row of Wt is nonzero, the vector gt = ∥Wt ∥row is well-defined and has strictly
+   positive entries. Hence
+                                                                                                        Dt = Diag(1/gt ) Wt
+    is well-defined, and for each row i,
+                                                                                                                                            wt,i
+                                                                                                                  dt,i =                            ,
+                                                                                                                                           ∥wt,i ∥2
+    so ∥dt,i ∥2 = 1. Therefore,
+                                                                                                           Wt = Diag(gt )Dt .
+
+    Using this factorization, we compute
+
+                                                      Wt Wt⊤ = Diag(gt )Dt D⊤
+                                                                            t Diag(gt ) = Diag(gt ) Ct Diag(gt ).
+
+    By definition of the spectral norm,
+                                                                                                                  2
+                                                                                                 ∥Wt ∥S∞ = λmax (Wt Wt⊤ ),
+    and therefore
+                                                                                              2                               
+                                                                                         ∥Wt ∥S∞ = λmax Diag(gt ) Ct Diag(gt ) .
+
+
+                                                                                                                                       18
+                                                                                                                    0.5       Muon, λ = 0.0
+                                                                                                                              Muon, λ = 0.1                                                                  0.8
+                            0.5                                                                                               Muown, λ = 0.0
+
+
+
+
+Normalized Effective Rank
+
+
+
+
+                                                                                        Normalized Effective Rank
+
+
+
+
+                                                                                                                                                                                 Normalized Effective Rank
+                                                                                                                    0.4
+                            0.4                                                                                                                                                                              0.6
+                                                                                                                    0.3
+                            0.3
+                                                                                                                                                                                                             0.4
+                                                                                                                    0.2
+                            0.2
+                                                                                                                    0.1                                                                                      0.2
+                            0.1                                     Muon, λ = 0.0                                                                                                                                                Muon, λ = 0.0
+                                                                    Muon, λ = 0.1                                                                                                                                                Muon, λ = 0.1
+                                                                    Muown, λ = 0.0                                  0.0                                                                                                          Muown, λ = 0.0
+                            0.0                                                                                                                                                                              0.0
+                                  0     2000    4000       6000    8000         10000                                     0           2000       4000       6000     8000   10000                                  0   2000   4000         6000   8000   10000
+                                                Training step                                                                                    Training step                                                                Training step
+
+                                               (a) Key                                                                                         (b) Value                                                               (c) MLP Layer 2
+
+       Figure 16: Normalized effective rank (Roy and Vetterli, 2007) of minibatch gradients for a 124M
+       model. At a given training step, we sample 8 gradients and average their effective ranks.
+
+      Algorithm 2 Muown (SignSGD Version)
+       Require: Initial point W1 ∈ Rm×n with nonzero rows; stepsizes η, γ > 0; momentum β1 ∈ [0, 1)
+                              Initialize R1 ← W1 , g1 ← ∥W1 ∥row , M0 ← ∇R L(W1 , ξ1 ), and m0 ← ∇g L(W1 , ξ1 ).
+                              for t = 1, 2, . . . do
+                                      # Update Rt with Muon
+                                      Mt ← β1 Mt−1 + ∇R L(Wt , ξt )
+                                      Ot ← arg min∥O∥S ≤1 ⟨Mt , O⟩                                                                                                 ▷ Choose arbitrary for set-valued arg min.
+                                                      ∞
+                                      Rt+1 ← Rt + ηOt
+
+                                      # Update gt with SignSGD
+                                      mt ← β1 mt−1 + ∇g L (Wt , ξt )
+                                      gt+1 ← gt − γ sgn (mt )
+
+                                      # Update Wt
+                                      Wt+1 ← W (gt+1 , Rt+1 )
+                              end for
+
+
+       It remains to factor out the maximal row magnitude. Since gt = ∥Wt ∥row , its entries are nonneg-
+       ative, so |gt | = gt . By the definition of pt ,
+
+                                                                gt = ∥gt ∥∞ pt ,                                                         hence                   Diag(gt ) = ∥gt ∥∞ Pt .
+       Substituting this into the previous identity yields
+                                                                                                                                                                     2
+                                                                          Diag(gt ) Ct Diag(gt ) = ∥gt ∥∞ Pt Ct Pt .
+       Since scaling a matrix by a positive scalar scales all eigenvalues by the same scalar, we obtain
+                                                                                                  2              
+                                                                λmax Diag(gt ) Ct Diag(gt ) = ∥gt ∥∞ λmax Pt Ct Pt .
+                                                                                                                                                                             2
+       Recalling that the LHS of the equation above is equal to ∥Wt ∥S∞ proves the claim.
+
+       B.2                            Deterministic Convergence (Theorem 2)
+
+       In this section we will provide the convergence analysis of Algorithm 2. Remember that
+                                                                                                                                                                                                                                         
+                                                                                                                                                                                                                         g
+                                        Le : Rm × Rm×n
+                                                   row>0 → R, L(g,
+                                                              e R) := L (W (g, R)) = L Diag                                                                                                                                                R .
+                                                                                                                                                                                                                       ∥R∥row
+
+      Theorem 2 (Deterministic Convergence of Muown). Assume L      e is L-smooth along the trajectory and
+      lower bounded by L
+                       e⋆ . Denote ∆1 ≥ L(g
+                                        e 1 , R1 ) − Le⋆ and assume the deterministic setting, i.e., access to
+
+
+                                                                                                                                                   19
+                                                           q
+                                                               ∆1
+the true gradient ∇L(W). Then, with β1 = 0 and η = γ =         LT , the iterates of Algorithm 2 satisfy
+
+                                  T                     r
+                               1X                          L∆1
+                                      ∇L(gt , Rt ) ≤ 4
+                                       e                         .
+                               T t=1              ∗          T
+                           p        
+This matches the optimal O    L∆1 /T non-convex rate (up to constants).
+
+We will derive this result in steps. Straightforward calculations show that the gradient of L
+                                                                                            e with
+respect to the canonical inner product is given by
+
+                ∇g Le (g, R) = diag ∇L (W) D⊤ ,
+                                                 
+                                                                          
+                ∇R Le (g, R) = Diag (g/ ∥R∥row ) ∇L (W) − Diag ∇g Le (g, R) D .
+
+where D = Diag(1/ ∥R∥row )R is the row-normalization of R and W = Diag (g) D is the original
+parameterization. In particular we note that, after re-parameterization, Muown updates R and g
+with standard, albeit different, first-order updates. In particular Algorithm 2 corresponds exactly
+to Muown when replacing Adam with its proxy SignSGD. In a first step we show that, under a
+smoothness assumption on L    e, the mixed update of Algorithm 2 can be analyzed separately and
+combined without issues.
+Lemma 1. Let g, ∆g ∈ Rm , R ∈ Rm×n
+                               row>0 , ∆R ∈ R
+                                              m×n
+                                                   and γ, η > 0. Furthermore define g+ :=
+g + γ∆g, R+ := R + η∆R and assume R+ ∈ Rm×nrow>0 and that L is L-smooth between (g, R) and
+                                                          e
+  +   +
+(g , R ). Then
+
+            Le g+ , R+ − Le (g, R)
+                      
+
+                                  Lγ 2     2
+                                                D                 E   L      2
+         ≤ γ⟨∇g Le (g, R) , ∆g⟩ +      ∥∆g∥∞ + η ∇R Le (g, R) , ∆R + η 2 ∥∆R∥S∞ .
+           |                 {z    2        } |                  {z F 2        }
+                         only depends on ∆g                      only depends on ∆R
+
+
+
+Proof. By the L-smoothness of L
+                              e we have
+
+       Le g+ , R+ − Le (g, R)
+                   
+        D                              E     L                          2
+     ≤ ∇Le (g, R) , (g+ , R+ ) − (g, R) +         (g+ , R+ ) − (g, R)
+                                         F    2
+                               D                   E     L                2   2
+     = γ⟨∇g Le (g, R) , ∆g⟩ + η ∇R Le (g, R) , ∆R + max{γ 2 ∥∆g∥∞ , η 2 ∥∆R∥S∞ }
+                                                     F   2
+                              Lγ 2      2
+                                                D                   E     L 2
+     ≤ γ⟨∇g Le (g, R) , ∆g⟩ +      ∥∆g∥∞ + η ∇R Le (g, R) , ∆R + η 2 ∥∆R∥S∞ ,
+                               2                                      F   2
+where we used our choice of inner product and norm in the equality.
+
+Now we are ready to prove Theorem 2.
+
+Proof of Theorem 2. Let t ∈ [T ]. We apply Lemma 1 with
+                                
+   ∆gt := − sgn ∇g Le (gt , Rt )              and   ∆Rt := argmin∥O∥S        ≤1 ⟨∇R L (gt , Rt ) , O⟩.
+                                                                                      e
+                                                                         ∞
+
+
+to get
+
+         Le (gt+1 , Rt+1 ) − Le (gt , Rt )
+                                  Lγ 2       2
+                                                  D                       E  L        2
+   ≤ γ⟨∇g Le (gt , Rt ) , ∆gt ⟩ +      ∥∆gt ∥∞ + η ∇R Le (gt , Rt ) , ∆Rt + η 2 ∥∆Rt ∥S∞
+     |                     {z      2          } |                      {z  F 2          }
+                       only depends on ∆gt                        only depends on ∆Rt
+
+
+
+                                                    20
+For the ∆gt -term note that ⟨∇g L
+                                e (gt , Rt ) , ∆gt ⟩ = − ∇g Le (gt , Rt )                               and ∥∆gt ∥∞ ≤ 1, thus
+                                                                                                    1
+
+                                        Lγ 2          2                         Lγ 2
+           γ⟨∇g Le (gt , Rt ) , ∆gt ⟩ +        ∥∆gt ∥∞ ≤ −γ ∇g Le (gt , Rt ) +       .
+                                           2                                1    2
+                             D                        E
+For the ∆Rt -term we have ∇R L     e (gt , Rt ) , ∆Rt   = − ∇R Le (gt , Rt ) , where ∥·∥S1 is the
+                                                                       F                                  S1
+Schatten-1 (trace) norm and ∥∆Rt ∥S∞ ≤ 1, thus
+             D                      E  L         2                            L
+            η ∇R Le (gt , Rt ) , ∆Rt + η 2 ∥∆Rt ∥S∞ ≤ −η ∇R Le (gt , Rt )    + η2 .
+                                     F 2                                  S1  2
+Combining these bounds gives
+                                                                                                                       L 2
+    Le (gt+1 , Rt+1 ) − Le (gt , Rt ) ≤ −γ ∇g Le (gt , Rt )                     − η ∇R Le (gt , Rt )               +     (η + γ 2 ).
+                                                                            1                              S1          2
+Summing this inequality from t = 1 to T and using L
+                                                  e (gT +1 , RT +1 ) ≥ Le⋆ gives
+               T                                                                      
+               X                                                                                    L 2
+                  γ ∇g Le (gt , Rt )              + η ∇R Le (gt , Rt )                     ≤ ∆1 +     (η + γ 2 )T.
+               t=1
+                                              1                                   S1                2
+
+Define RT := ∆1 + L  2 (η + γ )T . Since both terms in the sum are nonnegative, we can drop one
+                         2   2
+
+term at a time to obtain
+                     T                                                      T
+                 1X                       RT                           1X                          RT
+                       ∇g Le (gt , Rt ) ≤    ,                               ∇R Le (gt , Rt )    ≤    .
+                 T t=1                 1  γT                           T t=1                  S1   ηT
+
+By our choice of product norm ∥(g, R)∥ = max{∥g∥∞ , ∥R∥S∞ }, the corresponding dual norm
+satisfies
+                         ∇Le (gt , Rt )       = ∇g Le (gt , Rt )                + ∇R Le (gt , Rt )             .
+                                          ∗                                 1                             S1
+Combining the two bounds yields
+                                          T
+                                    1X                     RT   RT
+                                          ∇Le (gt , Rt ) ≤    +    .
+                                    T t=1               ∗  γT   ηT
+
+
+
+
+B.3     Stochastic Convergence (Theorem 1)
+
+For the stochastic convergence result, we will use the following standard bounded variance
+assumption on the stochastic gradients along the trajectory of Algorithm 2.
+Assumption 1. The stochastic gradients along the trajectory are unbiased, i.e.,
+
+            E[∇g L(g
+                 e t , Rt , ξt )] = ∇g L(g
+                                       e t , Rt ),                     E[∇R L(g
+                                                                            e t , Rt , ξt )] = ∇R L(g
+                                                                                                  e t , Rt ),
+
+and have bounded variance
+                                                                                                                              
+                                                   2                                                                        2
+E       ∇g L(g
+           e t , Rt , ξt ) − ∇g L(g
+                                e t , Rt )                 ≤ σg2 , E       ∇R L(g
+                                                                              e t , Rt , ξt ) − ∇R L(g
+                                                                                                   e t , Rt )                           2
+                                                                                                                                     ≤ σR .
+                                                   1                                                                        S1
+
+
+Now we are ready to prove the Theorem.
+
+Proof. As in the deterministic case, we apply Lemma 1 to get
+
+                 Le (gt+1 , Rt+1 ) − Le (gt , Rt )
+                                                    D                     E  L                                                         (1)
+              ≤ γ⟨∇g Le (gt , Rt ) , −sgn (mt )⟩ + η ∇R Le (gt , Rt ) , Ot + (γ 2 + η 2 ).
+                                                                           F 2
+
+
+                                                                 21
+We start by bounding the first term on the right-hand side through the classical decomposition of
+the inner product (see e.g. Cutkosky and Mehta, 2020) to get
+               D                             E
+                ∇g Le (gt , Rt ) , −sgn (mt )
+               D                                           E
+              = ∇g Le (gt , Rt ) − (1 − β1 )mt , −sgn (mt ) + ⟨(1 − β1 )mt , −sgn (mt )⟩
+
+              ≤ ∇g Le (gt , Rt ) − (1 − β1 )mt                       ∥−sgn (mt )∥∞ − (1 − β1 ) ∥mt ∥1
+                                                                 1
+
+              ≤ ∇g Le (gt , Rt ) − (1 − β1 )mt                       − (1 − β1 ) ∥mt ∥1
+                                                                 1
+
+              ≤ 2 ∇g Le (gt , Rt ) − (1 − β1 )mt                         − ∇g L(g
+                                                                              e t , Rt )                  ,
+                                                                     1                                1
+where we applied the Hölder inequality in the second, and the triangle inequality in the fourth step.
+Further, when denoting µt := ∇g L(g
+                                 e t , Rt ) − (1 − β1 )mt , ϵt := ∇g L(g                  e t , Rt ),
+                                                                     e t , Rt , ξt ) − ∇g L(g
+                               t−1
+                               X                             t−1
+                                                             X                                                   
+µt = β1t−1 µ1 −(1−β1 )                   β1τ −1 ϵt−τ +1 +            β1τ ∇g L(g
+                                                                            e t−τ , Rt−τ ) − ∇g L(g
+                                                                                                e t+1−τ , Rt+1−τ )
+                               τ =1                          τ =1
+and hence
+                                                                          t−1
+                                                                          X
+                     ∥µt ∥1 ≤ β1t−1 ∥µ1 ∥1 + (1 − β1 )                           β1τ −1 ϵt−τ +1
+                                                                          τ =1                        1
+                                     t−1
+                                     X
+                                +            β1τ ∇g L(g
+                                                    e t−τ , Rt−τ ) − ∇g L(g
+                                                                        e t+1−τ , Rt+1−τ )
+                                                                                                                                    1
+                                     τ =1
+                                                                                                                                                   (2)
+                                                                          t−1
+                                                                          X                                          t−1
+                                                                                                                     X
+                             ≤ β1t−1 ∥µ1 ∥1 + (1 − β1 )                          β1τ −1 ϵt−τ +1               + γL          β1τ
+                                                                          τ =1                        1              τ =1
+                                                                          t−1
+                                                                          X                                         γL
+                             ≤ β1t−1 ∥µ1 ∥1 + (1 − β1 )                          β1τ −1 ϵt−τ +1               +
+                                                                          τ =1
+                                                                                                                  1 − β1
+                                                                                                      1
+Following existing analyses of Muon (Shen et al., 2025), we next use equivalence of norms in finite
+dimensional spaces to derive
+                                                                                                  v                   
+        " t−1                            #            " t−1                              #        u
+                                                                                                  u   t−1            2
+          X                                             X                                         u  X τ −1
+    E              β1τ −1 ϵt−τ +1            ≤ ζg E            β1τ −1 ϵt−τ +1                ≤ ζg tE      β1 ϵt−τ +1 
+            τ =1                     1                  τ =1                         2                             τ =1                       2
+                                                v
+                                                u t−1
+                                                uX 2(τ −1) h                              2
+                                                                                               i      ζg σg
+                                             =ζ t
+                                                g     β   E ∥ϵ
+                                                             1                    t−τ +1 ∥2         ≤p        ,
+                                                      τ =1                                            1 − β12
+where we used the L2 -orthogonality of the error terms in the second, and ∥·∥2 ≤ ∥·∥1 in the last
+step. Plugging into (2) and summing yields
+      T                      T                                                T
+                                                                                        " t−1                                   #
+      X                      X                                                X           X                                               γL
+            E [∥µt ∥1 ] ≤           β1t−1 E[∥µ1 ∥1 ] + (1 − β1 )                    E               β1τ −1 ϵt−τ +1                  +          T
+      t=1                    t=1                                              t=1            τ =1
+                                                                                                                                        1 − β1
+                                                                                                                            1
+                      1                 ζg (1 − β1 )σ       γL
+                ≤         E[∥µ1 ∥1 ] + p              T+         T
+                   1 − β1                         2
+                                             1 − β1       1 − β1
+                     σg            p                γL
+                ≤          + ζ g σg 1 − β 1 T +          T,
+                   1 − β1                         1 − β1
+where we used our choice of m1 in the last step. Applying the same arguments to the R-term in
+(1) yields
+T D                                                                   T
+X                            E   2σR           p            2ηL      X
+        ∇R Le (gt , Rt ) , Ot ≤        + 2ζR σR 1 − β1 T +        T−     ∇R L(g
+                                                                            e t , Rt )    .
+t=1
+                                1 − β1                     1 − β1    t=1
+                                                                                       S1
+
+
+
+
+                                                                         22
+Summing (1) from t = 1 to T and using L
+                                      e (gT +1 , RT +1 ) ≥ Le⋆ gives
+      T
+      X                                                            
+        E γ ∇g L(g
+               e t , Rt )               + η ∇R L(g
+                                               e t , Rt )
+                                    1                          S1
+      t=1
+                        2                2
+                                            
+                      5γ         5η                                         p           2(σg + σR )η
+   ≤ ∆1 + L                  +                   T + 2(ζg σg + ζR σR )η      1 − β1 T +              .
+                   2(1 − β1 ) 2(1 − β1 )                                                   1 − β1
+By our choices of γ = η and definition σ̂ = ζg σg + ζR σR , we can simplify
+               T
+            1X h                     i ∆
+                                         1     5ηL        p               σg + σ R
+                  E ∇Le (gt , Rt )    ≤    +           + 2 1 − β1 σ̂ + 2            ,                     (3)
+            T t=1                  ∗    ηT   (1 − β1 )                   (1 − β1 )T
+
+where we used the fact that ∇L
+                             e (gt , Rt )             = ∇g L(g
+                                                           e t , Rt )       + ∇R L(g
+                                                                                 e t , Rt )        . Plugging
+                      q                           ∗                     1                     S1
+                            ∆1 (1−β1 )
+our choice γ = η =              LT     in the above inequality yields
+                                        s
+              T
+           1X h                     i        ∆1 L        p               σg + σ R
+                 E ∇Le (gt , Rt )     ≤6              + 2 1 − β1 σ̂ + 2            .
+           T t=1                  ∗       (1 − β1 )T                    (1 − β1 )T
+                                                     q      
+                                                         ∆1 L
+Further using the choice β1 = 1 − min 1, max T   −2/3
+                                                      , σ̂2 T    gives
+                                s                     r                  1/4
+                                                               ∆1 Lσ̂ 2
+                                                             
+                                       ∆1 L           ∆1 L
+                                               ≤           +
+                                    (1 − β1 )T         T            T
+                                                                      1/4
+                                                             ∆1 Lσ̂ 2
+                                                           
+                                    p               σ̂
+                                       1 − β1 σ̂ ≤ 1/3 +
+                                                   T           T
+                                     σg + σ R      σg + σ R      σ̂
+                                                 ≤           ≤ 1/3
+                                    (1 − β1 )T       T 1/3     T
+Combining these bounds yields
+                      T                        r                    1/4
+                                                           ∆1 Lσ̂ 2
+                                                         
+                   1X h                    i     ∆1 L                      4σ̂
+                         E ∇L (gt , Rt )
+                            e                ≤6       +8                 + 1/3
+                   T t=1                 ∗        T          T            T
+
+and hence the result.
+
+
+
+
+                                                          23
+C       Experimental Details
+
+Further Remarks on Algorithm 1. We use learning rate scaling to match the Adam update RMS
+norm (Liu et al., 2025)
+                   p for Muon as well as Muown. This corresponds to a learning rate adjustment
+by a factor of 0.2 max(m, n) for a layer of shape m × n. Moreover, Muown as outlined in
+Algorithm 1 uses simplified Nesterov momentum (Nesterov, 1983; Bengio et al., 2013), matching
+the PyTorch implementation of Muon.
+To keep Algorithm 1 concise, we describe the use of decoupled weight decay with Muown sep-
+arately here. When decoupled weight decay with coefficient λ is enabled, we replace the last
+line of Algorithm 1 with W ← Diag( gr )R − ηt λW and refresh g ← ∥W∥row to preserve the
+invariant g = ∥W∥row . This is only one of several natural placements of weight decay under the
+(g, R)-parameterization. For instance, one could equally well decay only the direction component
+R. The variant adopted above stays closest to the canonical decoupled formulation (Loshchilov
+and Hutter, 2019) on the effective weight W and is the one used throughout our experiments. A
+systematic study of other alternatives is left to future work.
+General Setup. If not noted otherwise, we run all experiments on top of the implementation of
+Ajroldi (2024). We make our code available on github.1 We train a transformer with Rotational
+Positional Embeddings (Su et al., 2024), RMSNorm (Zhang and Sennrich, 2019), SwiGLU MLPs
+(Shazeer, 2020), expansion ratio of 8/3, and weight tying. We employ a warmup-stable-decay
+schedule for 2% of training as warmup and 20% as cooldown. In all but the distributed bench-
+marking experiment in Table 3, we make use of the PyTorch implementation of Muon. We justify
+this deviation below. We employ batch size of 524k tokens per step training, training for a total
+token budget of 20× tokens/parameter (Hoffmann et al., 2022), if not otherwise noted. Regarding
+sequence length and training budget we make the following size-dependent choices:
+
+          • For models of the 124M class, we choose 12 layers with hidden dimension of 768 and 12
+            attention heads. We train with sequence length 1024 for 5B tokens and validate on 4M
+            tokens. We remark that due to weight tying the actual number of parameters is 124M.
+          • For models with 500M parameters, we choose 22 layers with hidden dimension of 1280
+            and 20 attention heads. We train with sequence length 2048 for 10B tokens and validate
+            on 10M tokens.
+          • For models with 1B parameters, we choose 24 layers with hidden dimension of 1792 and
+            28 heads. We train for 20B tokens with sequence length 2048, validating on 10M tokens.
+          • For models with 2.7B parameters, we choose 32 layers with dimension 2560 and 40 heads
+            and train for 53B tokens, keeping everything else as in the 1B setup.
+
+All models are trained on the 100B token sample of FineWeb-Edu (Lozhkov et al., 2024) and tok-
+enized with the GPT-NeoX-20B tokenizer (Black et al., 2022), if not noted otherwise. Experiments
+are performed on either of NVIDIA GH200 and NVIDIA H100 GPUs and we estimate the total
+GPU hours spent as roughly ≈18k hours, including experimentation, development, and final runs.
+Spectral Analysis (Fig. 1, 10, 11, 12, 14, 15). For the spectral analysis plots, we adopt the 500M
+setup outlined above and tune Muon and Muown with learning rate η ∈ {1 × 10−3 , 2 × 10−3 , 4 ×
+10−3 } and weight decay λ ∈ {0, 0.1}. We report results for the best runs in terms of validation
+loss, i.e. η = 2 × 10−3 with and without weight decay for Muon and η = 4 × 10−3 without
+weight decay for Muown. For the setup with fixed row magnitude, we re-use the best config from
+Muown.
+Learning Rate Ablation (Fig. 3). For the ablation study in Fig. 3, we use a grid of η ∈ {2.5 ×
+10−4 , 5 × 10−4 , 7.5 × 10−4 , 10−3 , 2 × 10−3 , 4 × 10−3 , 6 × 10−3 , 8 × 10−3 } for all optimizers
+apart from Lion. For Muon’s weight decay parameter, we use λ = 0.1, which we found to be
+optimal across a grid of λ ∈ {0.01, 0.03, 0.1, 0.3} (see Fig. 4b). Similarly, based on the results of
+Fig. 4b, we choose λ = 0.01 for Muown when using weight decay, despite having only a marginal
+effect. For Lion, we use η ∈ {8 × 10−5 , 10−4 , 2.5 × 10−4 , 5 × 10−4 , 7.5 × 10−4 }, as Lion typically
+has a larger update norm than other optimizers, requiring a lower learning rate (Chen et al.,
+2023). This matches our observation of divergence for learning rates larger than these. Moreover,
+    1
+        https://github.com/kcc-lion/muown
+
+
+                                                  24
+Chen et al. (2023) prescribe a larger value for weight decay in the range of 3-10× of the one used
+for AdamW. We opt for 5× the optimal value of Muon, yielding λ = 0.5 for Lion. We retain
+the default values of (β1 , β2 ) = (0.9, 0.99) for Lion. For SOAP (Vyas et al., 2025), we use the
+default hyperparameters from the original implementation: (β1 , β2 ) = (0.9, 0.95), ϵ = 10−8 , a
+preconditioner update frequency of 10 steps, and bias correction enabled. We set the maximum
+precondition dimension to 10,000, which excludes the embedding and head layers (vocabulary
+size 50,280) from preconditioning while covering all other layers. Weight decay for SOAP is set at
+λ = 10−4 , following Vyas et al. (2025).
+2.7B Runs (Fig. 4a, Table 2). We adopt the 2.7B setup above and sweep η ∈ {7.5×10−4 , 10−3 , 2×
+10−3 }, with λ = 0 for Muown and λ ∈ {0, 0.1} for Muon. The η = 2 × 10−3 Muon runs were
+aborted after 12h on 16 GPUs as the validation loss was diverging.
+Weight Decay Ablation (Fig. 4b). We adopt the 124M setup described above and train for
+5B tokens (2× Chinchilla-optimal), sweeping a two-dimensional grid over the learning rate
+η ∈ {7.5×10−4 , 10−3 , 2×10−3 , 4×10−3 , 6×10−3 } and weight decay λ ∈ {0, 0.01, 0.03, 0.1, 0.3}
+for both Muon and Muown. We report perplexity at 2× the Chinchilla-optimal token count (i.e.
+5B tokens).
+Learning Rate and Width Ablation (Fig. 5). We use the 124M architecture outlined above and
+vary the width as 512, 768, 1280, resulting in models of size 67M, 124M, and 308M. We train each
+size for a Chinchilla-optimal amount of tokens and use a logarithmically-spaced learning rate grid
+from 2−16 to 2−5 .
+Gradient Conditioning (Fig. 6). The effective rank of a matrix is defined as erank(σ) =
+       Pmin(m,n)                          σi
+exp(− i=1         pi log pi ) where pi = ∥σ∥ 1
+                                               and σ ∈ Rmin(m,n) contains the singular values of
+the gradient matrix. We normalize the effective rank by dividing it with min(m, n). For Muon,
+we show the gradient with respect to W, and for Muown the gradient with respect to R. Each
+line shows one of the 12 layers and the bold line the average.
+Gradient Noise (Fig. 7). We base the gradient noise analysis on our 124M weight decay ablation
+setup and consider the configuration with the best final validation loss. This results in Muon
+(η = 4 × 10−3 , λ = 0.1) and Muown without weight decay (η = 6 × 10−3 , λ = 0) run. For each
+of these runs we save the model and optimizer states after t = 1900, 3800, 5700, 7600 and the
+final T = 9538 iterations. For every checkpoint, we first compute the true gradient ∇W L (Wt )
+for Muon, and ∇g L  e (gt , Rt ) , ∇R Le (gt , Rt ) for Muown checkpoints over the whole 5B token
+                                                                                                (i)
+training dataset {ξ1 , . . . , ξT }. In a second pass we then calculate, for each weight matrix Wt ,
+       (i)  (i)
+resp. gt , Rt ,
+                                     T
+                       2          1 X                                  2
+                      σW (i) =           ∥∇W L (Wt ) − ∇W L (Wt , ξτ )∥S1 ,
+                          t       T τ =1
+and similarly σR(i) and σg(i) . The values of ζW , ζg and ζR are known analytically to be ζW =
+       p          t           t
+                                                     √
+ζR =       min{m, n} for W, R ∈ Rm×n and ζg =         m for g ∈ Rm . We compute the noise term
+separately for each weight matrix, plot the median across weights as a bold line, and show the
+interquartile range as a shaded region. We find that the noise term of Muown remains consistently
+below that of Muon, with the gap widening over the course of training.
+nanoGPT Speedrunning (Fig. 8). For the nanoGPT speedrunning (Jordan et al., 2024a) experi-
+ments, we leverage the Muon record available on github.2
+Multi-Seed Run for 500M (Table 1). We adopt the 500M setup above and report mean and
+standard deviation across three seeds for each configuration. The grid is η ∈ {1, 2, 4} × 10−3
+for all optimizers. Muown is run with λ = 0; for Muon we report both λ = 0 and λ = 0.1,
+the latter identified as optimal in the 124M weight-decay ablation (Fig. 4b). SOAP follows its
+hyperparameters from the 124M learning-rate ablation above with λ = 10−4 .
+Resource Overhead (Table 3). We compare the overall step times for Muon and Muown by
+running 1K steps for the 500M model outlined above on 4 GH200 devices. Here, we report the
+   2
+     https://github.com/KellerJordan/modded-nanogpt/blob/2c7027462732f2f7a76fb4b021066442c7b29298/
+records/track_1_short/2024-10-10_Muon/train_gpt2.py
+
+
+                                                25
+median runtime for Muon not based on the PyTorch implementation, but based on a custom
+version that mirrors the implementation details of Muown as closely as possible. The reason for
+this deviation is that the PyTorch implementation does not provide a version which distributes
+the optimizer step across ranks, making a fair comparison in this setup infeasible.
+Qwen2-0.5B (Table 4). We use the model configuration available on HuggingFace3 , but lower the
+base frequency of RoPE to 10,000 to align the configuration with the initial phase of pre-training
+as outlined in (Yang et al., 2024a, Section 3.2). We use the 10B split of FineWeb-Edu tokenized
+with the Qwen2-Tokenizer. We use a grid of η ∈ {10−3 , 2 × 10−3 , 4 × 10−3 , 8 × 10−3 , 10−2 } and
+tune λ ∈ {0, 0.1} for Muon.
+Magnitude Optimizer Ablation (Table 5). We adopt the 500M setup and compare three choices
+for the magnitude optimizer in Algorithm 1 across η ∈ {1, 2, 4} × 10−3 , all run with λ = 0: Fixed
+freezes gt = g1 at initialization, exposing the reparameterization without optimizing it; Signum
+replaces Adam with signSGD with momentum, and Adam is the default of Algorithm 1.
+Licenses. The FineWeb-Edu dataset (Lozhkov et al., 2024) is released under the Open Data
+Commons Attribution License (ODC-By). plainLM (Ajroldi, 2024) and modded-nanoGPT (Jordan
+et al., 2024a) are released under the MIT License. Qwen2 (Yang et al., 2024a) is released under the
+Apache 2.0 License.
+
+
+
+
+   3
+       https://huggingface.co/Qwen/Qwen2-0.5B/blob/main/config.json
+
+
+                                                26
+

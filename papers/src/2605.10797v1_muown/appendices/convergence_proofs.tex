@@ -1,0 +1,261 @@
+
+{
+\begin{algorithm}[t]
+    \caption{\algname{} (\signsgd\ Version)}\label{alg:muown_signgd}
+    {\linespread{1.3}\selectfont
+    \begin{algorithmic}
+    \Require Initial point $\W_1 \in \mathbb{R}^{m\times n}$ with nonzero rows; stepsizes $\eta, \gamma>0$; momentum $\beta_1\in[0,1)$
+    \State Initialize $\Rbf_1 \gets \W_1, \g_1 \gets \RowNorm{\W_1}, \M_0 \gets \nabla_\Rbf \mathcal L(\W_1, \xi_1)$, and $\m_0 \gets \nabla_\g \mathcal L (\W_1, \xi_1)$.
+    \For{$t=1,2,\dots$}
+        \State \textcolor{cyan}{\texttt{\# Update $\Rt$ with \muon}}
+        \State $\Mt \gets \beta_1 \Mtm + \nabla_\Rbf \mathcal L(\Wt, \xi_t)$
+        \State $\Ot \gets \arg\min_{\opnorm{\Obf} \leq 1} \langle \Mt, \Obf \rangle$\Comment{Choose arbitrary for set-valued $\arg\min$.}
+        \State $\Rtp \gets \Rt + \eta \Ot$
+        \State
+        \State \textcolor{cyan}{\texttt{\# Update $\gt$ with \signsgd}}
+        \State $\mt \gets \beta_1 \mtm + \nabla_\g \mathcal L\pare{\Wt, \xi_t}$
+        \State $\gtp \gets \gt - \gamma \operatorname{sgn}\pare{\mt}$
+        \State
+        \State \textcolor{cyan}{\texttt{\# Update $\Wt$}}
+        \State $\Wtp \gets \W\pare{\gtp, \Rtp}$
+    \EndFor
+    \end{algorithmic}
+    }
+\end{algorithm}
+
+\renewcommand{\opnorm}[1]{\norm{#1}_{S_\infty}}
+In this section we will provide the convergence analysis of Algorithm \ref{alg:muown_signgd}. Remember that 
+\begin{equation*}
+    \Ft \colon \mathbb{R}^m \times \rowPos \to \mathbb{R},\ \, \Ft(\g,\Rbf) := \mathcal L\pare{\W\pare{\g, \Rbf}} = \mathcal L\left(\Diag\left(\frac{\g}{\RowNorm{\Rbf}}\right)\, \Rbf\right).
+\end{equation*}
+
+\begin{theorem}[Deterministic Convergence of \algname{}]\label{thm:det_convergence}
+    Assume $\Ft$ is $L$-smooth along the trajectory and lower bounded by $\Ft_\star$. Denote $\Delta_1 \geq \Ft(\g_1, \Rbf_1) - \Ft_\star$ and assume the deterministic setting, i.e., access to the true gradient $\nabla \mathcal L(\W)$. 
+    Then, with $\beta_1 = 0$ and $\eta = \gamma = \sqrt{\frac{\Delta_1}{LT}}$, the iterates of Algorithm \ref{alg:muown_signgd} satisfy
+    \begin{equation*}
+        \frac 1 T \sum_{t=1}^T \norm{\nabla \Ft(\g_t,\Rbf_t)}_* \leq 4\sqrt{\frac{L\Delta_1}{T}}.
+    \end{equation*}
+    This matches the optimal $\mathcal O\pare{\sqrt{L\Delta_1/T}}$ non-convex rate (up to constants).
+\end{theorem}
+
+We will derive this result in steps. Straightforward calculations show that the gradient of $\Ft$ with respect to the canonical inner product is given by
+\begin{align*}
+    \nabla_\g \Ft\pare{\g, \Rbf} &= \mathrm{diag}\pare{\nabla \mathcal L\pare{\W} \D^\top},\\
+    \nabla_\Rbf \Ft\pare{\g, \Rbf} &= \Diag\pare{\g/\RowNorm{\Rbf}}\pare{\nabla \mathcal L\pare{\W} - \Diag\pare{\nabla_\g \Ft\pare{\g,\Rbf}} \D}.
+\end{align*}
+where $\D = \Diag(1/\RowNorm{\Rbf})\Rbf$ is the row-normalization of $\Rbf$ and $\W = \Diag\pare{\g} \D$ is the original parameterization. In particular we note that, after re-parameterization, Muown updates $\Rbf$ and $\g$ with standard, albeit different, first-order updates. In particular Algorithm \ref{alg:muown_signgd} corresponds exactly to Muown when replacing Adam with its proxy \signsgd. In a first step we show that, under a smoothness assumption on $\Ft$, the mixed update of Algorithm \ref{alg:muown_signgd} can be analyzed separately and combined without issues.
+
+\begin{lemma}\label{lem:split_algs}
+    Let $\g, \Delta \g \in \mathbb{R}^m, \Rbf\in \rowPos, \Delta \Rbf \in \mathbb{R}^{m \times n}$ and $\gamma, \eta > 0$. Furthermore define $\g^+ := \g + \gamma \Delta \g, \Rbf^+ := \Rbf + \eta \Delta \Rbf$ and assume $\Rbf^+ \in \rowPos$ and that $\Ft$ is $L$-smooth between $(\g, \Rbf)$ and $(\g^+, \Rbf^+)$. Then
+    \begin{align*}
+        &\ \Ft\pare{\g^+, \Rbf^+} - \Ft\pare{\g, \Rbf} \\
+        \leq &\  
+        \underbrace{\gamma \langle \nabla_\g \Ft\pare{\g,\Rbf}, \Delta \g\rangle + \frac{L \gamma^2}{2}\norm{\Delta \g}_\infty^2}_{\text{only depends on $\Delta \g$}}
+        + \underbrace{\eta \innerF{\nabla_\Rbf \Ft\pare{\g,\Rbf}}{\Delta \Rbf} + \frac{L}{2} \eta^2\opnorm{\Delta \Rbf}^2}_{\text{only depends on $\Delta \Rbf$}}.
+    \end{align*}
+\end{lemma}
+\begin{proof}
+    By the $L$-smoothness of $\Ft$ we have
+    \begin{align*}
+        &\ \Ft\pare{\g^+, \Rbf^+} - \Ft\pare{\g, \Rbf} \\
+        \leq &\ \innerF{\nabla \Ft\pare{\g, \Rbf}}{(\g^+, \Rbf^+) - (\g, \Rbf)} + \frac{L}{2}\norm{(\g^+, \Rbf^+) - (\g, \Rbf)}^2 \\
+        = &\ \gamma \langle \nabla_\g \Ft\pare{\g,\Rbf}, \Delta \g\rangle + \eta \innerF{\nabla_\Rbf \Ft\pare{\g,\Rbf}}{\Delta \Rbf} + \frac{L}{2}\max\{\gamma^2\norm{\Delta \g}_\infty^2, \eta^2\opnorm{\Delta \Rbf}^2\} \\
+        \leq &\  
+        \gamma \langle \nabla_\g \Ft\pare{\g,\Rbf}, \Delta \g\rangle + \frac{L \gamma^2}{2}\norm{\Delta \g}_\infty^2
+        + \eta \innerF{\nabla_\Rbf \Ft\pare{\g,\Rbf}}{\Delta \Rbf} + \frac{L}{2} \eta^2\opnorm{\Delta \Rbf}^2,
+    \end{align*}
+    where we used our choice of inner product and norm in the equality.
+\end{proof}
+
+Now we are ready to prove Theorem \ref{thm:det_convergence}.
+
+\begin{proof}[Proof of Theorem \ref{thm:det_convergence}]
+    Let $t \in [T]$. We apply Lemma \ref{lem:split_algs} with
+    \begin{equation*}
+        \Delta \g_t := -\operatorname{sgn}\pare{\nabla_\g \Ft\pare{\g_t,\Rbf_t}} \qquad  \text{and} \qquad
+        \Delta \Rbf_t := \operatorname{argmin}_{\opnorm{\Obf} \leq 1}\langle \nabla_\Rbf \Ft\pare{\g_t,\Rbf_t}, \Obf \rangle.
+    \end{equation*}
+    to get
+    \begin{align*}
+        &\ \Ft\pare{\g_{t+1}, \Rbf_{t+1}} - \Ft\pare{\g_t, \Rbf_t} \\
+        \leq &\  
+        \underbrace{\gamma \langle \nabla_\g \Ft \pare{\gt, \Rt}, \Delta \g_t\rangle + \frac{L \gamma^2}{2}\norm{\Delta \g_t}_\infty^2}_{\text{only depends on $\Delta \g_t$}}
+        + \underbrace{\eta \innerF{\nabla_\Rbf \Ft\pare{\gt,\Rt}}{\Delta \Rbf_t} + \frac{L}{2} \eta^2\opnorm{\Delta \Rbf_t}^2}_{\text{only depends on $\Delta \Rbf_t$}}
+    \end{align*}
+    For the $\Delta \g_t$-term note that $\langle \nabla_\g \Ft\pare{\gt,\Rt}, \Delta \g_t\rangle = -\norm{\nabla_\g \Ft\pare{\gt,\Rt}}_1$ and $\norm{\Delta \g_t}_\infty \leq 1$, thus
+    \begin{equation*}
+        \gamma \langle \nabla_\g \Ft\pare{\gt,\Rt}, \Delta \g_t\rangle + \frac{L \gamma^2}{2}\norm{\Delta \g_t}_\infty^2
+        \leq
+        -\gamma \norm{\nabla_\g \Ft\pare{\gt,\Rt}}_1 + \frac{L \gamma^2}{2}.
+    \end{equation*}
+    For the $\Delta \Rt$-term we have $\innerF{\nabla_\Rbf \Ft\pare{\gt,\Rt}}{\Delta \Rt} = -\trnorm{\nabla_\Rbf \Ft\pare{\gt,\Rt}}$, where $\trnorm \cdot$ is the Schatten-1 (trace) norm and $\opnorm{\Delta \Rt} \leq 1$, thus
+    \begin{equation*}
+        \eta \innerF{\nabla_\Rbf \Ft\pare{\gt,\Rt}}{\Delta \Rt} + \frac{L}{2} \eta^2\opnorm{\Delta \Rt}^2
+        \leq
+        -\eta \trnorm{\nabla_\Rbf \Ft\pare{\gt,\Rt}} + \frac{L}{2} \eta^2.
+    \end{equation*}
+    Combining these bounds gives
+    \begin{equation*}
+        \Ft\pare{\g_{t+1}, \Rbf_{t+1}} - \Ft\pare{\g_t, \Rbf_t} 
+        \leq
+        -\gamma \norm{\nabla_\g \Ft\pare{\gt,\Rt}}_1 -\eta \trnorm{\nabla_\Rbf \Ft\pare{\gt,\Rt}} + \frac{L}{2}(\eta^2 + \gamma^2).
+    \end{equation*}
+    Summing this inequality from $t=1$ to $T$ and using $\Ft\pare{\g_{T+1}, \Rbf_{T+1}} \geq \Ft_\star$ gives
+    \begin{equation*}
+        \sum_{t=1}^{T}\pare{\gamma \norm{\nabla_\g \Ft\pare{\gt,\Rt}}_1 + \eta \trnorm{\nabla_\Rbf \Ft\pare{\gt,\Rt}}}
+        \leq \Delta_1 + \frac{L}{2}(\eta^2 + \gamma^2)T.
+    \end{equation*}
+    Define $R_T := \Delta_1 + \frac{L}{2}(\eta^2 + \gamma^2)T$. Since both terms in the sum are nonnegative, we can drop one term at a time to obtain
+    \begin{equation*}
+        \frac{1}{T}\sum_{t=1}^T \norm{\nabla_\g \Ft\pare{\gt,\Rt}}_1 \leq \frac{R_T}{\gamma T},
+        \qquad
+        \frac{1}{T}\sum_{t=1}^T \trnorm{\nabla_\Rbf \Ft\pare{\gt,\Rt}} \leq \frac{R_T}{\eta T}.
+    \end{equation*}
+    By our choice of product norm $\norm{(\g,\Rbf)} = \max\{\norm{\g}_\infty,\opnorm{\Rbf}\}$, the corresponding dual norm satisfies
+    \begin{equation*}
+        \norm{\nabla \Ft\pare{\gt,\Rt}}_* = \norm{\nabla_\g \Ft\pare{\gt,\Rt}}_1 + \trnorm{\nabla_\Rbf \Ft\pare{\gt,\Rt}}.
+    \end{equation*}
+    Combining the two bounds yields
+    \begin{equation*}
+        \frac{1}{T}\sum_{t=1}^T \norm{\nabla \Ft\pare{\gt,\Rt}}_* \leq \frac{R_T}{\gamma T} + \frac{R_T}{\eta T}.
+    \end{equation*}
+    
+\end{proof}
+
+\subsection{Stochastic Convergence (Theorem~\texorpdfstring{\ref{thm:stoch_convergence}}{2})}
+\label{sec:app.conv_analysis.stochastic}
+
+For the stochastic convergence result, we will use the following standard bounded variance assumption on the stochastic gradients along the trajectory of Algorithm \ref{alg:muown_signgd}.
+\begin{assumption}\label{assum:bounded_var}
+    The stochastic gradients along the trajectory are unbiased, i.e., 
+    \begin{equation*}
+        \E[\nabla_{\g} \Ft(\gt, \Rt, \xi_t)] = \nabla_{\g} \Ft(\gt, \Rt), \qquad 
+        \E[\nabla_{\Rbf} \Ft(\gt, \Rt, \xi_t)] = \nabla_{\Rbf} \Ft(\gt, \Rt),
+    \end{equation*}
+    and have bounded variance
+    \begin{equation*}
+        \E \left[\norm{\nabla_{\g} \Ft(\gt, \Rt, \xi_t) - \nabla_{\g} \Ft(\gt, \Rt)}_1^2\right] \leq \sigg^2,  \ 
+        \E \left[\trnorm{\nabla_{\Rbf} \Ft(\gt, \Rt, \xi_t) - \nabla_{\Rbf} \Ft(\gt, \Rt)}^2\right] \leq \sigR^2.
+    \end{equation*}
+\end{assumption}
+
+Now we are ready to prove the Theorem.
+
+\begin{proof}
+
+As in the deterministic case, we apply Lemma \ref{lem:split_algs} to get
+\begin{align}\begin{split}\label{eq:descent_ineq}
+    &\ \Ft\pare{\gtp, \Rtp} - \Ft\pare{\gt, \Rt} \\
+    \leq &\  
+    \gamma \langle \nabla_\g \Ft\pare{\gt,\Rt}, - \sgn\pare{\mt}\rangle
+    + \eta \innerF{\nabla_\Rbf \Ft\pare{\gt,\Rt}}{\Ot} + \frac{L}{2}(\gamma^2 + \eta^2).
+\end{split}\end{align}
+We start by bounding the first term on the right-hand side through the classical decomposition of the inner product \citep[see e.g.][]{MomentumImprovesNormalized2020cutkosky} to get
+\begin{align*}
+    &\ \left\langle \nabla_\g \Ft\pare{\gt,\Rt}, - \sgn\pare{\mt}\right\rangle\\
+    =&\  \left\langle \nabla_\g \Ft\pare{\gt,\Rt} - (1-\beta_1)\mt, - \sgn\pare{\mt}\right\rangle 
+    + \left\langle (1-\beta_1)\mt, - \sgn\pare{\mt}\right\rangle\\
+    \leq &\ \norm{\nabla_\g \Ft\pare{\gt,\Rt} - (1-\beta_1)\mt}_1 \norm{-\sgn\pare{\mt}}_\infty - (1-\beta_1)\norm{\mt}_1 \\
+    \leq &\ \norm{\nabla_\g \Ft\pare{\gt,\Rt} - (1-\beta_1)\mt}_1 - (1-\beta_1)\norm{\mt}_1\\
+    \leq &\ 2\norm{\nabla_\g \Ft\pare{\gt,\Rt} - (1-\beta_1)\mt}_1 - \norm{\gradgt}_1,
+\end{align*}
+where we applied the Hölder inequality in the second, and the triangle inequality in the fourth step. Further, when denoting $\mubf_t := \gradgt - (1-\beta_1)\mt, \eps_t := \nabla_\g \Ft(\gt, \Rt, \xi_t) - \gradgt$, 
+\begin{equation*}
+    \mubf_t = 
+    \beta_1^{t-1} \mubf_1 
+    - (1-\beta_1) \sum_{\tau=1}^{t-1} \beta_1^{\tau - 1} \eps_{t- \tau + 1}
+    + \sum_{\tau=1}^{t-1} \beta_1^{\tau} \pare{\nabla_\g \Ft(\g_{t - \tau}, \Rbf_{t-\tau}) - \nabla_\g \Ft(\g_{t + 1 - \tau}, \Rbf_{t + 1 - \tau})}
+\end{equation*}
+and hence
+\begin{align}\label{eq:mu_decomposition}\begin{split}
+    \norm{\mubf_t}_1 \leq
+    &\ \beta_1^{t-1} \norm{\mubf_1}_1 
+    + (1-\beta_1) \norm{\sum_{\tau=1}^{t-1} \beta_1^{\tau - 1} \eps_{t- \tau + 1}}_1\\
+    &+ \sum_{\tau=1}^{t-1} \beta_1^{\tau} \norm{\nabla_\g \Ft(\g_{t - \tau}, \Rbf_{t-\tau}) - \nabla_\g \Ft(\g_{t + 1 - \tau}, \Rbf_{t + 1 - \tau})}_1\\
+    \leq &\ \beta_1^{t-1} \norm{\mubf_1}_1 
+    + (1-\beta_1) \norm{\sum_{\tau=1}^{t-1} \beta_1^{\tau - 1} \eps_{t- \tau + 1}}_1 
+    + \gamma L \sum_{\tau=1}^{t-1} \beta_1^{\tau} \\
+    \leq &\ \beta_1^{t-1} \norm{\mubf_1}_1 
+    + (1-\beta_1) \norm{\sum_{\tau=1}^{t-1} \beta_1^{\tau - 1} \eps_{t- \tau + 1}}_1 
+    + \frac{\gamma L}{1-\beta_1}
+\end{split}\end{align}
+Following existing analyses of Muon \citep{ConvergenceAnalysisMuon2025shen}, we next use equivalence of norms in finite dimensional spaces to derive
+\begin{align*}
+    \E\left[\norm{\sum_{\tau=1}^{t-1} \beta_1^{\tau - 1} \eps_{t- \tau + 1}}_1\right]
+    &\leq \zeta_\g \E\left[\norm{\sum_{\tau=1}^{t-1} \beta_1^{\tau - 1} \eps_{t- \tau + 1}}_2\right]
+    \leq \zeta_\g \sqrt{\E\left[\norm{\sum_{\tau=1}^{t-1} \beta_1^{\tau - 1} \eps_{t- \tau + 1}}_2^2\right]}\\
+    &= \zeta_\g \sqrt{\sum_{\tau=1}^{t-1} \beta_1^{2(\tau-1)} \E\left[\norm{\eps_{t- \tau + 1}}_2^2\right]} 
+    \leq \frac{\zeta_\g \sigg}{\sqrt{1-\beta_1^2}},
+\end{align*}
+where we used the $L^2$-orthogonality of the error terms in the second, and $\norm \cdot_2 \leq \norm \cdot_1$ in the last step. Plugging into \eqref{eq:mu_decomposition} and summing yields
+\begin{align*}
+    \sum_{t=1}^T \E\left[\norm{\mubf_t}_1\right] \leq
+    &\ \sum_{t=1}^T \beta_1^{t-1} \E [\norm{\mubf_1}_1] 
+    + (1-\beta_1)\sum_{t=1}^T \E\left[\norm{\sum_{\tau=1}^{t-1} \beta_1^{\tau - 1} \eps_{t- \tau + 1}}_1\right] 
+    + \frac{\gamma L}{1-\beta_1}T\\
+    \leq &\ 
+    \frac{1}{1-\beta_1} \E [\norm{\mubf_1}_1] 
+    + \frac{\zeta_\g (1-\beta_1) \sigma}{\sqrt{1-\beta_1^2}}T
+    + \frac{\gamma L}{1-\beta_1}T\\
+    \leq &\ 
+    \frac\sigg{1-\beta_1}
+    + \zeta_\g \sigg \sqrt{1-\beta_1} T
+    + \frac{\gamma L}{1-\beta_1}T,
+\end{align*}
+where we used our choice of $\m_1$ in the last step. Applying the same arguments to the $\Rbf$-term in \eqref{eq:descent_ineq} yields
+\begin{align*}
+    \sum_{t=1}^T \left\langle \nabla_\Rbf \Ft\pare{\gt,\Rt}, \Ot\right\rangle
+    &\leq 
+    \frac {2\sigR} {1-\beta_1}  
+    + 2\zeta_\Rbf \sigR \sqrt{1-\beta_1} T
+    + \frac{2\eta L}{1-\beta_1}T
+    - \sum_{t=1}^T \trnorm{\gradRt}.
+\end{align*}
+Summing \eqref{eq:descent_ineq} from $t=1$ to $T$ and using $\Ft\pare{\g_{T+1}, \Rbf_{T+1}} \geq \Ft_\star$ gives
+\begin{align*}
+    &\ \sum_{t=1}^T \E\left[\gamma \norm{\gradgt}_1 + \eta \trnorm{\gradRt}\right] \\
+    \leq &\ 
+    \Delta_1
+    + L \pare{\frac{5\gamma^2}{2(1-\beta_1)} + \frac{5\eta^2}{2(1-\beta_1)}}T
+    + 2 (\zeta_\g \sigg + \zeta_\Rbf \sigR)\eta \sqrt{1-\beta_1}  T
+    + \frac{2(\sigg + \sigR)\eta}{1-\beta_1}.
+\end{align*}
+By our choices of $\gamma = \eta$ and definition $\hat \sigma = \zeta_\g \sigg + \zeta_\Rbf \sigR$, we can simplify
+\begin{equation}
+    \frac{1}{T}\sum_{t=1}^T \E\left[\norm{\nabla \Ft\pare{\gt,\Rt}}_*\right]
+    \leq 
+    \frac{\Delta_1}{\eta T}
+    + \frac{5 \eta L}{(1- \beta_1)}
+    + 2 \sqrt{1-\beta_1}\hat \sigma 
+    + 2\frac{\sigg + \sigR}{(1-\beta_1) T},
+\end{equation}
+where we used the fact that $\norm{\nabla \Ft \pare{\gt, \Rt}}_* = \norm{\gradgt}_1 + \trnorm{\gradRt}$. Plugging our choice $\gamma = \eta = \sqrt{\frac{\Delta_1 (1-\beta_1)}{L T}}$ in the above inequality yields
+\begin{equation*}
+    \frac{1}{T}\sum_{t=1}^T \E\left[\norm{\nabla \Ft\pare{\gt,\Rt}}_*\right]
+    \leq 
+    6\sqrt{\frac{\Delta_1 L}{(1-\beta_1) T}}
+    + 2 \sqrt{1-\beta_1} \hat \sigma
+    + 2\frac{\sigg + \sigR}{(1-\beta_1) T}.
+\end{equation*}
+Further using the choice $\beta_1 = 1 - \min\left\{1, \max\left\{T^{-\nicefrac 2 3}, \sqrt{\frac{\Delta_1 L}{\hat \sigma^2 T}}\right\}\right\}$ gives
+\begin{align*}
+    \sqrt{\frac{\Delta_1 L}{(1-\beta_1) T}}
+    &\leq \sqrt{\frac{\Delta_1 L}{T}} + \pare{\frac{\Delta_1 L \hat \sigma^2}{T}}^{\nicefrac 1 4}\\
+    \sqrt{1-\beta_1} \hat \sigma
+    &\leq \frac{\hat \sigma}{T^{\nicefrac 1 3}} + \pare{\frac{\Delta_1 L \hat \sigma^2}{T}}^{\nicefrac 1 4}\\
+    \frac{ \sigg + \sigR}{(1-\beta_1) T}
+    &\leq \frac{\sigg + \sigR}{T^{\nicefrac 1 3}}
+    \leq \frac{\hat \sigma}{T^{\nicefrac 1 3}}
+\end{align*}
+Combining these bounds yields 
+\begin{equation*}
+    \frac{1}{T}\sum_{t=1}^T \E\left[\norm{\nabla \Ft\pare{\gt,\Rt}}_*\right]
+    \leq 
+    6 \sqrt{\frac{\Delta_1 L}{T}}
+    + 8 \pare{\frac{\Delta_1 L \hat \sigma^2}{T}}^{\nicefrac 1 4}
+    + \frac{4 \hat \sigma}{T^{\nicefrac 1 3}}
+\end{equation*}
+and hence the result.
+    
+\end{proof}
+}
