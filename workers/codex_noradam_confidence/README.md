@@ -48,6 +48,13 @@ commit b009f03 Compare NorMuon base against AdamW
 - `results/fineweb_gpt2_llm50m_anchormuown_20260601/`: 51M GPT-2-tokenized
   FineWeb-Edu comparison of Muown, EMA-Nesterov, AnchorMuon, AnchorMuown,
   Muon, AdamW, and AdamW-Atan2 controls.
+- `results/fineweb_gpt2_llm50m_ema_anchor_hpo_20260602/`: wider
+  GPT-2-tokenized HPO focused on EMA-Nesterov + AnchorMuon and stronger
+  top-per-family replays.
+- `results/fineweb_gpt2_llm50m_plateau20k_20260602/`: selected 20K-step
+  overfit/plateau sweep used to choose a practical common stop point.
+- `results/fineweb_gpt2_llm50m_plateau8k_20260602/`: final selected 8K-step
+  GPT-2-tokenized comparison with 256-batch final validation.
 - `results/cifar10_muown_ema_20260601/`: CIFAR-10 transfer check for Muown and
   EMA-Nesterov against the current AnchorMuon image-classification recipe.
 
@@ -147,6 +154,43 @@ Plots and full CSV:
 `results/fineweb_gpt2_llm50m_anchormuown_20260601/plots/val_loss_curve.png`,
 `results/fineweb_gpt2_llm50m_anchormuown_20260601/plots/val_acc_curve.png`,
 and `results/fineweb_gpt2_llm50m_anchormuown_20260601/plots/step_time_ms_bar.png`.
+
+### GPT-2 Tokenized EMA-AnchorMuon HPO And Plateau Check
+
+Latest GPT-2-tokenized LM run: `51,045,888`-parameter GPT, FineWeb-Edu
+`gpt2` tokens, `8,000,000` train tokens, `524,288` validation tokens, batch
+`16 x 256`, BF16, WSD with 100-step warmup and 20% decay, sequential
+validation, and two RTX PRO 6000 Blackwell GPUs scheduled one trial per GPU.
+
+I ran `1,314` 600-step HPO candidates focused on EMA-Nesterov + AnchorMuon,
+then replayed selected winners. The 4K replay was not flat, so I ran a 20K
+selected sweep. That showed optimizer-dependent overfitting on this small
+token cache: AnchorMuon-family peaked around 7K, EMA-Muon/Muon around 8K-10K,
+and AdamW-style baselines kept improving through 20K but did not reach the best
+Muon-family loss. The practical common stop point for this proxy is therefore
+8K steps, about `4.1` passes over the cache.
+
+8K selected replay, with 256 sequential final validation batches:
+
+| Rank | Optimizer | Selected config | Full val loss | Full token acc | Step | Throughput |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | EMA-Nesterov + Muon | `lr=0.0016`, `wd=0.05`, `ema_beta=0.1`, `ema_gamma=0.995` | 4.9585 | 24.82% | 23.34 ms | 175.5k tok/s |
+| 2 | Plain Muon | `lr=0.0012`, `wd=0.05` | 4.9737 | 24.74% | 21.20 ms | 193.2k tok/s |
+| 3 | AdamW-Atan2 | `lr=0.0005`, `wd=0.05` | 5.1509 | 24.24% | 16.19 ms | 253.0k tok/s |
+| 4 | AdamW | `lr=0.0005`, `wd=0.05` | 5.1510 | 24.22% | 15.39 ms | 266.1k tok/s |
+| 5 | AnchorMuon | `lr=0.0016`, `row_gamma=0.15`, `soda=0.001`, `fallback=RMS@1.0x` | 5.1607 | 24.91% | 19.85 ms | 206.4k tok/s |
+| 6 | EMA-Nesterov + AnchorMuon | `lr=0.0016`, `row_gamma=0`, `soda=0.003`, `ema_beta=0.3`, `ema_gamma=0.995` | 5.1684 | 24.81% | 22.09 ms | 185.4k tok/s |
+
+Takeaway: EMA-Nesterov + Muon is the best current loss result for the
+GPT-2-tokenized 50M LM proxy. Plain Muon is close and faster. AnchorMuon still
+has competitive token accuracy and fast spectral steps, but it does not win
+cross-entropy here, and EMA-Nesterov did not rescue AnchorMuon.
+
+Plots and full CSV:
+`results/fineweb_gpt2_llm50m_plateau8k_20260602/summary.md`,
+`results/fineweb_gpt2_llm50m_plateau8k_20260602/plots/val_loss_curve.png`,
+`results/fineweb_gpt2_llm50m_plateau8k_20260602/plots/val_acc_curve.png`,
+and `results/fineweb_gpt2_llm50m_plateau8k_20260602/plots/step_time_ms_bar.png`.
 
 ### CIFAR-10 Muown / EMA-Nesterov Transfer Check
 

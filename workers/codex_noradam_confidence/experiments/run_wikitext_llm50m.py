@@ -110,6 +110,7 @@ def parse_args() -> argparse.Namespace:
             "fineweb_long",
             "fineweb_anchor_hpo",
             "fineweb_tokenized_hpo",
+            "fineweb_ema_anchor_hpo",
             "muown_ema_hpo",
         ],
         default="anchor_deep",
@@ -146,7 +147,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--max-hpo-trials", type=int, default=0)
+    parser.add_argument("--final-top-per-family", type=int, default=1)
+    parser.add_argument("--resume-existing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--final-only", action="store_true")
+    parser.add_argument(
+        "--final-from-hpo-summary",
+        type=Path,
+        help="When --final-only is set, select final trials from a previous hpo_summary.csv instead of replaying the preset grid.",
+    )
     return parser.parse_args()
 
 
@@ -926,6 +934,9 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
             scale = lr_scale(step, trial.steps, trial.warmup_steps, trial.final_lr_scale, trial.wsd_decay_frac)
             for group in optimizer.param_groups:
                 group["lr"] = float(group.get("_bench_base_lr", trial.lr)) * scale
+            # Log the actual applied lr of the primary (matrix) param group, which
+            # for AnchorMuon/Muon fallback groups differs from trial.lr * scale.
+            applied_lr = float(optimizer.param_groups[0]["lr"]) if optimizer.param_groups else trial.lr * scale
             x, y = train_stream.batch(batch_size=args.batch_size, block_size=args.block_size, generator=train_gen)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -945,11 +956,16 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
                     "step": step,
                     "phase": "train",
                     "train_loss": last_loss,
-                    "lr": trial.lr * scale,
+                    "lr": applied_lr,
                     "step_time_ms": elapsed * 1000.0,
                     "tokens_per_sec": args.batch_size * args.block_size / max(elapsed, 1e-9),
                 }) + "\n")
             if step in eval_steps:
+                # Re-seed val_gen so every eval point scores the SAME fixed
+                # validation batches. Otherwise the generator advances across
+                # eval points and best_val_loss = min over eval rows is biased
+                # downward by lucky easy random draws.
+                val_gen.manual_seed(trial.seed + 20)
                 val_loss, val_acc = evaluate(
                     model,
                     val_stream,
@@ -967,7 +983,7 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
                     "train_loss": last_loss,
                     "val_loss": val_loss,
                     "val_acc": val_acc,
-                    "lr": trial.lr * scale,
+                    "lr": applied_lr,
                     "mean_step_time_ms": mean_recent * 1000.0,
                     "tokens_per_sec": args.batch_size * args.block_size / max(mean_recent, 1e-9),
                 }) + "\n")
@@ -1290,6 +1306,125 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
         warmup = min(args.warmup_steps, max(1, args.hpo_steps // 4))
         return [replace(trial, eval_every=eval_every, warmup_steps=warmup) for trial in trials]
 
+    if args.preset == "fineweb_ema_anchor_hpo":
+        by_name: dict[str, TrialConfig] = {}
+
+        def add(trial: TrialConfig) -> None:
+            by_name.setdefault(trial.name, trial)
+
+        # Keep cheap reference baselines in the focused EMA-AnchorMuon sweep so
+        # the final replay can show whether the wrapper is actually useful.
+        for lr in (4e-4, 5e-4, 6e-4):
+            add(TrialConfig(f"ema_anchor_ref_adamw_lr{lr:g}", "adamw", lr, steps=args.hpo_steps))
+            add(TrialConfig(f"ema_anchor_ref_adamatan2_lr{lr:g}", "adamatan2", lr, steps=args.hpo_steps))
+        for lr in (1.2e-3, 1.4e-3, 1.6e-3):
+            add(TrialConfig(f"ema_anchor_ref_muon_lr{lr:g}", "muon", lr, weight_decay=0.05, steps=args.hpo_steps))
+            for ema_beta in (0.05, 0.10, 0.20):
+                add(
+                    TrialConfig(
+                        f"ema_anchor_ref_ema_muon_lr{lr:g}_b{ema_beta:g}_g0.995",
+                        "ema_muon",
+                        lr,
+                        weight_decay=0.05,
+                        ema_beta=ema_beta,
+                        ema_gamma=0.995,
+                        ema_warmup_frac=0.20,
+                        ema_rest_frac=0.10,
+                        steps=args.hpo_steps,
+                    )
+                )
+
+        anchor_lrs = (1.15e-3, 1.30e-3, 1.45e-3, 1.60e-3)
+        row_gammas = (0.0, 0.15, 0.25, 0.35, 0.45, 0.55)
+        soda_scales = (3e-4, 1e-3, 3e-3, 1e-2)
+        fallback_choices = ((1.0, "rms"), (0.75, "rms"), (0.5, "atan2"))
+
+        for lr in anchor_lrs:
+            for row_gamma in row_gammas:
+                for soda_lambda_scale in soda_scales:
+                    for fallback_lr_mult, fallback_mode in fallback_choices:
+                        add(
+                            TrialConfig(
+                                f"ema_anchor_ref_anchor_lr{lr:g}_rg{row_gamma:g}_soda{soda_lambda_scale:g}_flr{fallback_lr_mult:g}_{fallback_mode}",
+                                "anchormuon",
+                                lr,
+                                row_gamma=row_gamma,
+                                pmuoneq_beta=0.90,
+                                normuon_beta2=0.93,
+                                fallback_lr_mult=fallback_lr_mult,
+                                fallback_mode=fallback_mode,
+                                soda_lambda_scale=soda_lambda_scale,
+                                steps=args.hpo_steps,
+                            )
+                        )
+                        add(
+                            TrialConfig(
+                                f"ema_anchor_base_lr{lr:g}_rg{row_gamma:g}_soda{soda_lambda_scale:g}_flr{fallback_lr_mult:g}_{fallback_mode}_b0.3_g0.995_w0.2_r0.1",
+                                "ema_anchormuon",
+                                lr,
+                                row_gamma=row_gamma,
+                                pmuoneq_beta=0.90,
+                                normuon_beta2=0.93,
+                                fallback_lr_mult=fallback_lr_mult,
+                                fallback_mode=fallback_mode,
+                                soda_lambda_scale=soda_lambda_scale,
+                                ema_beta=0.30,
+                                ema_gamma=0.995,
+                                ema_warmup_frac=0.20,
+                                ema_rest_frac=0.10,
+                                steps=args.hpo_steps,
+                            )
+                        )
+
+        # A second, deeper pass over the EMA dynamics around strong AnchorMuon
+        # regions. These settings are deliberately not the same as the broad
+        # matrix/fallback grid above, so short-run HPO can test whether the EMA
+        # schedule itself is the useful part.
+        base_settings = (
+            (1.30e-3, 0.25, 1e-3, 1.0, "rms"),
+            (1.45e-3, 0.25, 1e-3, 1.0, "rms"),
+            (1.45e-3, 0.35, 1e-3, 1.0, "rms"),
+            (1.45e-3, 0.45, 3e-3, 1.0, "rms"),
+            (1.60e-3, 0.25, 1e-3, 0.75, "rms"),
+            (1.60e-3, 0.35, 3e-3, 0.75, "rms"),
+        )
+        phase_windows = (
+            (0.00, 0.00),
+            (0.10, 0.00),
+            (0.10, 0.10),
+            (0.20, 0.10),
+            (0.30, 0.20),
+        )
+        for lr, row_gamma, soda_lambda_scale, fallback_lr_mult, fallback_mode in base_settings:
+            for ema_beta in (0.05, 0.10, 0.20, 0.30, 0.50, 0.70):
+                for ema_gamma in (0.98, 0.99, 0.995, 0.9975):
+                    for ema_warmup_frac, ema_rest_frac in phase_windows:
+                        add(
+                            TrialConfig(
+                                f"ema_anchor_dyn_lr{lr:g}_rg{row_gamma:g}_soda{soda_lambda_scale:g}_flr{fallback_lr_mult:g}_{fallback_mode}_b{ema_beta:g}_g{ema_gamma:g}_w{ema_warmup_frac:g}_r{ema_rest_frac:g}",
+                                "ema_anchormuon",
+                                lr,
+                                row_gamma=row_gamma,
+                                pmuoneq_beta=0.90,
+                                normuon_beta2=0.93,
+                                fallback_lr_mult=fallback_lr_mult,
+                                fallback_mode=fallback_mode,
+                                soda_lambda_scale=soda_lambda_scale,
+                                ema_beta=ema_beta,
+                                ema_gamma=ema_gamma,
+                                ema_warmup_frac=ema_warmup_frac,
+                                ema_rest_frac=ema_rest_frac,
+                                steps=args.hpo_steps,
+                            )
+                        )
+
+        trials = list(by_name.values())
+        if args.max_hpo_trials:
+            trials = trials[: args.max_hpo_trials]
+        eval_every = max(1, args.hpo_steps // max(args.eval_bins, 1))
+        warmup = min(args.warmup_steps, max(1, args.hpo_steps // 4))
+        return [replace(trial, eval_every=eval_every, warmup_steps=warmup) for trial in trials]
+
     if args.preset == "muown_ema_hpo":
         by_name: dict[str, TrialConfig] = {}
 
@@ -1547,14 +1682,14 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
 
 
 def final_trials_from_hpo(args: argparse.Namespace, hpo_rows: list[dict[str, Any]]) -> list[TrialConfig]:
-    best: dict[str, dict[str, Any]] = {}
+    by_family: dict[str, list[dict[str, Any]]] = {}
     for row in hpo_rows:
         family = str(row["family"])
-        if family not in best or float(row["best_val_loss"]) < float(best[family]["best_val_loss"]):
-            best[family] = row
+        by_family.setdefault(family, []).append(row)
     eval_every = max(1, args.final_steps // max(args.eval_bins, 1))
     warmup = min(args.warmup_steps, max(1, args.final_steps // 4))
     trials: list[TrialConfig] = []
+    seen_names: set[str] = set()
     for family in (
         "anchormuon",
         "anchormuown",
@@ -1567,33 +1702,38 @@ def final_trials_from_hpo(args: argparse.Namespace, hpo_rows: list[dict[str, Any
         "adamatan2",
         "muon",
     ):
-        if family not in best:
+        if family not in by_family:
             continue
-        row = best[family]
-        trials.append(
-            TrialConfig(
-                name=f"final_{row['name']}",
-                family=family,
-                lr=float(row["lr"]),
-                weight_decay=float(row.get("weight_decay", 0.05)),
-                row_gamma=float(row.get("row_gamma", 0.25)),
-                pmuoneq_beta=float(row.get("pmuoneq_beta", 0.90)),
-                normuon_beta2=float(row.get("normuon_beta2", 0.93)),
-                fallback_lr_mult=float(row.get("fallback_lr_mult", 0.5)),
-                fallback_mode=str(row.get("fallback_mode", "atan2")),
-                soda_lambda_scale=float(row.get("soda_lambda_scale", 1.0)),
-                soda_lambda_power=float(row.get("soda_lambda_power", 1.0)),
-                ema_beta=float(row.get("ema_beta", 0.0)),
-                ema_gamma=float(row.get("ema_gamma", 0.99)),
-                ema_warmup_frac=float(row.get("ema_warmup_frac", 0.30)),
-                ema_rest_frac=float(row.get("ema_rest_frac", 0.20)),
-                muown_mag_lr_mult=float(row.get("muown_mag_lr_mult", 1.0)),
-                seed=args.seed,
-                steps=args.final_steps,
-                eval_every=eval_every,
-                warmup_steps=warmup,
+        rows = sorted(by_family[family], key=lambda r: float(r["best_val_loss"]))
+        for row in rows[: max(1, int(args.final_top_per_family))]:
+            name = f"final_{row['name']}"
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            trials.append(
+                TrialConfig(
+                    name=name,
+                    family=family,
+                    lr=float(row["lr"]),
+                    weight_decay=float(row.get("weight_decay", 0.05)),
+                    row_gamma=float(row.get("row_gamma", 0.25)),
+                    pmuoneq_beta=float(row.get("pmuoneq_beta", 0.90)),
+                    normuon_beta2=float(row.get("normuon_beta2", 0.93)),
+                    fallback_lr_mult=float(row.get("fallback_lr_mult", 0.5)),
+                    fallback_mode=str(row.get("fallback_mode", "atan2")),
+                    soda_lambda_scale=float(row.get("soda_lambda_scale", 1.0)),
+                    soda_lambda_power=float(row.get("soda_lambda_power", 1.0)),
+                    ema_beta=float(row.get("ema_beta", 0.0)),
+                    ema_gamma=float(row.get("ema_gamma", 0.99)),
+                    ema_warmup_frac=float(row.get("ema_warmup_frac", 0.30)),
+                    ema_rest_frac=float(row.get("ema_rest_frac", 0.20)),
+                    muown_mag_lr_mult=float(row.get("muown_mag_lr_mult", 1.0)),
+                    seed=args.seed,
+                    steps=args.final_steps,
+                    eval_every=eval_every,
+                    warmup_steps=warmup,
+                )
             )
-        )
     return trials
 
 
@@ -1692,10 +1832,18 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> list[d
     if gpu_count < 1:
         raise RuntimeError("CUDA GPU is required for this benchmark")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    pending = list(trials)
+    summaries: list[dict[str, Any]] = []
+    pending: list[TrialConfig] = []
+    for trial in trials:
+        phase = "final" if trial.name.startswith("final_") else "hpo"
+        summary_path = args.output_dir / phase / trial.name / "summary.json"
+        if args.resume_existing and summary_path.exists():
+            summaries.append(json.loads(summary_path.read_text()))
+            print(f"skipped existing {trial.name}", flush=True)
+            continue
+        pending.append(trial)
     running: list[tuple[subprocess.Popen[str], Path, int, str]] = []
     available_gpus = list(range(gpu_count))
-    summaries: list[dict[str, Any]] = []
     while pending or running:
         still: list[tuple[subprocess.Popen[str], Path, int, str]] = []
         for proc, trial_file, gpu, name in running:
@@ -1739,6 +1887,11 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def read_csv_rows(path: Path) -> list[dict[str, Any]]:
+    with path.open() as f:
+        return list(csv.DictReader(f))
 
 
 def load_eval_curve(trial_dir: Path) -> list[dict[str, Any]]:
@@ -1848,7 +2001,7 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
         f"- Model: decoder-only GPT, layers={args.n_layer}, width={args.n_embd}, heads={args.n_head}, context={args.block_size}, vocab={int(final_rows[0]['vocab_size']) if final_rows else tokenizer_vocab_size(args):,}",
         f"- Trainable parameters: {int(final_rows[0]['param_count']) if final_rows else 'n/a'}",
         f"- Batch: {args.batch_size} sequences x {args.block_size} {unit}",
-        f"- HPO: {'skipped; fixed preset configs replayed directly' if args.final_only else f'{_step_description(hpo_rows, args.hpo_steps)} per candidate, selected by best validation loss'}",
+        f"- HPO: {'skipped; selected from prior hpo_summary.csv' if args.final_only and args.final_from_hpo_summary else ('skipped; fixed preset configs replayed directly' if args.final_only else f'{_step_description(hpo_rows, args.hpo_steps)} per candidate, selected by best validation loss')}",
         f"- Final replay: {_step_description(final_rows, args.final_steps)} per selected optimizer",
         f"- Validation estimate: {args.eval_batches} {args.eval_mode} batches per evaluation point",
         f"- Final extra validation: {'disabled' if args.final_eval_batches <= 0 else f'{args.final_eval_batches} {args.eval_mode} batches'}",
@@ -1938,8 +2091,12 @@ def main() -> None:
     }
     (args.output_dir / "environment.json").write_text(json.dumps(env, indent=2) + "\n")
     if args.final_only:
-        hpo_rows: list[dict[str, Any]] = []
-        final_rows = launch_trials(args, final_trials_from_preset(args))
+        if args.final_from_hpo_summary:
+            hpo_rows = read_csv_rows(args.final_from_hpo_summary)
+            final_rows = launch_trials(args, final_trials_from_hpo(args, hpo_rows))
+        else:
+            hpo_rows = []
+            final_rows = launch_trials(args, final_trials_from_preset(args))
     else:
         hpo_rows = launch_trials(args, hpo_trials(args))
         write_csv(args.output_dir / "hpo_summary.csv", hpo_rows)

@@ -502,7 +502,7 @@ class AnchorMuon(torch.optim.Optimizer):
         matrix, _ = _matrix_view(param)
         rows, cols = matrix.shape
         shape = (rows, 1) if rows >= cols else (1, cols)
-        return _state_tensor(state, "normuon_second_moment", shape=shape, device=param.device, fill=1.0)
+        return _state_tensor(state, "normuon_second_moment", shape=shape, device=param.device, fill=0.0)
 
     def _ensure_fallback_state(self, param: Tensor, state: dict[str, Any]) -> Tensor:
         return _state_tensor(state, "exp_avg_sq", shape=tuple(param.shape), device=param.device, fill=0.0)

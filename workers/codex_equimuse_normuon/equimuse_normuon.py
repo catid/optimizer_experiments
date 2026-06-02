@@ -484,14 +484,14 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         soda_values: list[float] = []
         aspect_enabled = False
         for group in self.param_groups:
-            lr, ckp1, beta1, t = self._advance_group_schedule(group)
+            lr, ckp1, beta1, beta1_prev, t = self._advance_group_schedule(group)
             soda_lambda = self._soda_lambda(group, t)
             if bool(group.get("use_muon", False)):
                 aspect_enabled = aspect_enabled or bool(group.get("normuon_aspect_scale", self.normuon_aspect_scale))
-                count = self._step_muon_group(group, lr, ckp1, beta1, soda_lambda)
+                count = self._step_muon_group(group, lr, ckp1, beta1, beta1_prev, soda_lambda)
                 muon_matrices += count
             else:
-                count = self._step_fallback_group(group, lr, ckp1, beta1, t, soda_lambda)
+                count = self._step_fallback_group(group, lr, ckp1, beta1, beta1_prev, t, soda_lambda)
                 fallback_params += count
             if soda_lambda > 0.0:
                 soda_params += count
@@ -514,12 +514,16 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         }
         return loss
 
-    def _advance_group_schedule(self, group: dict[str, Any]) -> tuple[float, float, float, int]:
+    def _advance_group_schedule(self, group: dict[str, Any]) -> tuple[float, float, float, float, int]:
         k = int(group["k"])
         t = k + 1
         warmup_steps = int(group.get("warmup_steps", self.warmup_steps))
         if warmup_steps <= 0:
             raise ValueError("warmup_steps must be positive")
+
+        # beta1 that produced the current param value Y_{t-1}; used to invert
+        # Y -> X before the schedule advances beta1 to the current step's value.
+        beta1_prev = float(group.get("beta1", self.beta1_init))
 
         base_lr = self._current_base_lr(group)
         lr = base_lr * min(1.0, t / warmup_steps)
@@ -535,7 +539,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         beta1 = self._compute_beta1(group, t, ckp1, warmup_steps)
         group["beta1"] = beta1
         group["k"] = t
-        return lr, ckp1, beta1, t
+        return lr, ckp1, beta1, beta1_prev, t
 
     @staticmethod
     def _current_base_lr(group: dict[str, Any]) -> float:
@@ -598,6 +602,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         lr: float,
         ckp1: float,
         beta1: float,
+        beta1_prev: float,
         t: int,
         soda_lambda: float,
     ) -> int:
@@ -614,10 +619,10 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
 
         if bool(group.get("foreach", self.foreach)) and hasattr(torch, "_foreach_mul_"):
             for bucket in _bucket_by_tensor(items, tensor_index=0):
-                self._step_fallback_bucket_foreach(bucket, group, lr, ckp1, beta1, t, soda_lambda)
+                self._step_fallback_bucket_foreach(bucket, group, lr, ckp1, beta1, beta1_prev, t, soda_lambda)
         else:
             for item in items:
-                self._step_fallback_one(item, group, lr, ckp1, beta1, t, soda_lambda)
+                self._step_fallback_one(item, group, lr, ckp1, beta1, beta1_prev, t, soda_lambda)
         return len(items)
 
     def _step_fallback_bucket_foreach(
@@ -627,6 +632,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         lr: float,
         ckp1: float,
         beta1: float,
+        beta1_prev: float,
         t: int,
         soda_lambda: float,
     ) -> None:
@@ -640,7 +646,8 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         wd = float(group.get("weight_decay", 0.0))
         bias_correction2 = 1.0 - beta2**t
 
-        _foreach_lerp_(params, zs, 1.0 - 1.0 / beta1, True)
+        # Invert Y -> X using the beta1 that produced the current param value.
+        _foreach_lerp_(params, zs, 1.0 - 1.0 / beta1_prev, True)
         self._apply_soda_anchor_bucket(zs, anchors, soda_lambda)
         torch._foreach_mul_(exp_avg_sqs, beta2)
         torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
@@ -661,6 +668,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         lr: float,
         ckp1: float,
         beta1: float,
+        beta1_prev: float,
         t: int,
         soda_lambda: float,
     ) -> None:
@@ -668,7 +676,8 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         beta2 = float(group.get("beta2", 0.999))
         eps = float(group.get("eps", 1e-10))
         wd = float(group.get("weight_decay", 0.0))
-        p.lerp_(z.to(dtype=p.dtype), 1.0 - 1.0 / beta1)
+        # Invert Y -> X using the beta1 that produced the current param value.
+        p.lerp_(z.to(dtype=p.dtype), 1.0 - 1.0 / beta1_prev)
         self._apply_soda_anchor_one(z, anchor, soda_lambda)
         exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
         update = grad.div(exp_avg_sq.div(1.0 - beta2**t).sqrt_().add_(eps))
@@ -678,7 +687,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         p.lerp_(z.to(dtype=p.dtype), ckp1)
         p.lerp_(z.to(dtype=p.dtype), 1.0 - beta1)
 
-    def _step_muon_group(self, group: dict[str, Any], lr: float, ckp1: float, beta1: float, soda_lambda: float) -> int:
+    def _step_muon_group(self, group: dict[str, Any], lr: float, ckp1: float, beta1: float, beta1_prev: float, soda_lambda: float) -> int:
         items: list[dict[str, Any]] = []
         momentum_beta = float(group.get("momentum", 0.95))
         for p in group["params"]:
@@ -691,7 +700,8 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
             anchor = self._get_soda_anchor(p, z)
             if "momentum_buffer" not in state:
                 state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32, memory_format=torch.preserve_format)
-            p.lerp_(z.to(dtype=p.dtype), 1.0 - 1.0 / beta1)
+            # Invert Y -> X using the beta1 that produced the current param value.
+            p.lerp_(z.to(dtype=p.dtype), 1.0 - 1.0 / beta1_prev)
             grad32 = p.grad.detach().to(torch.float32)
             state["momentum_buffer"].lerp_(grad32, 1.0 - momentum_beta)
             update = grad32.lerp(state["momentum_buffer"], momentum_beta)

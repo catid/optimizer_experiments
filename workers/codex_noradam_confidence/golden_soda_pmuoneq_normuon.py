@@ -279,7 +279,7 @@ class GoldenSodaPmuonEqNorMuon(torch.optim.Optimizer):
             "normuon_second_moment",
             shape=norm_shape,
             device=param.device,
-            fill=1.0,
+            fill=0.0,
         )
         return momentum, row_ema, normuon_second
 

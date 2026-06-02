@@ -734,19 +734,16 @@ class AnchorMuon(torch.optim.Optimizer):
         p: torch.Tensor,
         rows: int,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         state = self.state[p]
         row_ema = state.get("pmuoneq_row_ema")
         if row_ema is None or row_ema.shape != (rows,) or row_ema.device != device:
             row_ema = state["pmuoneq_row_ema"] = torch.ones(rows, device=device, dtype=torch.float32)
-        row_factor = state.get("pmuoneq_row_factor")
-        if row_factor is None or row_factor.shape != (rows,) or row_factor.device != device:
-            row_factor = state["pmuoneq_row_factor"] = torch.ones(rows, device=device, dtype=torch.float32)
         second = state.get("normuon_second_momentum")
         second_shape = (rows, 1)
         if second is None or second.shape != second_shape or second.device != device:
             second = state["normuon_second_momentum"] = torch.zeros(*second_shape, device=device, dtype=torch.float32)
-        return row_ema, row_factor, second
+        return row_ema, second
 
     def _transform_matrix_bucket(
         self,
@@ -758,12 +755,10 @@ class AnchorMuon(torch.optim.Optimizer):
         _batch, rows, _cols = grads.shape
 
         row_buffers: list[torch.Tensor] = []
-        row_factor_buffers: list[torch.Tensor] = []
         second_buffers: list[torch.Tensor] = []
         for p, _anchor, _source, _grad in entries:
-            row_ema, row_factor, second = self._ensure_matrix_state(p, rows, grads.device)
+            row_ema, second = self._ensure_matrix_state(p, rows, grads.device)
             row_buffers.append(row_ema)
-            row_factor_buffers.append(row_factor)
             second_buffers.append(second)
 
         beta_p = float(group["pmuoneq_beta"])
@@ -785,7 +780,6 @@ class AnchorMuon(torch.optim.Optimizer):
 
         for idx, (p, _anchor, _source, _grad) in enumerate(entries):
             self.state[p]["pmuoneq_row_ema"].copy_(row_stack[idx])
-            self.state[p]["pmuoneq_row_factor"].copy_(row_factor[idx])
             self.state[p]["normuon_second_momentum"].copy_(second_stack[idx])
         return update
 

@@ -200,10 +200,16 @@ def test_atan2_fallback_scales_only_fallback_update() -> None:
         fallback_mode="atan2",
         fallback_betas=(0.5, 0.5),
     )
+    # Seed a SODA anchor distinct from the parameter so the anchor pull is not a
+    # no-op on the first step. With soda_lambda_scale/power = 1.0 the step-1 SODA
+    # weight is min(1.0, 1.0 / 2.0**1.0) = 0.5, so p is first pulled halfway to the
+    # anchor and only then receives the AdamATan2 update.
+    opt.state[p]["soda_z0"] = torch.zeros_like(p)
     p.grad = torch.tensor([0.5, -0.25])
     opt.step()
 
-    expected = torch.tensor([1.0, -2.0]) - 0.1 * torch.tensor([math.pi / 4.0, -math.pi / 4.0])
+    pulled = 0.5 * torch.tensor([1.0, -2.0]) + 0.5 * torch.tensor([0.0, 0.0])
+    expected = pulled - 0.1 * torch.tensor([math.pi / 4.0, -math.pi / 4.0])
     assert torch.allclose(p.detach(), expected, atol=1e-6, rtol=1e-6)
     assert "exp_avg" in opt.state[p]
     assert "exp_avg_sq" in opt.state[p]
@@ -238,10 +244,16 @@ def test_adamc_fallback_applies_optional_lr_squared_decay() -> None:
         fallback_betas=(0.5, 0.5),
         fallback_weight_decay=1.0,
     )
+    # Seed a SODA anchor distinct from the parameter so the anchor pull is exercised
+    # (otherwise it is a no-op on step 1). The fallback path must apply, in order:
+    # the SODA pull p <- (1 - lambda) p + lambda * z0 (lambda = 0.5 on step 1), then
+    # the lr**2 AdamC weight decay, then the AdamC update.
+    opt.state[p]["soda_z0"] = torch.zeros_like(p)
     p.grad = torch.tensor([0.5, -0.25])
     opt.step()
 
-    expected = torch.tensor([1.0, -2.0]) * 0.99 - 0.1 * torch.tensor([1.0, -1.0])
+    pulled = 0.5 * torch.tensor([1.0, -2.0]) + 0.5 * torch.tensor([0.0, 0.0])
+    expected = pulled * 0.99 - 0.1 * torch.tensor([1.0, -1.0])
     assert torch.allclose(p.detach(), expected, atol=1e-6, rtol=1e-6)
     assert "exp_avg" in opt.state[p]
     assert "exp_avg_sq" in opt.state[p]
@@ -315,7 +327,7 @@ def test_anchor_step_is_finite_and_creates_only_row_pmuoneq_state() -> None:
     state = opt.state[model.fc1.weight]
     assert "momentum_buffer" in state
     assert "pmuoneq_row_ema" in state
-    assert "pmuoneq_row_factor" in state
+    assert "pmuoneq_row_factor" not in state
     assert "normuon_second_momentum" in state
     assert "pmuoneq_col_ema" not in state
     assert "pmuoneq_col_factor" not in state

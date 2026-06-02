@@ -221,3 +221,78 @@ def test_anchor_muown_optimizer_step_keeps_parameters_finite():
 
     for param in model.parameters():
         assert torch.isfinite(param).all()
+
+
+def test_fineweb_ema_anchor_hpo_preset_has_focused_ema_anchor_grid():
+    runner = _load_runner()
+    args = SimpleNamespace(
+        preset="fineweb_ema_anchor_hpo",
+        hpo_steps=123,
+        eval_bins=3,
+        warmup_steps=99,
+        max_hpo_trials=0,
+    )
+
+    trials = runner.hpo_trials(args)
+    families = {trial.family for trial in trials}
+    ema_anchor_trials = [trial for trial in trials if trial.family == "ema_anchormuon"]
+
+    assert {"anchormuon", "ema_anchormuon", "muon", "ema_muon", "adamw", "adamatan2"} <= families
+    assert len(ema_anchor_trials) > 500
+    assert {trial.ema_warmup_frac for trial in ema_anchor_trials} >= {0.0, 0.2, 0.3}
+    assert {trial.ema_rest_frac for trial in ema_anchor_trials} >= {0.0, 0.1, 0.2}
+    assert all(trial.eval_every == 41 for trial in trials)
+    assert all(trial.warmup_steps == 30 for trial in trials)
+
+
+def test_final_trials_from_hpo_can_replay_multiple_top_configs_per_family():
+    runner = _load_runner()
+    args = SimpleNamespace(final_steps=100, eval_bins=4, warmup_steps=20, seed=7, final_top_per_family=2)
+    hpo_rows = [
+        {"name": "anchor_bad", "family": "anchormuon", "lr": 0.1, "best_val_loss": 2.0},
+        {"name": "anchor_best", "family": "anchormuon", "lr": 0.2, "best_val_loss": 1.0},
+        {"name": "anchor_second", "family": "anchormuon", "lr": 0.3, "best_val_loss": 1.5},
+        {"name": "ema_best", "family": "ema_anchormuon", "lr": 0.4, "best_val_loss": 0.9, "ema_beta": 0.3},
+        {"name": "ema_second", "family": "ema_anchormuon", "lr": 0.5, "best_val_loss": 1.1, "ema_beta": 0.5},
+        {"name": "ema_bad", "family": "ema_anchormuon", "lr": 0.6, "best_val_loss": 1.2, "ema_beta": 0.7},
+    ]
+
+    trials = runner.final_trials_from_hpo(args, hpo_rows)
+    names = [trial.name for trial in trials]
+
+    assert names == [
+        "final_anchor_best",
+        "final_anchor_second",
+        "final_ema_best",
+        "final_ema_second",
+    ]
+    assert [trial.eval_every for trial in trials] == [25, 25, 25, 25]
+    assert [trial.warmup_steps for trial in trials] == [20, 20, 20, 20]
+
+
+def test_read_csv_rows_supports_selected_final_replay(tmp_path):
+    runner = _load_runner()
+    path = tmp_path / "hpo_summary.csv"
+    path.write_text("name,family,lr,best_val_loss\nmuon_a,muon,0.1,2.0\nmuon_b,muon,0.2,1.0\n")
+
+    rows = runner.read_csv_rows(path)
+
+    assert rows == [
+        {"name": "muon_a", "family": "muon", "lr": "0.1", "best_val_loss": "2.0"},
+        {"name": "muon_b", "family": "muon", "lr": "0.2", "best_val_loss": "1.0"},
+    ]
+
+
+def test_launch_trials_skips_existing_summaries(monkeypatch, tmp_path):
+    runner = _load_runner()
+    trial = runner.TrialConfig("already_done", "adamw", 1e-3)
+    summary_dir = tmp_path / "hpo" / trial.name
+    summary_dir.mkdir(parents=True)
+    summary = {"name": trial.name, "family": trial.family, "best_val_loss": 1.23}
+    (summary_dir / "summary.json").write_text(__import__("json").dumps(summary))
+    args = SimpleNamespace(output_dir=tmp_path, resume_existing=True)
+    monkeypatch.setattr(runner.torch.cuda, "device_count", lambda: 1)
+
+    rows = runner.launch_trials(args, [trial])
+
+    assert rows == [summary]

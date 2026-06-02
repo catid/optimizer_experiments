@@ -61,7 +61,7 @@ class VisionRotaryEmbedding(nn.Module):
         ft_seq_len = int(np.sqrt(x.shape[1]))
         if ft_seq_len * ft_seq_len != x.shape[1]:
             raise ValueError(f"VisionRotaryEmbedding requires a square patch grid, got {x.shape[1]} tokens")
-        t = torch.arange(ft_seq_len, device=x.device, dtype=torch.float32) / ft_seq_len * self.pt_seq_len
+        t = torch.arange(ft_seq_len, device=x.device, dtype=self.freqs.dtype) / ft_seq_len * self.pt_seq_len
 
         freqs = torch.einsum('..., f -> ... f', t, self.freqs)
         freqs = repeat(freqs, '... n -> ... (n r)', r = 2) # 14*32

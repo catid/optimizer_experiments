@@ -598,7 +598,7 @@ class GoldenSodaPmuonEqNorMuon(torch.optim.Optimizer):
             state["step"] = 0
         state["step"] = int(state.get("step", 0)) + 1
         beta2 = float(group.get("fallback_beta2", 0.999))
-        eps = float(group.get("eps", 1e-10))
+        eps = float(group.get("eps", 1e-8))
         g = grad.detach().to(torch.float32)
         exp_avg_sq.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
         step = int(state["step"])
@@ -730,6 +730,9 @@ def build_golden_soda_pmuoneq_normuon_param_groups(
                 "pmuoneq_eps": pmuoneq_eps,
                 "normuon_beta2": normuon_beta2,
                 "normuon_eps": normuon_eps,
+                "fallback_beta2": fallback_beta2,
+                "eps": eps,
+                "weight_decay": fallback_weight_decay,
             }
         )
     if fallback_params:
