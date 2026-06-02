@@ -1431,68 +1431,138 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
         def add(trial: TrialConfig) -> None:
             by_name.setdefault(trial.name, trial)
 
-        # Keep the previous FineWeb winner in the comparison so the new paper
-        # variants are judged against the strongest local baseline, not only
-        # plain Muon.
+        # Keep the latest tokenized-FineWeb reference rows in the comparison so
+        # Muown is judged against the current 8K winners, not the older byte-LM
+        # AnchorMuon run.
         add(
             TrialConfig(
-                "fineweb_anchor_best_lr0.0012_rg0.45_soda0.003_pb0.9_nb0.93_flr1_rms",
+                "muown_ref_anchor_lr0.0016_rg0.15_soda0.001_flr1_rms",
                 "anchormuon",
-                0.0012,
-                row_gamma=0.45,
+                0.0016,
+                row_gamma=0.15,
+                pmuoneq_beta=0.90,
+                normuon_beta2=0.93,
+                fallback_lr_mult=1.0,
+                fallback_mode="rms",
+                soda_lambda_scale=0.001,
+                steps=args.hpo_steps,
+            )
+        )
+        add(
+            TrialConfig(
+                "muown_ref_ema_anchor_lr0.0016_rg0_soda0.003_flr1_rms_b0.3_g0.995_w0.2_r0.1",
+                "ema_anchormuon",
+                0.0016,
+                row_gamma=0.0,
                 pmuoneq_beta=0.90,
                 normuon_beta2=0.93,
                 fallback_lr_mult=1.0,
                 fallback_mode="rms",
                 soda_lambda_scale=0.003,
+                ema_beta=0.30,
+                ema_gamma=0.995,
+                ema_warmup_frac=0.20,
+                ema_rest_frac=0.10,
                 steps=args.hpo_steps,
             )
         )
-        for lr in (3e-4, 4e-4, 5e-4):
+        for lr in (4e-4, 5e-4, 6e-4):
             add(TrialConfig(f"fineweb_adamw_lr{lr:g}", "adamw", lr, steps=args.hpo_steps))
             add(TrialConfig(f"fineweb_adamatan2_lr{lr:g}", "adamatan2", lr, steps=args.hpo_steps))
-        for lr in (1.0e-3, 1.1e-3, 1.2e-3, 1.35e-3):
+        for lr in (1.2e-3, 1.4e-3, 1.6e-3):
             add(TrialConfig(f"fineweb_muon_lr{lr:g}", "muon", lr, weight_decay=0.05, steps=args.hpo_steps))
+            for ema_beta in (0.05, 0.10, 0.20):
+                add(
+                    TrialConfig(
+                        f"fineweb_ema_muon_lr{lr:g}_b{ema_beta:g}_g0.995_w0.2_r0.1",
+                        "ema_muon",
+                        lr,
+                        weight_decay=0.05,
+                        ema_beta=ema_beta,
+                        ema_gamma=0.995,
+                        ema_warmup_frac=0.20,
+                        ema_rest_frac=0.10,
+                        steps=args.hpo_steps,
+                    )
+                )
 
         # Muown's paper reports the best default without weight decay, but the
         # benchmark's Muon baseline uses decay. Sweep both to check whether the
         # implicit row-magnitude path really removes the need for it here.
-        for lr in (9e-4, 1.1e-3, 1.3e-3, 1.6e-3, 2.0e-3):
+        for lr in (8e-4, 1.0e-3, 1.2e-3, 1.4e-3, 1.6e-3, 1.9e-3):
             for wd in (0.0, 0.01, 0.05):
                 add(TrialConfig(f"fineweb_muown_lr{lr:g}_wd{wd:g}", "muown", lr, weight_decay=wd, steps=args.hpo_steps))
 
-        # EMA-Nesterov is a wrapper around a tuned base optimizer. The paper's
-        # useful region is beta in 0.1..0.5 and gamma near 0.99 for short runs.
-        for lr in (1.0e-3, 1.1e-3, 1.2e-3):
-            for ema_beta in (0.1, 0.3, 0.5):
-                for ema_gamma in (0.99, 0.995):
-                    add(
-                        TrialConfig(
-                            f"fineweb_ema_muon_lr{lr:g}_b{ema_beta:g}_g{ema_gamma:g}",
-                            "ema_muon",
-                            lr,
-                            weight_decay=0.05,
-                            ema_beta=ema_beta,
-                            ema_gamma=ema_gamma,
-                            steps=args.hpo_steps,
-                        )
-                    )
-
-        for lr in (1.1e-3, 1.3e-3, 1.6e-3):
-            for wd in (0.0, 0.01):
-                for ema_beta in (0.1, 0.3):
+        # EMA-Nesterov is a wrapper around a tuned base optimizer. For Muown,
+        # sweep weaker and stronger beta because the row-magnitude path can
+        # overreact to lookahead gradients on short noisy LM runs.
+        for lr in (9e-4, 1.1e-3, 1.3e-3, 1.6e-3):
+            for wd in (0.0, 0.01, 0.05):
+                for ema_beta in (0.05, 0.10, 0.20, 0.30):
                     for ema_gamma in (0.99, 0.995):
                         add(
                             TrialConfig(
-                                f"fineweb_ema_muown_lr{lr:g}_wd{wd:g}_b{ema_beta:g}_g{ema_gamma:g}",
+                                f"fineweb_ema_muown_lr{lr:g}_wd{wd:g}_b{ema_beta:g}_g{ema_gamma:g}_w0.2_r0.1",
                                 "ema_muown",
                                 lr,
                                 weight_decay=wd,
                                 ema_beta=ema_beta,
                                 ema_gamma=ema_gamma,
+                                ema_warmup_frac=0.20,
+                                ema_rest_frac=0.10,
                                 steps=args.hpo_steps,
                             )
                         )
+
+        # Muown inside AnchorMuon has an extra radial-step scale. This tests
+        # whether the row-magnitude parameterization helps the current
+        # SODA/PMuonEq/NorMuon recipe or only the plain Muon branch.
+        anchor_settings = (
+            (1.30e-3, 0.0, 3e-3, 1.0, "rms"),
+            (1.45e-3, 0.0, 3e-3, 1.0, "rms"),
+            (1.60e-3, 0.0, 3e-3, 1.0, "rms"),
+            (1.45e-3, 0.15, 1e-3, 1.0, "rms"),
+            (1.60e-3, 0.15, 1e-3, 1.0, "rms"),
+            (1.60e-3, 0.25, 1e-3, 0.75, "rms"),
+            (1.60e-3, 0.25, 3e-3, 0.75, "rms"),
+        )
+        for lr, row_gamma, soda_lambda_scale, fallback_lr_mult, fallback_mode in anchor_settings:
+            for muown_mag_lr_mult in (0.25, 0.50, 1.0):
+                add(
+                    TrialConfig(
+                        f"fineweb_anchormuown_lr{lr:g}_rg{row_gamma:g}_soda{soda_lambda_scale:g}_mag{muown_mag_lr_mult:g}_flr{fallback_lr_mult:g}_{fallback_mode}",
+                        "anchormuown",
+                        lr,
+                        row_gamma=row_gamma,
+                        pmuoneq_beta=0.90,
+                        normuon_beta2=0.93,
+                        fallback_lr_mult=fallback_lr_mult,
+                        fallback_mode=fallback_mode,
+                        soda_lambda_scale=soda_lambda_scale,
+                        muown_mag_lr_mult=muown_mag_lr_mult,
+                        steps=args.hpo_steps,
+                    )
+                )
+                for ema_beta in (0.10, 0.30):
+                    add(
+                        TrialConfig(
+                            f"fineweb_ema_anchormuown_lr{lr:g}_rg{row_gamma:g}_soda{soda_lambda_scale:g}_mag{muown_mag_lr_mult:g}_flr{fallback_lr_mult:g}_{fallback_mode}_b{ema_beta:g}_g0.995_w0.2_r0.1",
+                            "ema_anchormuown",
+                            lr,
+                            row_gamma=row_gamma,
+                            pmuoneq_beta=0.90,
+                            normuon_beta2=0.93,
+                            fallback_lr_mult=fallback_lr_mult,
+                            fallback_mode=fallback_mode,
+                            soda_lambda_scale=soda_lambda_scale,
+                            ema_beta=ema_beta,
+                            ema_gamma=0.995,
+                            ema_warmup_frac=0.20,
+                            ema_rest_frac=0.10,
+                            muown_mag_lr_mult=muown_mag_lr_mult,
+                            steps=args.hpo_steps,
+                        )
+                    )
 
         trials = list(by_name.values())
         if args.max_hpo_trials:
@@ -1894,6 +1964,14 @@ def read_csv_rows(path: Path) -> list[dict[str, Any]]:
         return list(csv.DictReader(f))
 
 
+def finite_metric(row: dict[str, Any], key: str, *, default: float = math.inf) -> float:
+    try:
+        value = float(row[key])
+    except (KeyError, TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) else default
+
+
 def load_eval_curve(trial_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line in (trial_dir / "metrics.jsonl").read_text().splitlines():
@@ -1940,7 +2018,7 @@ def make_plots(args: argparse.Namespace, final_rows: list[dict[str, Any]]) -> No
         fig.savefig(plots_dir / out_name, dpi=180)
         plt.close(fig)
 
-    sorted_rows = sorted(final_rows, key=lambda r: float(r["mean_step_time_ms"]))
+    sorted_rows = sorted(final_rows, key=lambda r: finite_metric(r, "mean_step_time_ms"))
     for metric, ylabel, out_name, scale in [
         ("mean_step_time_ms", "Mean step time (ms)", "step_time_ms_bar.png", 1.0),
         ("tokens_per_sec", "Throughput (k tokens/s)", "tokens_per_sec_bar.png", 1e-3),
@@ -1967,7 +2045,13 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
         "ema_muon": "EMA-Nesterov + Muon",
         "ema_muown": "EMA-Nesterov + Muown",
     }
-    final_sorted = sorted(final_rows, key=lambda r: float(r["final_val_loss"]))
+    final_sorted = sorted(
+        final_rows,
+        key=lambda r: finite_metric(
+            r,
+            "final_full_val_loss" if "final_full_val_loss" in r else "final_val_loss",
+        ),
+    )
     tokenizer_name = "utf8-byte" if args.tokenizer_mode == "byte" else args.tokenizer_name
     unit = "bytes" if args.tokenizer_mode == "byte" else "tokens"
     accuracy_name = "byte acc" if args.tokenizer_mode == "byte" else "token acc"

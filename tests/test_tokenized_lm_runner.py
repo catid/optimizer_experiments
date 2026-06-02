@@ -245,6 +245,43 @@ def test_fineweb_ema_anchor_hpo_preset_has_focused_ema_anchor_grid():
     assert all(trial.warmup_steps == 30 for trial in trials)
 
 
+def test_muown_ema_hpo_preset_includes_muown_and_anchor_muown_grid():
+    runner = _load_runner()
+    args = SimpleNamespace(
+        preset="muown_ema_hpo",
+        hpo_steps=120,
+        eval_bins=4,
+        warmup_steps=99,
+        max_hpo_trials=0,
+    )
+
+    trials = runner.hpo_trials(args)
+    families = {trial.family for trial in trials}
+    anchor_muown_trials = [trial for trial in trials if trial.family == "anchormuown"]
+    ema_muown_trials = [trial for trial in trials if trial.family == "ema_muown"]
+    ema_anchor_muown_trials = [trial for trial in trials if trial.family == "ema_anchormuown"]
+
+    assert {
+        "adamw",
+        "adamatan2",
+        "muon",
+        "ema_muon",
+        "anchormuon",
+        "ema_anchormuon",
+        "muown",
+        "ema_muown",
+        "anchormuown",
+        "ema_anchormuown",
+    } <= families
+    assert len(ema_muown_trials) >= 80
+    assert len(anchor_muown_trials) >= 20
+    assert len(ema_anchor_muown_trials) >= 40
+    assert {trial.muown_mag_lr_mult for trial in anchor_muown_trials} == {0.25, 0.5, 1.0}
+    assert {trial.ema_beta for trial in ema_muown_trials} >= {0.05, 0.1, 0.2, 0.3}
+    assert all(trial.eval_every == 30 for trial in trials)
+    assert all(trial.warmup_steps == 30 for trial in trials)
+
+
 def test_final_trials_from_hpo_can_replay_multiple_top_configs_per_family():
     runner = _load_runner()
     args = SimpleNamespace(final_steps=100, eval_bins=4, warmup_steps=20, seed=7, final_top_per_family=2)
@@ -281,6 +318,20 @@ def test_read_csv_rows_supports_selected_final_replay(tmp_path):
         {"name": "muon_a", "family": "muon", "lr": "0.1", "best_val_loss": "2.0"},
         {"name": "muon_b", "family": "muon", "lr": "0.2", "best_val_loss": "1.0"},
     ]
+
+
+def test_finite_metric_sorts_nan_like_missing_value():
+    runner = _load_runner()
+
+    rows = [
+        {"name": "nan", "final_val_loss": "nan"},
+        {"name": "missing"},
+        {"name": "finite", "final_val_loss": "1.0"},
+    ]
+
+    ordered = sorted(rows, key=lambda row: runner.finite_metric(row, "final_val_loss"))
+
+    assert [row["name"] for row in ordered] == ["finite", "nan", "missing"]
 
 
 def test_launch_trials_skips_existing_summaries(monkeypatch, tmp_path):

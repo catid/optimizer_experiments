@@ -55,6 +55,10 @@ commit b009f03 Compare NorMuon base against AdamW
   overfit/plateau sweep used to choose a practical common stop point.
 - `results/fineweb_gpt2_llm50m_plateau8k_20260602/`: final selected 8K-step
   GPT-2-tokenized comparison with 256-batch final validation.
+- `results/fineweb_gpt2_llm50m_muown_hpo_20260602/`: 197-candidate
+  GPT-2-tokenized Muown-family HPO plus 4K top-family replay.
+- `results/fineweb_gpt2_llm50m_muown_plateau8k_20260602/`: selected 8K-step
+  Muown-family plateau replay with 256-batch final validation.
 - `results/cifar10_muown_ema_20260601/`: CIFAR-10 transfer check for Muown and
   EMA-Nesterov against the current AnchorMuon image-classification recipe.
 
@@ -191,6 +195,44 @@ Plots and full CSV:
 `results/fineweb_gpt2_llm50m_plateau8k_20260602/plots/val_loss_curve.png`,
 `results/fineweb_gpt2_llm50m_plateau8k_20260602/plots/val_acc_curve.png`,
 and `results/fineweb_gpt2_llm50m_plateau8k_20260602/plots/step_time_ms_bar.png`.
+
+### GPT-2 Tokenized Muown HPO And 8K Plateau Check
+
+I expanded the tokenized FineWeb run with a focused Muown-family HPO. The setup
+matched the preceding plateau check: `51,045,888`-parameter GPT, FineWeb-Edu
+`gpt2` tokens, `8,000,000` train tokens, `524,288` validation tokens, batch
+`16 x 256`, BF16, WSD with 100-step warmup and 20% decay, sequential
+validation, and two RTX PRO 6000 Blackwell GPUs scheduled one trial per GPU.
+
+HPO ran `197` 600-step candidates covering Muown, EMA-Nesterov+Muown,
+AnchorMuown, EMA-Nesterov+AnchorMuown, and the current AdamW/Muon/AnchorMuon
+reference rows. The selected 4K replay found AnchorMuown promising at
+`mag_lr=0.5x`, but the 8K replay showed the AnchorMuown hybrids reach NaN
+around step 6000. Plain Muown and EMA-Muown stayed finite.
+
+8K selected replay, with 256 sequential final validation batches:
+
+| Rank | Optimizer | Selected config | Full val loss | Full token acc | Step | Throughput |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | Plain Muon | `lr=0.0016`, `wd=0.05` | 4.9570 | 24.79% | 21.27 ms | 192.6k tok/s |
+| 2 | EMA-Nesterov + Muon | `lr=0.0016`, `wd=0.05`, `ema_beta=0.1`, `ema_gamma=0.995` | 4.9585 | 24.82% | 23.34 ms | 175.5k tok/s |
+| 3 | EMA-Nesterov + Muown | `lr=0.0016`, `wd=0`, `ema_beta=0.1`, `ema_gamma=0.995` | 5.0936 | 24.52% | 27.10 ms | 151.1k tok/s |
+| 4 | Muown | `lr=0.0016`, `wd=0` | 5.1003 | 24.51% | 24.89 ms | 164.6k tok/s |
+| 5 | AdamW-Atan2 | `lr=0.0005`, `wd=0.05` | 5.1509 | 24.24% | 16.15 ms | 253.6k tok/s |
+| 6 | AdamW | `lr=0.0005`, `wd=0.05` | 5.1510 | 24.22% | 15.39 ms | 266.1k tok/s |
+| 7 | AnchorMuon | `lr=0.0016`, `row_gamma=0.15`, `soda=0.001`, `fallback=RMS@1.0x` | 5.1607 | 24.91% | 19.86 ms | 206.2k tok/s |
+| 8 | EMA-Nesterov + AnchorMuon | `lr=0.0016`, `row_gamma=0`, `soda=0.003`, `ema_beta=0.3`, `ema_gamma=0.995` | 5.1684 | 24.81% | 22.06 ms | 185.7k tok/s |
+
+Takeaway: Muown beats AdamW on this tokenized LM proxy, but it does not beat
+tuned Muon or EMA-Nesterov+Muon. EMA-Nesterov adds little on top of Muown. The
+AnchorMuown hybrid is not ready for this setup because it becomes numerically
+unstable at longer replay length despite looking good at 4K.
+
+Plots and full CSV:
+`results/fineweb_gpt2_llm50m_muown_plateau8k_20260602/summary.md`,
+`results/fineweb_gpt2_llm50m_muown_plateau8k_20260602/plots/val_loss_curve.png`,
+`results/fineweb_gpt2_llm50m_muown_plateau8k_20260602/plots/val_acc_curve.png`,
+and `results/fineweb_gpt2_llm50m_muown_plateau8k_20260602/plots/step_time_ms_bar.png`.
 
 ### CIFAR-10 Muown / EMA-Nesterov Transfer Check
 
