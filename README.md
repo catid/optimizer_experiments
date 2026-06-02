@@ -337,32 +337,33 @@ check whether the LM-proxy win transferred to image classification.
 Protocol: `vit5_micro`, CIFAR-10 45k/5k train/validation split, official
 10k test evaluated only at the end, batch size 512, seed `123`, BF16 autocast,
 channels-last tensors, 16 dataloader workers, and two RTX PRO 6000 Blackwell
-GPUs scheduled one trial per GPU. HPO used 12 epochs; the best config per
-family was replayed for 50 epochs. Muown and EMA-Nesterov live only in the
-worker CIFAR runner and do not change root `optimizer.py`.
+GPUs scheduled one trial per GPU. The completed hard HPO used 268 candidates
+for 12 epochs; the best config per optimizer family was replayed for 50
+epochs. Muown and EMA-Nesterov live only in the worker CIFAR runner and do not
+change root `optimizer.py`.
 
 | Rank | Family | Selected config | Final val acc | Official test acc | Final val loss | Test loss | Step time | Examples/sec |
 |---:|---|---|---:|---:|---:|---:|---:|---:|
-| 1 | AnchorMuon root | `lr=0.016`, WSD, `row_gamma=0.35`, `pmuon_beta=0.90`, `normuon_beta=0.93`, AdamAtan2 fallback at `0.5x` | 88.32% | 87.98% | 0.3787 | 0.4065 | 17.11 ms | 29.9k |
-| 2 | EMA-Nesterov + Muon | `lr=0.014`, `wd=0.001`, `ema_beta=0.1`, `ema_gamma=0.99` | 86.94% | 86.08% | 0.4754 | 0.5023 | 17.79 ms | 28.8k |
-| 3 | Plain Muon | `lr=0.014`, `wd=0.001`, GramNS | 86.72% | 85.40% | 0.5289 | 0.5582 | 17.08 ms | 30.0k |
-| 4 | Muown | `lr=0.012`, `wd=0`, WSD | 83.36% | 83.56% | 0.4845 | 0.4902 | 20.10 ms | 25.5k |
-| 5 | AdamW | `lr=0.004`, `wd=0.001`, cosine | 79.22% | 79.76% | 0.6158 | 0.6352 | 11.62 ms | 44.1k |
-| 6 | EMA-Nesterov + Muown | `lr=0.012`, `wd=0.001`, `ema_beta=0.1`, `ema_gamma=0.99` | 76.54% | 75.40% | 0.6649 | 0.6954 | 21.18 ms | 24.2k |
+| 1 | AnchorMuon root | `lr=0.016`, WSD, SODA+PMuonEq+NorMuon, AdamAtan2 fallback `0.5x` | 88.48% | 87.85% | 0.3695 | 0.3972 | 16.25 ms | 31.5k |
+| 2 | EMA-Nesterov + Muon | `lr=0.014`, WSD, `wd=0.001`, `ema_beta=0.03`, `ema_gamma=0.995` | 87.72% | 86.99% | 0.4231 | 0.4886 | 18.36 ms | 27.9k |
+| 3 | EMA-Nesterov + Muown | `lr=0.014`, WSD, `wd=0`, `fallback=1.0x`, `mag_lr=1.0x`, `ema_beta=0.15`, `ema_gamma=0.995` | 85.34% | 84.85% | 0.4498 | 0.4657 | 20.79 ms | 24.6k |
+| 4 | Muown | `lr=0.014`, WSD, `wd=0`, `fallback=0.5x`, `mag_lr=1.0x` | 83.24% | 82.61% | 0.5062 | 0.5197 | 19.55 ms | 26.2k |
+| 5 | AdamW | `lr=0.004`, cosine, `wd=0.001` | 79.64% | 79.55% | 0.5998 | 0.6240 | 11.26 ms | 45.5k |
 
 Takeaway: Muown did not transfer to CIFAR-10 as well as it did to the byte-LM
 proxy. The current root AnchorMuon image-classification recipe remains the
-best CIFAR option. EMA-Nesterov + Muon was stable and beat plain Muon on
-official test in this single-seed run, but it still trailed AnchorMuon.
+best CIFAR option. The harder search materially improved EMA-Nesterov + Muown
+versus the earlier narrow pass, but it still trailed EMA-Nesterov + Muon and
+root AnchorMuon.
 
 Result bundle:
-`workers/codex_noradam_confidence/results/cifar10_muown_ema_20260601/`.
+`workers/codex_noradam_confidence/results/cifar10_ema_muown_hard_fixedlr_20260601/`.
 
-![CIFAR-10 Muown / EMA-Nesterov validation accuracy](workers/codex_noradam_confidence/results/cifar10_muown_ema_20260601/final_bins/val_acc.png)
+![CIFAR-10 Muown / EMA-Nesterov validation accuracy](workers/codex_noradam_confidence/results/cifar10_ema_muown_hard_fixedlr_20260601/final_bins/val_acc.png)
 
-![CIFAR-10 Muown / EMA-Nesterov validation loss](workers/codex_noradam_confidence/results/cifar10_muown_ema_20260601/final_bins/val_loss.png)
+![CIFAR-10 Muown / EMA-Nesterov validation loss](workers/codex_noradam_confidence/results/cifar10_ema_muown_hard_fixedlr_20260601/final_bins/val_loss.png)
 
-![CIFAR-10 Muown / EMA-Nesterov step time](workers/codex_noradam_confidence/results/cifar10_muown_ema_20260601/final_bins/step_time_ms_bar.png)
+![CIFAR-10 Muown / EMA-Nesterov step time](workers/codex_noradam_confidence/results/cifar10_ema_muown_hard_fixedlr_20260601/final_bins/step_time_ms_bar.png)
 
 ## FineWeb-Edu 50M LLM WikiText-Transfer Run
 

@@ -123,6 +123,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--only", default="", help="Regex filter for trial names")
     parser.add_argument("--max-trials", type=int, default=0)
+    parser.add_argument(
+        "--skip-completed",
+        action="store_true",
+        help="Supervisor mode: skip trials whose output directory already has summary.json.",
+    )
     parser.add_argument("--data-path", type=Path, default=Path("/home/catid/screen/repos/TinyRecursiveModels/data/cifar10"))
     parser.add_argument("--output-dir", type=Path, default=ROOT / "experiments" / "results" / "cifar10_anchormuon")
     parser.add_argument("--model", default="vit5_micro")
@@ -2107,6 +2112,9 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> None:
     while pending or running:
         while pending and len(running) < gpu_count:
             cfg = pending.pop(0)
+            if args.skip_completed and (output_dir / cfg.name / "summary.json").exists():
+                print(f"[skip] completed trial={cfg.name}", flush=True)
+                continue
             trial_json = output_dir / f"{cfg.name}.trial.json"
             trial_json.write_text(json.dumps(asdict(cfg), indent=2) + "\n")
             cmd = [
