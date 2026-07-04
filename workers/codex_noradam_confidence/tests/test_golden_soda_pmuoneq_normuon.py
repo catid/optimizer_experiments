@@ -4,6 +4,7 @@ import copy
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +44,38 @@ class TinyTiedLM(torch.nn.Module):
         self.proj = torch.nn.Linear(8, 8, bias=False)
         self.lm_head = torch.nn.Linear(8, 11, bias=False)
         self.lm_head.weight = self.wte.weight
+
+
+def test_sparse_gradients_fail_with_clear_error() -> None:
+    embedding = torch.nn.Embedding(16, 8, sparse=True)
+    opt = GoldenSodaPmuonEqNorMuon(
+        [{"params": [embedding.weight], "use_matrix": False}],
+        lr=0.1,
+        warmup_steps=1,
+    )
+
+    loss = embedding(torch.tensor([1, 2, 3])).sum()
+    loss.backward()
+
+    with pytest.raises(RuntimeError, match="does not support sparse gradients"):
+        opt.step()
+
+
+def test_golden_constructor_deduplicates_shared_params_in_raw_inputs() -> None:
+    for params in (
+        lambda p: [p, p],
+        lambda p: [{"params": [p, p], "use_matrix": False}],
+        lambda p: [{"params": p, "use_matrix": False}],
+    ):
+        param = torch.nn.Parameter(torch.ones(1))
+        opt = GoldenSodaPmuonEqNorMuon(params(param), lr=0.1, warmup_steps=1)
+
+        assert sum(candidate is param for group in opt.param_groups for candidate in group["params"]) == 1
+
+        param.grad = torch.ones_like(param)
+        opt.step()
+
+        assert opt.last_stats["fallback_params"] == 1.0
 
 
 def _loss(model: TinyGoldenNet, seed: int) -> torch.Tensor:
@@ -126,6 +159,43 @@ def test_golden_param_groups_are_lm_safe_and_deduplicate_tied_weights() -> None:
     assert sum(id(param) == id(model.wte.weight) for group in groups for param in group["params"]) == 1
 
 
+def test_golden_uses_effective_matrix_shape_for_leading_singleton_params() -> None:
+    torch.manual_seed(15)
+    param = torch.nn.Parameter(torch.randn(1, 6, 8) * 0.02)
+    opt = GoldenSodaPmuonEqNorMuon([param], lr=1e-3, warmup_steps=1)
+
+    param.grad = torch.randn_like(param)
+    opt.step()
+
+    assert opt.last_stats["matrix_params"] == 1.0
+    state = opt.state[param]
+    assert state["row_ema"].shape == (6,)
+    assert state["normuon_second_moment"].shape == (1, 8)
+
+
+def test_golden_fallback_bias_correction_uses_per_parameter_step() -> None:
+    p1 = torch.nn.Parameter(torch.tensor([1.0]))
+    p2 = torch.nn.Parameter(torch.tensor([1.0]))
+    opt = GoldenSodaPmuonEqNorMuon(
+        [{"params": [p1, p2], "use_matrix": False}],
+        lr=0.1,
+        warmup_steps=1,
+        beta2=0.9,
+        eps=1e-10,
+    )
+
+    p1.grad = torch.tensor([1.0])
+    p2.grad = None
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+    p1.grad = None
+    p2.grad = torch.tensor([1.0])
+    opt.step()
+
+    assert torch.allclose(p2.detach(), torch.tensor([0.9]), atol=1e-6, rtol=1e-6)
+    assert opt.state[p2]["fallback_step"] == 1
+
+
 def test_golden_step_keeps_gradients_unchanged_and_state_fp32() -> None:
     torch.manual_seed(6)
     model = TinyGoldenNet()
@@ -167,6 +237,35 @@ def test_golden_state_dict_resume_matches_uninterrupted_step() -> None:
 
     for expected, actual in zip(uninterrupted.parameters(), resumed.parameters()):
         assert torch.allclose(expected, actual, atol=1e-6, rtol=1e-6)
+
+
+def test_golden_bfloat16_state_dict_load_restores_fp32_state() -> None:
+    param = torch.nn.Parameter(torch.randn(4, 4, dtype=torch.bfloat16))
+    opt = GoldenSodaPmuonEqNorMuon(
+        [{"params": [param], "use_matrix": True}],
+        lr=1e-3,
+        warmup_steps=1,
+    )
+    param.grad = torch.randn_like(param)
+    opt.step()
+
+    restored_param = torch.nn.Parameter(param.detach().clone())
+    restored = GoldenSodaPmuonEqNorMuon(
+        [{"params": [restored_param], "use_matrix": True}],
+        lr=1e-3,
+        warmup_steps=1,
+    )
+    restored.load_state_dict(copy.deepcopy(opt.state_dict()))
+
+    restored_param.grad = torch.randn_like(restored_param)
+    restored.step()
+
+    state = restored.state[restored_param]
+    assert state["z"].dtype == torch.float32
+    assert state["soda_init"].dtype == torch.float32
+    assert state["momentum"].dtype == torch.float32
+    assert state["row_ema"].dtype == torch.float32
+    assert state["normuon_second_moment"].dtype == torch.float32
 
 
 def test_golden_train_eval_are_noop_compatibility_methods() -> None:

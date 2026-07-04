@@ -236,8 +236,12 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
         ]
     )
     val_tf = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
-    train = datasets.CIFAR10(args.data_path, train=True, transform=train_tf, download=True)
-    val = datasets.CIFAR10(args.data_path, train=False, transform=val_tf, download=True)
+    train_base = datasets.CIFAR10(args.data_path, train=True, transform=train_tf, download=True)
+    val_base = datasets.CIFAR10(args.data_path, train=True, transform=val_tf, download=True)
+    val_size = min(5_000, max(1, len(train_base) // 10))
+    split = len(train_base) - val_size
+    train = Subset(train_base, list(range(split)))
+    val = Subset(val_base, list(range(split, len(train_base))))
     if 0 < args.train_subset < len(train):
         generator = torch.Generator().manual_seed(args.seed)
         train = Subset(train, torch.randperm(len(train), generator=generator)[: args.train_subset].tolist())
@@ -250,6 +254,26 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
         persistent_workers=args.num_workers > 0,
     )
     return DataLoader(train, shuffle=True, drop_last=True, **kwargs), DataLoader(val, shuffle=False, **kwargs)
+
+
+def total_training_steps(args: argparse.Namespace, train_loader: DataLoader) -> int:
+    total_steps = int(args.epochs) * len(train_loader)
+    if args.max_steps > 0:
+        total_steps = min(total_steps, int(args.max_steps))
+    if total_steps <= 0:
+        raise RuntimeError(
+            "no training steps to run; reduce batch size, disable drop_last by increasing the training subset, "
+            "or increase --epochs"
+        )
+    return total_steps
+
+
+def finite_metric(row: dict, key: str, *, default: float) -> float:
+    try:
+        value = float(row[key])
+    except (KeyError, TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) else default
 
 
 def matrix_filter(name: str, p: torch.nn.Parameter) -> bool:
@@ -338,9 +362,7 @@ def run_worker(args: argparse.Namespace) -> None:
     model = create_model(args.model, pretrained=False, num_classes=10, img_size=32, drop_path_rate=0.05)
     model.to(device=device, memory_format=torch.channels_last)
     optimizer = make_optimizer(model, trial, args)
-    total_steps = args.epochs * len(train_loader)
-    if args.max_steps > 0:
-        total_steps = min(total_steps, args.max_steps)
+    total_steps = total_training_steps(args, train_loader)
     eval_steps = selected_eval_steps(total_steps, args.eval_bins)
     global_step = 0
     best_val_loss = float("inf")
@@ -463,7 +485,13 @@ def summarize(output_dir: Path) -> None:
             writer = csv.DictWriter(handle, fieldnames=keys, lineterminator="\n")
             writer.writeheader()
             writer.writerows(curves)
-    ranked = sorted(summaries, key=lambda row: (row["best_val_loss"], -row["best_val_accuracy"]))
+    ranked = sorted(
+        summaries,
+        key=lambda row: (
+            finite_metric(row, "best_val_loss", default=math.inf),
+            -finite_metric(row, "best_val_accuracy", default=-math.inf),
+        ),
+    )
     lines = [
         "# CIFAR-10 NorMuon Aspect Ablation\n",
         "| trial | best val loss | final val loss | best val acc | final val acc | examples/s | mean step ms |",

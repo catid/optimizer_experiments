@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 
 def _load_models_vit5():
@@ -78,3 +79,21 @@ def test_vit_models_only_requires_square_registers_when_register_rope_enabled():
             rope=True,
             rope_reg=True,
         )
+
+
+def test_generic_vit_models_flash_default_falls_back_on_cpu():
+    models = _load_models_vit5()
+    model = models.vit_models(
+        img_size=32,
+        patch_size=4,
+        embed_dim=48,
+        depth=1,
+        num_heads=3,
+        num_classes=5,
+        rope=False,
+    )
+
+    out = model(torch.randn(2, 3, 32, 32))
+
+    assert out.shape == (2, 5)
+    assert torch.isfinite(out).all()

@@ -369,8 +369,6 @@ class MuownDP(Muown):
                     v_g.mul_(beta2).addcmul_(grad_g, grad_g, value=1 - beta2)
                     bc1 = 1 - beta1**step
                     bc2 = 1 - beta2**step
-                    if weight_decay != 0.0:
-                        g.mul_(1 - lr * weight_decay)
                     g.addcdiv_(m_g / bc1, (v_g / bc2).sqrt().add_(adam_eps), value=-lr)
 
                     state["v_norm"] = _wn_recompose(p.data, g, v_new)

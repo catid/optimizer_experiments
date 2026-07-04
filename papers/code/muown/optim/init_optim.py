@@ -35,7 +35,7 @@ def intialize_optimizer(model, cfg):
             weight_decay=cfg.adamw_weight_decay,
         )
 
-    elif cfg.optim == "muon_torch":
+    elif cfg.optim in ("muon_torch", "muon_vanilla"):
         from torch.optim import Muon as MuonTorch
 
         from optim.muon import split_params_muon_adam

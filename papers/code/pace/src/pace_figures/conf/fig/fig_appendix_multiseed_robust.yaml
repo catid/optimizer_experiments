@@ -1,0 +1,39 @@
+id: fig_appendix_multiseed_robust
+paper: "Fig 17"
+desc: "Seed robustness across 3 models, {const,wsd}, seeds {42,1337,2024}"
+dataset: smoltalk
+
+# 2 schedules (Constant LR, WSD) x 3 models x 3 methods (AdamW/EMA/PACE), each at
+# the model's headline cell, repeated over seeds {42, 1337, 2024} for the mean +
+# min-max band. 3 models x 3 methods x 2 schedules x 3 seeds = 54 runs.
+sweeps:
+  # ---- SmolLM2-1.7B (headline: lr 1e-3, PACE c0.15 k0.2; baselines k0.5) ----
+  - model: smollm2_1.7b
+    base: {method: AdamW, optimizer: {name: adamw, lr: 0.001, lambda_pullback: 0.0}}
+    grid: {schedule: [const, wsd], seed: [42, 1337, 2024]}
+  - model: smollm2_1.7b
+    base: {method: EMA, optimizer: {name: ema, lr: 0.001, lambda_pullback: 0.0, ema_kappa: 0.5}}
+    grid: {schedule: [const, wsd], seed: [42, 1337, 2024]}
+  - model: smollm2_1.7b
+    base: {method: PACE, optimizer: {name: pace, lr: 0.001, lambda_pullback: 0.15, ema_kappa: 0.2}}
+    grid: {schedule: [const, wsd], seed: [42, 1337, 2024]}
+  # ---- Qwen3-1.7B (headline: lr 5e-4, PACE c0.25 k0.5) ----
+  - model: qwen3_1.7b
+    base: {method: AdamW, optimizer: {name: adamw, lr: 0.0005, lambda_pullback: 0.0}}
+    grid: {schedule: [const, wsd], seed: [42, 1337, 2024]}
+  - model: qwen3_1.7b
+    base: {method: EMA, optimizer: {name: ema, lr: 0.0005, lambda_pullback: 0.0, ema_kappa: 0.5}}
+    grid: {schedule: [const, wsd], seed: [42, 1337, 2024]}
+  - model: qwen3_1.7b
+    base: {method: PACE, optimizer: {name: pace, lr: 0.0005, lambda_pullback: 0.25, ema_kappa: 0.5}}
+    grid: {schedule: [const, wsd], seed: [42, 1337, 2024]}
+  # ---- Gemma3-1B (headline: lr 1e-3, PACE c0.15 k0.5) ----
+  - model: gemma3_1b
+    base: {method: AdamW, optimizer: {name: adamw, lr: 0.001, lambda_pullback: 0.0}}
+    grid: {schedule: [const, wsd], seed: [42, 1337, 2024]}
+  - model: gemma3_1b
+    base: {method: EMA, optimizer: {name: ema, lr: 0.001, lambda_pullback: 0.0, ema_kappa: 0.5}}
+    grid: {schedule: [const, wsd], seed: [42, 1337, 2024]}
+  - model: gemma3_1b
+    base: {method: PACE, optimizer: {name: pace, lr: 0.001, lambda_pullback: 0.15, ema_kappa: 0.5}}
+    grid: {schedule: [const, wsd], seed: [42, 1337, 2024]}

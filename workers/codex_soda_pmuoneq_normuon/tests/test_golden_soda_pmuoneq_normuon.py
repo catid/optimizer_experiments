@@ -3,6 +3,7 @@ import sys
 from io import BytesIO
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -43,6 +44,63 @@ class TwoMatrixNet(nn.Module):
         return self.classifier_head(F.gelu(self.right(F.gelu(self.left(x)))))
 
 
+@pytest.mark.parametrize("optimizer_cls", [GoldenSodaPmuonEqNorMuon, SodaPmuonEqNorMuon])
+def test_sparse_gradients_fail_with_clear_error(optimizer_cls: type[torch.optim.Optimizer]) -> None:
+    embedding = nn.Embedding(16, 8, sparse=True)
+    opt = optimizer_cls(
+        [{"params": [embedding.weight], "use_matrix_update": False}],
+        warmup_steps=1,
+    )
+
+    loss = embedding(torch.tensor([1, 2, 3])).sum()
+    loss.backward()
+
+    with pytest.raises(RuntimeError, match="does not support sparse gradients"):
+        opt.step()
+
+
+@pytest.mark.parametrize("optimizer_cls", [GoldenSodaPmuonEqNorMuon, SodaPmuonEqNorMuon])
+def test_bfloat16_state_dict_load_restores_fp32_matrix_state(optimizer_cls: type[torch.optim.Optimizer]) -> None:
+    param = nn.Parameter(torch.randn(4, 4, dtype=torch.bfloat16))
+    fallback = nn.Parameter(torch.randn(4, dtype=torch.bfloat16))
+    opt = optimizer_cls(
+        [
+            {"params": [param], "use_matrix_update": True, "lr": 1e-3},
+            {"params": [fallback], "use_matrix_update": False, "lr": 1e-3},
+        ],
+        warmup_steps=1,
+        use_external_lr=True,
+        ns_compute_dtype=torch.float32,
+    )
+    param.grad = torch.randn_like(param)
+    fallback.grad = torch.randn_like(fallback)
+    opt.step()
+
+    restored_param = nn.Parameter(param.detach().clone())
+    restored_fallback = nn.Parameter(fallback.detach().clone())
+    restored = optimizer_cls(
+        [
+            {"params": [restored_param], "use_matrix_update": True, "lr": 1e-3},
+            {"params": [restored_fallback], "use_matrix_update": False, "lr": 1e-3},
+        ],
+        warmup_steps=1,
+        use_external_lr=True,
+        ns_compute_dtype=torch.float32,
+    )
+    restored.load_state_dict(copy.deepcopy(opt.state_dict()))
+
+    restored_param.grad = torch.randn_like(restored_param)
+    restored_fallback.grad = torch.randn_like(restored_fallback)
+    restored.step()
+
+    state = restored.state[restored_param]
+    fallback_state = restored.state[restored_fallback]
+    assert state["momentum_buffer"].dtype == torch.float32
+    assert state["pmuoneq_row_ema"].dtype == torch.float32
+    assert state["normuon_second_momentum"].dtype == torch.float32
+    assert fallback_state["exp_avg_sq"].dtype == torch.float32
+
+
 def _run_step(model: nn.Module, opt: torch.optim.Optimizer, step: int) -> float:
     torch.manual_seed(1000 + step)
     x = torch.randn(16, 8)
@@ -75,6 +133,38 @@ def test_golden_param_groups_keep_heads_norms_and_embeddings_in_fallback() -> No
     assert "token_embed.weight" in fallback_names
     assert "blocks.0.layernorm.weight" in fallback_names
     assert "blocks.0.mlp.fc1.bias" in fallback_names
+
+
+def test_golden_param_groups_deduplicate_tied_parameter_aliases() -> None:
+    tied = nn.Parameter(torch.zeros(8, 8))
+    groups = build_golden_soda_pmuoneq_normuon_param_groups(
+        [
+            ("token_embed.weight", tied),
+            ("lm_head.weight", tied),
+        ]
+    )
+
+    assert len(groups) == 1
+    assert groups[0]["use_matrix_update"] is False
+    assert groups[0]["params"] == [tied]
+    assert groups[0]["param_names"] == ["token_embed.weight|lm_head.weight"]
+
+
+def test_golden_constructor_deduplicates_shared_params_in_raw_inputs() -> None:
+    for params in (
+        lambda p: [p, p],
+        lambda p: [{"params": [p, p], "use_matrix_update": False}],
+        lambda p: [{"params": p, "use_matrix_update": False}],
+    ):
+        param = nn.Parameter(torch.ones(1))
+        opt = GoldenSodaPmuonEqNorMuon(params(param), warmup_steps=1)
+
+        assert sum(candidate is param for group in opt.param_groups for candidate in group["params"]) == 1
+
+        param.grad = torch.ones_like(param)
+        opt.step()
+
+        assert opt.last_stats["fallback_count"] == 1.0
 
 
 def test_golden_groups_do_not_expose_removed_ablation_flags() -> None:
@@ -115,6 +205,20 @@ def test_golden_step_is_finite_and_creates_only_row_pmuoneq_state() -> None:
     assert "pmuoneq_col_factor" not in state
     assert opt.last_stats["matrix_count"] >= 1
     assert opt.last_stats["fallback_count"] >= 1
+
+
+def test_golden_leading_singleton_param_uses_effective_matrix_shape() -> None:
+    torch.manual_seed(101)
+    param = nn.Parameter(torch.randn(1, 6, 8))
+    groups = build_golden_soda_pmuoneq_normuon_param_groups([("blocks.0.rel.weight", param)])
+    opt = GoldenSodaPmuonEqNorMuon(groups, warmup_steps=1, ns_compute_dtype=torch.float32)
+
+    param.grad = torch.randn_like(param)
+    opt.step()
+
+    state = opt.state[param]
+    assert state["pmuoneq_row_ema"].shape == (6,)
+    assert opt.last_stats["matrix_count"] == 1.0
 
 
 def test_golden_matches_legacy_configured_as_winning_no_aspect_path() -> None:

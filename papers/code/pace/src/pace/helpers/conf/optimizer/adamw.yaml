@@ -1,0 +1,13 @@
+name: adamw
+lr: 1e-3
+betas: [0.9, 0.999]
+eps: 1e-8
+weight_decay: 0.01
+lambda_pullback: 0.0
+clamp_pullback: true
+use_ema_eval: false
+ema_kappa: null
+beta_ema: 0.01
+ema_rho: 0.0
+ema_gamma: 1.0
+ema_update_freq: 1

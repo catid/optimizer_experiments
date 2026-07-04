@@ -96,6 +96,38 @@ def test_worker_hf_token_cache_requires_parent_seeded_cache(tmp_path):
         runner.prepare_text_cache(args, require_existing=True)
 
 
+def test_hf_cache_paths_include_validation_split(monkeypatch, tmp_path):
+    runner = _load_runner()
+    monkeypatch.setattr(runner, "_require_cache_files", lambda *paths: None)
+
+    def args_for(mode: str, val_split: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            tokenizer_mode=mode,
+            cache_dir=tmp_path,
+            hf_dataset="demo/dataset",
+            hf_config="",
+            hf_split="train",
+            hf_val_split=val_split,
+            hf_text_field="text",
+            tokenizer_name="gpt2",
+            tokenizer_add_eos=True,
+            hf_shuffle_buffer=17,
+            seed=777,
+            max_train_bytes=128,
+            max_val_bytes=64,
+            max_train_tokens=128,
+            max_val_tokens=64,
+        )
+
+    byte_validation = runner.prepare_hf_text_cache(args_for("byte", "validation"), require_existing=True)[1]
+    byte_test = runner.prepare_hf_text_cache(args_for("byte", "test"), require_existing=True)[1]
+    token_validation = runner.prepare_hf_text_cache(args_for("hf", "validation"), require_existing=True)[1]
+    token_test = runner.prepare_hf_text_cache(args_for("hf", "test"), require_existing=True)[1]
+
+    assert byte_validation != byte_test
+    assert token_validation != token_test
+
+
 def test_worker_command_forwards_supervisor_seed(monkeypatch, tmp_path):
     runner = _load_runner()
     monkeypatch.setattr(
@@ -193,6 +225,42 @@ def test_ema_nesterov_restores_base_weights_before_step():
     opt.step()
 
     assert float(p.detach()) == pytest.approx(0.8)
+
+
+def test_ema_nesterov_state_dict_remaps_state_to_new_parameters():
+    runner = _load_runner()
+    p = torch.nn.Parameter(torch.tensor([1.0]))
+    base = torch.optim.SGD([p], lr=0.1)
+    opt = runner.EMANesterovOptimizer(
+        base,
+        total_steps=10,
+        beta=1.0,
+        gamma=0.0,
+        warmup_frac=0.0,
+        rest_frac=0.0,
+    )
+    opt.zero_grad()
+    opt.state[p]["ema_delta"].fill_(0.5)
+    state = opt.state_dict()
+
+    p2 = torch.nn.Parameter(torch.tensor([1.0]))
+    base2 = torch.optim.SGD([p2], lr=0.1)
+    opt2 = runner.EMANesterovOptimizer(
+        base2,
+        total_steps=10,
+        beta=1.0,
+        gamma=0.0,
+        warmup_frac=0.0,
+        rest_frac=0.0,
+    )
+    opt2.load_state_dict(state)
+
+    assert p2 in opt2.state
+    assert p not in opt2.state
+    assert torch.equal(opt2.state[p2]["ema_delta"], opt.state[p]["ema_delta"])
+    assert opt2.state[p2]["ema_delta"].data_ptr() != opt.state[p]["ema_delta"].data_ptr()
+    opt2.zero_grad()
+    assert float(p2.detach()) == pytest.approx(1.5)
 
 
 def test_anchor_muown_optimizer_step_keeps_parameters_finite():
@@ -318,6 +386,74 @@ def test_read_csv_rows_supports_selected_final_replay(tmp_path):
         {"name": "muon_a", "family": "muon", "lr": "0.1", "best_val_loss": "2.0"},
         {"name": "muon_b", "family": "muon", "lr": "0.2", "best_val_loss": "1.0"},
     ]
+
+
+def test_final_trials_from_hpo_ignores_nan_best_loss_when_finite_exists():
+    runner = _load_runner()
+    args = SimpleNamespace(final_steps=100, eval_bins=4, warmup_steps=20, seed=7, final_top_per_family=1)
+    hpo_rows = [
+        {"name": "bad_nan", "family": "muon", "lr": 0.1, "best_val_loss": "nan"},
+        {"name": "good_finite", "family": "muon", "lr": 0.2, "best_val_loss": 1.0},
+    ]
+
+    trials = runner.final_trials_from_hpo(args, hpo_rows)
+
+    assert [trial.name for trial in trials] == ["final_good_finite"]
+
+
+def test_final_trials_from_hpo_skips_nonfinite_rows_before_top_k():
+    runner = _load_runner()
+    args = SimpleNamespace(final_steps=100, eval_bins=4, warmup_steps=20, seed=7, final_top_per_family=2)
+    hpo_rows = [
+        {"name": "bad_nan", "family": "muon", "lr": 0.1, "best_val_loss": "nan"},
+        {"name": "good_finite", "family": "muon", "lr": 0.2, "best_val_loss": 1.0},
+    ]
+
+    trials = runner.final_trials_from_hpo(args, hpo_rows)
+
+    assert [trial.name for trial in trials] == ["final_good_finite"]
+
+
+def test_wikitext_smoke_trials_finish_warmup():
+    runner = _load_runner()
+    args = SimpleNamespace(preset="smoke")
+
+    trials = runner.hpo_trials(args)
+
+    assert trials
+    assert all(trial.steps > trial.warmup_steps for trial in trials)
+    assert all(
+        runner.lr_scale(
+            trial.warmup_steps + 1,
+            trial.steps,
+            trial.warmup_steps,
+            trial.final_lr_scale,
+            trial.wsd_decay_frac,
+        )
+        == 1.0
+        for trial in trials
+    )
+
+
+def test_wikitext_smoke_final_replay_stays_smoke_sized():
+    runner = _load_runner()
+    smoke_args = SimpleNamespace(preset="smoke")
+    hpo_rows = [vars(trial).copy() for trial in runner.hpo_trials(smoke_args)]
+    final_args = SimpleNamespace(
+        preset="smoke",
+        final_steps=800,
+        eval_bins=2,
+        warmup_steps=100,
+        seed=7,
+        final_top_per_family=1,
+    )
+
+    trials = runner.final_trials_from_hpo(final_args, hpo_rows)
+
+    assert trials
+    assert {trial.steps for trial in trials} == {4}
+    assert {trial.eval_every for trial in trials} == {2}
+    assert {trial.warmup_steps for trial in trials} == {1}
 
 
 def test_finite_metric_sorts_nan_like_missing_value():

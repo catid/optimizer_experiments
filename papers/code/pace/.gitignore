@@ -1,0 +1,31 @@
+# training / figure outputs
+runs/
+figures/rendered/
+outputs/
+multirun/
+wandb/
+*.pt
+*.ckpt
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# os
+.DS_Store
+
+# cluster-internal validation tooling
+scripts/smoke.sbatch
+scripts/verify_repo.sh
+scripts/figtest.sbatch
+tests/figtest.py
+
+# no bundled data in the repo (reproduction uses the static config map + pace-train)
+data/
+
+# durable local test artifacts (revisitable; references cluster paths)
+test_results/

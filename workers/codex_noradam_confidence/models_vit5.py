@@ -58,9 +58,10 @@ class Attention(nn.Module):
             q = torch.cat((q[:, :1], q[:, 1: reg_idx], self.rope_reg(q[:, reg_idx:])), dim=1)
             k = torch.cat((k[:, :1], k[:, 1: reg_idx], self.rope_reg(k[:, reg_idx:])), dim=1)
         
-        if self.flash:
+        flash_func = globals().get("flash_attn_qkvpacked_func")
+        if self.flash and qkv.is_cuda and flash_func is not None:
             qkv = torch.stack([q, k, v], dim=2)
-            x = flash_attn_qkvpacked_func(qkv).reshape(B, N, C)
+            x = flash_func(qkv).reshape(B, N, C)
         else:
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             q = q * self.scale

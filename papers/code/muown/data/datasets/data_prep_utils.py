@@ -95,8 +95,7 @@ def concat_chunck(examples: Dict[str, List[Any]], max_seq_length) -> Dict[str, L
     # Concatenate all texts.
     concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
     total_length = len(concatenated_examples[list(examples.keys())[0]])
-    if total_length >= max_seq_length:
-        total_length = (total_length // max_seq_length) * max_seq_length
+    total_length = (total_length // max_seq_length) * max_seq_length
 
     # Split by chunks of max_len.
     result = {

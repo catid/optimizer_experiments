@@ -1,0 +1,19 @@
+id: fig_appendix_train_curves
+paper: "Fig 7"
+desc: "Training-loss comparison (PACE / AdamW / EMA), SmolLM2-135M & Qwen3-1.7B"
+dataset: smoltalk
+
+# Best-of-method (lowest final val) at each model's matched learning rate, the
+# same runs as the body Fig 4 but plotting train_loss. non-PACE/AdamW/EMA baselines omitted.
+# per the PACE-repo rule (only AdamW / EMA / PACE are reproduced here).
+#   SmolLM2-135M: matched lr 5e-3   |   Qwen3-1.7B: matched lr 3e-4
+# Picked configs verified from the fig4 best-of-method selection.
+curves:
+  # ---- SmolLM2-135M (matched lr 5e-3) ----
+  - {model: smollm2_135m, method: AdamW, schedule: const, seed: 42, optimizer: {name: adamw, lr: 0.005, lambda_pullback: 0.0}}
+  - {model: smollm2_135m, method: EMA,   schedule: const, seed: 42, optimizer: {name: ema,   lr: 0.005, lambda_pullback: 0.0,  ema_kappa: 0.5}}
+  - {model: smollm2_135m, method: PACE,  schedule: const, seed: 42, optimizer: {name: pace,  lr: 0.005, lambda_pullback: 0.01, ema_kappa: 0.5}}
+  # ---- Qwen3-1.7B (matched lr 3e-4) ----
+  - {model: qwen3_1.7b,   method: AdamW, schedule: const, seed: 42, optimizer: {name: adamw, lr: 0.0003, lambda_pullback: 0.0}}
+  - {model: qwen3_1.7b,   method: EMA,   schedule: const, seed: 42, optimizer: {name: ema,   lr: 0.0003, lambda_pullback: 0.0,  ema_kappa: 0.7}}
+  - {model: qwen3_1.7b,   method: PACE,  schedule: const, seed: 42, optimizer: {name: pace,  lr: 0.0003, lambda_pullback: 0.25, ema_kappa: 0.7}}

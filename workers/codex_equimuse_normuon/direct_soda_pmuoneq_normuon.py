@@ -260,12 +260,41 @@ POLAR_EXPRESS_COEFFICIENTS: tuple[tuple[float, float, float], ...] = tuple(
 
 
 @torch.no_grad()
+def _effective_matrix_shape(x: torch.Tensor) -> tuple[int, ...]:
+    return tuple(int(dim) for dim in x.shape if int(dim) > 1)
+
+
+@torch.no_grad()
+def _has_matrix_shape(x: torch.Tensor) -> bool:
+    return len(_effective_matrix_shape(x)) >= 2
+
+
+def _fp32_state_tensor(
+    state: dict[str, Any],
+    key: str,
+    *,
+    shape: tuple[int, ...],
+    device: torch.device,
+    fill: float,
+) -> torch.Tensor:
+    value = state.get(key)
+    if isinstance(value, torch.Tensor) and tuple(value.shape) == shape:
+        if value.device != device or value.dtype != torch.float32:
+            value = state[key] = value.to(device=device, dtype=torch.float32)
+        return value
+    value = torch.full(shape, fill, device=device, dtype=torch.float32)
+    state[key] = value
+    return value
+
+
+@torch.no_grad()
 def _matrix_view(x: torch.Tensor) -> torch.Tensor:
-    if x.ndim < 2:
-        raise ValueError("matrix update requires a tensor with ndim >= 2")
-    if x.ndim == 2:
-        return x
-    return x.reshape(x.shape[0], -1)
+    effective_shape = _effective_matrix_shape(x)
+    if len(effective_shape) < 2:
+        raise ValueError("matrix update requires at least two non-singleton dimensions")
+    if len(effective_shape) == 2:
+        return x.reshape(effective_shape)
+    return x.reshape(effective_shape[0], math.prod(effective_shape[1:]))
 
 
 @torch.no_grad()
@@ -556,8 +585,10 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             seen_params: set[int] = set()
             deduped_groups: list[dict[str, Any]] = []
             for group in groups:
-                params_in = list(group["params"])
+                params_value = group["params"]
+                params_in = [params_value] if isinstance(params_value, torch.Tensor) else list(params_value)
                 names_in = list(group.get("param_names", []))
+                keep_names = len(names_in) == len(params_in)
                 params_out: list[torch.Tensor] = []
                 names_out: list[str] = []
                 for idx, p in enumerate(params_in):
@@ -565,13 +596,15 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
                         continue
                     seen_params.add(id(p))
                     params_out.append(p)
-                    if names_in:
+                    if keep_names:
                         names_out.append(names_in[idx])
                 if not params_out:
                     continue
                 group["params"] = params_out
-                if names_in:
+                if keep_names:
                     group["param_names"] = names_out
+                else:
+                    group.pop("param_names", None)
                 group.setdefault("use_matrix_update", group.get("use_muon", False))
                 is_matrix = bool(group["use_matrix_update"])
                 group.setdefault("lr", matrix_lr if is_matrix else adam_lr)
@@ -605,7 +638,7 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             if id(p) in seen_params:
                 continue
             seen_params.add(id(p))
-            if p.requires_grad and p.ndim >= 2:
+            if p.requires_grad and _has_matrix_shape(p):
                 matrix_params.append(p)
             else:
                 fallback_params.append(p)
@@ -665,9 +698,13 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
 
     def _pre_matrix_source(self, p: torch.Tensor, grad: torch.Tensor, momentum_beta: float) -> tuple[torch.Tensor, torch.Tensor]:
         state = self.state[p]
-        momentum = state.get("momentum_buffer")
-        if momentum is None or momentum.shape != grad.shape or momentum.device != grad.device:
-            momentum = state["momentum_buffer"] = torch.zeros_like(grad, dtype=torch.float32)
+        momentum = _fp32_state_tensor(
+            state,
+            "momentum_buffer",
+            shape=tuple(grad.shape),
+            device=grad.device,
+            fill=0.0,
+        )
         g = grad.detach().to(torch.float32)
         momentum.lerp_(g, 1.0 - momentum_beta)
         source = torch.lerp(g, momentum, momentum_beta)
@@ -682,22 +719,18 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         normuon_mode: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         state = self.state[p]
-        row_ema = state.get("pmuoneq_row_ema")
-        if row_ema is None or row_ema.shape != (rows,) or row_ema.device != device:
-            row_ema = state["pmuoneq_row_ema"] = torch.ones(rows, device=device, dtype=torch.float32)
-        col_ema = state.get("pmuoneq_col_ema")
-        if col_ema is None or col_ema.shape != (cols,) or col_ema.device != device:
-            col_ema = state["pmuoneq_col_ema"] = torch.ones(cols, device=device, dtype=torch.float32)
-        row_factor = state.get("pmuoneq_row_factor")
-        if row_factor is None or row_factor.shape != (rows,) or row_factor.device != device:
-            row_factor = state["pmuoneq_row_factor"] = torch.ones(rows, device=device, dtype=torch.float32)
-        col_factor = state.get("pmuoneq_col_factor")
-        if col_factor is None or col_factor.shape != (cols,) or col_factor.device != device:
-            col_factor = state["pmuoneq_col_factor"] = torch.ones(cols, device=device, dtype=torch.float32)
-        second = state.get("normuon_second_momentum")
+        row_ema = _fp32_state_tensor(state, "pmuoneq_row_ema", shape=(rows,), device=device, fill=1.0)
+        col_ema = _fp32_state_tensor(state, "pmuoneq_col_ema", shape=(cols,), device=device, fill=1.0)
+        row_factor = _fp32_state_tensor(state, "pmuoneq_row_factor", shape=(rows,), device=device, fill=1.0)
+        col_factor = _fp32_state_tensor(state, "pmuoneq_col_factor", shape=(cols,), device=device, fill=1.0)
         second_shape = _normuon_second_shape(rows, cols, normuon_mode)
-        if second is None or second.shape != second_shape or second.device != device:
-            second = state["normuon_second_momentum"] = torch.zeros(*second_shape, device=device, dtype=torch.float32)
+        second = _fp32_state_tensor(
+            state,
+            "normuon_second_momentum",
+            shape=second_shape,
+            device=device,
+            fill=0.0,
+        )
         return row_ema, col_ema, row_factor, col_factor, second
 
     def _transform_matrix_bucket(
@@ -762,7 +795,9 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
             grad = p.grad
             if grad is None:
                 continue
-            if grad.ndim < 2:
+            if grad.is_sparse:
+                raise RuntimeError("SodaPmuonEqNorMuon does not support sparse gradients")
+            if not _has_matrix_shape(grad):
                 fallback_count += self._step_fallback_param(p, group, lr=lr, t=t)
                 continue
             anchor = self._soda_anchor(p)
@@ -802,9 +837,14 @@ class SodaPmuonEqNorMuon(torch.optim.Optimizer):
         grad = p.grad
         if grad is None:
             return 0
+        if grad.is_sparse:
+            raise RuntimeError("SodaPmuonEqNorMuon does not support sparse gradients")
         state = self.state[p]
         exp_avg_sq = state.get("exp_avg_sq")
-        if exp_avg_sq is None or exp_avg_sq.shape != p.shape or exp_avg_sq.device != p.device:
+        if isinstance(exp_avg_sq, torch.Tensor) and exp_avg_sq.shape == p.shape:
+            if exp_avg_sq.device != p.device or exp_avg_sq.dtype != torch.float32:
+                exp_avg_sq = state["exp_avg_sq"] = exp_avg_sq.to(device=p.device, dtype=torch.float32)
+        else:
             exp_avg_sq = state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
             state["step"] = 0
         state["step"] = int(state.get("step", 0)) + 1
@@ -899,24 +939,29 @@ def build_soda_pmuoneq_normuon_param_groups(
     matrix_names: list[str] = []
     fallback_params: list[torch.nn.Parameter] = []
     fallback_names: list[str] = []
-    seen_params: set[int] = set()
+    unique: dict[int, tuple[torch.nn.Parameter, list[str]]] = {}
 
     for name, p in named_parameters:
         if not p.requires_grad:
             continue
-        if id(p) in seen_params:
-            continue
-        seen_params.add(id(p))
-        if matrix_filter is not None:
-            use_matrix = bool(matrix_filter(name, p))
+        key = id(p)
+        if key not in unique:
+            unique[key] = (p, [name])
         else:
-            use_matrix = p.ndim >= 2 and not _is_default_fallback_name(name)
+            unique[key][1].append(name)
+
+    for p, names in unique.values():
+        if matrix_filter is not None:
+            use_matrix = any(bool(matrix_filter(name, p)) for name in names)
+        else:
+            use_matrix = _has_matrix_shape(p) and not any(_is_default_fallback_name(name) for name in names)
+        display_name = "|".join(names)
         if use_matrix:
             matrix_params.append(p)
-            matrix_names.append(name)
+            matrix_names.append(display_name)
         else:
             fallback_params.append(p)
-            fallback_names.append(name)
+            fallback_names.append(display_name)
 
     groups: list[dict[str, Any]] = []
     if matrix_params:

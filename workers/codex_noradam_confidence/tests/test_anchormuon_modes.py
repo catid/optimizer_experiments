@@ -4,7 +4,9 @@ import copy
 import math
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +24,7 @@ from optim_anchormuon import (
     pmuon_eq_precondition,
 )
 from optim_factory import _anchor_param_groups
+from optim_factory import create_optimizer
 
 
 class TinyNet(torch.nn.Module):
@@ -37,6 +40,38 @@ class TinyNet(torch.nn.Module):
         x = self.linear1(x)
         x = self.norm(x).relu()
         return self.linear2(x)
+
+
+def test_sparse_gradients_fail_with_clear_error() -> None:
+    embedding = torch.nn.Embedding(16, 8, sparse=True)
+    opt = AnchorMuon(
+        [{"params": [embedding.weight], "use_muon": False}],
+        lr=0.1,
+        warmup_steps=1,
+    )
+
+    loss = embedding(torch.tensor([1, 2, 3])).sum()
+    loss.backward()
+
+    with pytest.raises(RuntimeError, match="does not support sparse gradients"):
+        opt.step()
+
+
+def test_constructor_deduplicates_shared_params_in_raw_inputs() -> None:
+    for params in (
+        lambda p: [p, p],
+        lambda p: [{"params": [p, p], "use_muon": False}],
+        lambda p: [{"params": p, "use_muon": False}],
+    ):
+        param = torch.nn.Parameter(torch.ones(1))
+        opt = AnchorMuon(params(param), lr=0.1, warmup_steps=1, amuse=False)
+
+        assert sum(candidate is param for group in opt.param_groups for candidate in group["params"]) == 1
+
+        param.grad = torch.ones_like(param)
+        opt.step()
+
+        assert opt.last_stats["params"] == 1.0
 
 
 def _loss(model: TinyNet) -> torch.Tensor:
@@ -122,6 +157,31 @@ def test_leading_singleton_matrix_params_use_effective_matrix_shape() -> None:
     assert state["row_ema"].shape == (6,)
     assert state["col_ema"].shape == (8,)
     assert opt.last_stats["matrix_params"] == 1
+
+
+def test_fallback_bias_correction_uses_per_parameter_step() -> None:
+    p1 = torch.nn.Parameter(torch.tensor([1.0]))
+    p2 = torch.nn.Parameter(torch.tensor([1.0]))
+    opt = AnchorMuon(
+        [{"params": [p1, p2], "use_muon": False}],
+        lr=0.1,
+        betas=(0.0, 0.9),
+        warmup_steps=1,
+        amuse=False,
+        soda="none",
+        weight_decay=0.0,
+    )
+
+    p1.grad = torch.tensor([1.0])
+    p2.grad = None
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+    p1.grad = None
+    p2.grad = torch.tensor([1.0])
+    opt.step()
+
+    assert torch.allclose(p2.detach(), torch.tensor([0.9]), atol=1e-6, rtol=1e-6)
+    assert opt.state[p2]["fallback_step"] == 1
 
 
 def test_normuon_normalizes_rows_or_columns_and_preserves_norm() -> None:
@@ -318,6 +378,98 @@ def test_reported_recipe_state_dict_resume_matches_uninterrupted_step() -> None:
         assert torch.allclose(p_expected, p_actual, atol=1e-6, rtol=1e-6)
     for group_expected, group_actual in zip(opt_uninterrupted.param_groups, opt_resumed.param_groups):
         assert group_expected["anchor_step"] == group_actual["anchor_step"]
+
+
+def test_bfloat16_state_dict_load_restores_fp32_anchor_state() -> None:
+    param = torch.nn.Parameter(torch.randn(4, 4, dtype=torch.bfloat16))
+    opt = AnchorMuon(
+        [{"params": [param], "use_muon": True}],
+        lr=1e-3,
+        warmup_steps=1,
+        normuon=True,
+    )
+    param.grad = torch.randn_like(param)
+    opt.step()
+
+    restored_param = torch.nn.Parameter(param.detach().clone())
+    restored = AnchorMuon(
+        [{"params": [restored_param], "use_muon": True}],
+        lr=1e-3,
+        warmup_steps=1,
+        normuon=True,
+    )
+    restored.load_state_dict(copy.deepcopy(opt.state_dict()))
+
+    restored_param.grad = torch.randn_like(restored_param)
+    restored.step()
+
+    state = restored.state[restored_param]
+    assert state["z"].dtype == torch.float32
+    assert state["soda_init"].dtype == torch.float32
+    assert state["momentum"].dtype == torch.float32
+    assert state["row_ema"].dtype == torch.float32
+    assert state["col_ema"].dtype == torch.float32
+    assert state["normuon_second_moment"].dtype == torch.float32
+
+
+def test_eval_mode_survives_state_dict_round_trip() -> None:
+    p = torch.nn.Parameter(torch.tensor([1.0, -2.0, 3.0]))
+    opt = AnchorMuon([p], lr=0.1, warmup_steps=2)
+    for grad in (
+        torch.tensor([0.3, -0.2, 0.1]),
+        torch.tensor([0.1, 0.2, -0.3]),
+        torch.tensor([-0.1, 0.2, 0.3]),
+    ):
+        p.grad = grad
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+    opt.eval()
+    eval_value = p.detach().clone()
+
+    restored_param = torch.nn.Parameter(eval_value.clone())
+    restored = AnchorMuon([restored_param], lr=0.1, warmup_steps=2)
+    restored.load_state_dict(copy.deepcopy(opt.state_dict()))
+
+    assert restored._train_mode is False
+    restored.train()
+    assert not torch.allclose(restored_param.detach(), eval_value)
+
+
+def test_optimizer_factory_accepts_none_opt_eps_for_anchormuon() -> None:
+    model = torch.nn.Linear(4, 3)
+    args = SimpleNamespace(
+        opt="anchormuon",
+        opt_betas=None,
+        opt_eps=None,
+        weight_decay=0.0,
+        lr=1e-3,
+        anchor_beta1=0.9,
+        anchor_beta2=0.95,
+        anchor_rho=0.8,
+        anchor_warmup_steps=2,
+        anchor_use_external_lr=False,
+        anchor_amuse=True,
+        anchor_momentum=0.95,
+        anchor_pmuon_beta=0.95,
+        anchor_pmuon_eq=True,
+        anchor_row_gamma=0.2,
+        anchor_col_gamma=0.0,
+        anchor_mimuon=False,
+        anchor_mimuon_mix=0.85,
+        anchor_normuon=False,
+        anchor_normuon_aspect_scale=False,
+        anchor_normuon_beta=0.95,
+        anchor_normuon_eps=1e-10,
+        anchor_pmuon_eps=1e-6,
+        anchor_ns_steps=5,
+        anchor_soda="matrix",
+        anchor_min_matrix_dim=2,
+    )
+
+    opt = create_optimizer(args, model)
+
+    assert isinstance(opt, AnchorMuon)
+    assert all(group["eps"] == 1e-8 for group in opt.param_groups)
 
 
 def test_eval_train_swap_roundtrip() -> None:

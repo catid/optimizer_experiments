@@ -41,11 +41,18 @@ def _as_float(x: Tensor) -> Tensor:
     return x.detach().float()
 
 
+def _effective_matrix_shape(x: Tensor) -> tuple[int, ...]:
+    return tuple(int(dim) for dim in x.shape if int(dim) > 1)
+
+
 def _matrix_view(x: Tensor) -> tuple[Tensor, tuple[int, ...]]:
-    if x.ndim < 2:
-        raise ValueError("matrix view requires a tensor with ndim >= 2")
+    effective_shape = _effective_matrix_shape(x)
+    if len(effective_shape) < 2:
+        raise ValueError("matrix view requires at least two non-singleton dimensions")
     shape = tuple(x.shape)
-    return x.reshape(x.shape[0], -1), shape
+    rows = effective_shape[0]
+    cols = math.prod(effective_shape[1:])
+    return x.reshape(rows, cols), shape
 
 
 def _restore_matrix_view(x: Tensor, shape: tuple[int, ...]) -> Tensor:
@@ -69,6 +76,48 @@ def _state_tensor(
     value = torch.full(shape, fill, device=device, dtype=torch.float32)
     state[key] = value
     return value
+
+
+def _dedupe_optimizer_params(params: Iterable[Tensor] | Iterable[dict[str, Any]]) -> list[Any]:
+    items = list(params)
+    if not items:
+        return items
+    seen: set[int] = set()
+    if isinstance(items[0], dict):
+        groups: list[dict[str, Any]] = []
+        for original in items:
+            group = dict(original)
+            params_value = group["params"]
+            params_in = [params_value] if isinstance(params_value, Tensor) else list(params_value)
+            names_in = list(group.get("param_names", []))
+            keep_names = len(names_in) == len(params_in)
+            params_out: list[Tensor] = []
+            names_out: list[str] = []
+            for idx, param in enumerate(params_in):
+                if id(param) in seen:
+                    continue
+                seen.add(id(param))
+                params_out.append(param)
+                if keep_names:
+                    names_out.append(names_in[idx])
+            if not params_out:
+                continue
+            group["params"] = params_out
+            if keep_names:
+                group["param_names"] = names_out
+            else:
+                group.pop("param_names", None)
+            groups.append(group)
+        return groups
+
+    params_out: list[Any] = []
+    for param in items:
+        if isinstance(param, Tensor):
+            if id(param) in seen:
+                continue
+            seen.add(id(param))
+        params_out.append(param)
+    return params_out
 
 
 @torch.no_grad()
@@ -120,15 +169,16 @@ def _is_embedding_name(name: str) -> bool:
 
 
 def _should_use_matrix_path(name: str, param: Tensor, *, min_matrix_dim: int) -> bool:
-    if param.ndim < 2 or not param.is_floating_point():
+    effective_shape = _effective_matrix_shape(param)
+    if len(effective_shape) < 2 or not param.is_floating_point():
         return False
     lowered = name.lower()
     if name.endswith(".bias") or "norm" in lowered or "ln_" in lowered or "layernorm" in lowered:
         return False
     if _is_embedding_name(name) or _is_head_name(name):
         return False
-    rows = int(param.shape[0])
-    cols = int(param.numel() // max(rows, 1))
+    rows = effective_shape[0]
+    cols = math.prod(effective_shape[1:])
     return min(rows, cols) >= int(min_matrix_dim)
 
 
@@ -227,7 +277,7 @@ class GoldenSodaPmuonEqNorMuon(torch.optim.Optimizer):
             use_matrix=None,
             step=0,
         )
-        super().__init__(params, defaults)
+        super().__init__(_dedupe_optimizer_params(params), defaults)
         self.last_stats: dict[str, float] = {}
 
     def train(self) -> "GoldenSodaPmuonEqNorMuon":
@@ -248,25 +298,32 @@ class GoldenSodaPmuonEqNorMuon(torch.optim.Optimizer):
         return step, lr
 
     def _use_matrix_for_param(self, group: dict[str, Any], param: Tensor) -> bool:
+        effective_shape = _effective_matrix_shape(param)
         explicit = group.get("use_matrix", None)
         if explicit is not None:
-            return bool(explicit)
-        if param.ndim < 2:
+            return bool(explicit) and len(effective_shape) >= 2
+        if len(effective_shape) < 2:
             return False
-        rows = int(param.shape[0])
-        cols = int(param.numel() // max(rows, 1))
+        rows = effective_shape[0]
+        cols = math.prod(effective_shape[1:])
         return min(rows, cols) >= int(group["min_matrix_dim"])
 
     def _ensure_common_state(self, param: Tensor, state: dict[str, Any]) -> tuple[Tensor, Tensor]:
-        if "z" not in state or tuple(state["z"].shape) != tuple(param.shape) or state["z"].device != param.device:
-            state["z"] = _as_float(param).clone(memory_format=torch.preserve_format)
+        z = state.get("z")
+        if isinstance(z, Tensor) and tuple(z.shape) == tuple(param.shape):
+            if z.device != param.device or z.dtype != torch.float32:
+                z = state["z"] = z.to(device=param.device, dtype=torch.float32)
+        else:
+            z = state["z"] = _as_float(param).clone(memory_format=torch.preserve_format)
+        init = state.get("soda_init")
         if (
-            "soda_init" not in state
-            or tuple(state["soda_init"].shape) != tuple(param.shape)
-            or state["soda_init"].device != param.device
+            not isinstance(init, Tensor)
+            or tuple(init.shape) != tuple(param.shape)
         ):
-            state["soda_init"] = _as_float(param).clone(memory_format=torch.preserve_format)
-        return state["z"], state["soda_init"]
+            init = state["soda_init"] = _as_float(param).clone(memory_format=torch.preserve_format)
+        elif init.device != param.device or init.dtype != torch.float32:
+            init = state["soda_init"] = init.to(device=param.device, dtype=torch.float32)
+        return z, init
 
     def _ensure_matrix_state(self, param: Tensor, state: dict[str, Any]) -> tuple[Tensor, Tensor, Tensor]:
         matrix, _ = _matrix_view(param)
@@ -327,8 +384,10 @@ class GoldenSodaPmuonEqNorMuon(torch.optim.Optimizer):
     def _fallback_update(self, grad: Tensor, group: dict[str, Any], state: dict[str, Any], step: int, param: Tensor) -> Tensor:
         exp_avg_sq = self._ensure_fallback_state(param, state)
         beta2 = float(group["beta2"])
+        state["fallback_step"] = int(state.get("fallback_step", 0)) + 1
+        fallback_step = int(state["fallback_step"])
         exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-        denom = (exp_avg_sq / max(1.0 - beta2**step, float(group["eps"]))).sqrt().add_(float(group["eps"]))
+        denom = (exp_avg_sq / max(1.0 - beta2**fallback_step, float(group["eps"]))).sqrt().add_(float(group["eps"]))
         return grad / denom
 
     @torch.no_grad()
@@ -349,6 +408,8 @@ class GoldenSodaPmuonEqNorMuon(torch.optim.Optimizer):
             for param in group["params"]:
                 if param.grad is None:
                     continue
+                if param.grad.is_sparse:
+                    raise RuntimeError("GoldenSodaPmuonEqNorMuon does not support sparse gradients")
                 total_params += 1
                 grad = _as_float(param.grad)
                 state = self.state[param]

@@ -688,7 +688,7 @@ def training_loop_per_worker(config):
 
 
         if args.grad_clipping_norm != 0.0:
-            torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping_norm)
+            torch.nn.utils.clip_grad_norm_(list(opt_utils.trainable_tensors(trainable_params)), args.grad_clipping_norm)
 
         
         optimizer.step()

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from timm.optim import create_optimizer as create_timm_optimizer
-
 from optim_anchormuon import AnchorMuon
 
 
@@ -39,9 +37,12 @@ def create_optimizer(args, model):
 
     opt_name = args.opt.lower()
     if opt_name not in {"anchormuon", "anchor_muon", "anchor-muon"}:
+        from timm.optim import create_optimizer as create_timm_optimizer
+
         return create_timm_optimizer(args, model)
 
     betas = tuple(args.opt_betas) if args.opt_betas is not None else (0.9, 0.95)
+    opt_eps = 1e-8 if args.opt_eps is None else float(args.opt_eps)
     return AnchorMuon(
         _anchor_param_groups(model, float(args.weight_decay)),
         lr=float(args.lr),
@@ -63,7 +64,7 @@ def create_optimizer(args, model):
         normuon_beta=float(args.anchor_normuon_beta),
         normuon_aspect_scale=bool(getattr(args, "anchor_normuon_aspect_scale", False)),
         normuon_eps=float(args.anchor_normuon_eps),
-        eps=float(args.opt_eps),
+        eps=opt_eps,
         pmuon_eps=float(args.anchor_pmuon_eps),
         ns_steps=int(args.anchor_ns_steps),
         soda=args.anchor_soda,

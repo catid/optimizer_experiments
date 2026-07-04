@@ -1,0 +1,35 @@
+id: fig3_135m_grid
+paper: "Fig 3"
+desc: "SmolLM2-135M: update-frequency x pullback-strength grid (kappa=0.3)"
+dataset: smoltalk
+
+# Body Fig 3 plots the kappa=0.3 row of the exp13 SmolLM2-135M smoltalk sweep:
+# PACE over (lr x c x update_freq), plus matched AdamW and EMA reference points.
+# Exact sweep grid is from exp13 run.py:
+#   LRS=[0.001,0.0015,0.002,0.003,0.005], CS=[1e-4,1e-3,3e-3,1e-2,3e-2,0.1,0.3],
+#   KAPPA=0.3, UFS=[1,5,10], const schedule, seed 42, ema_update_freq swept.
+
+# PACE: full (lr x c x uf) grid at kappa=0.3
+sweep:
+  model: smollm2_135m
+  base: {method: PACE, optimizer: {name: pace, ema_kappa: 0.3}, schedule: const, seed: 42}
+  grid:
+    optimizer.lr: [0.001, 0.0015, 0.002, 0.003, 0.005]
+    optimizer.lambda_pullback: [0.0001, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3]
+    optimizer.ema_update_freq: [1, 5, 10]
+
+# EMA reference points (c=0) at kappa=0.3, per lr x uf
+sweeps:
+  - model: smollm2_135m
+    base: {method: EMA, optimizer: {name: ema, lambda_pullback: 0.0, ema_kappa: 0.3}, schedule: const, seed: 42}
+    grid:
+      optimizer.lr: [0.001, 0.0015, 0.002, 0.003, 0.005]
+      optimizer.ema_update_freq: [1, 5, 10]
+
+# AdamW reference points (one per lr)
+curves:
+  - {model: smollm2_135m, method: AdamW, schedule: const, seed: 42, optimizer: {name: adamw, lr: 0.001,  lambda_pullback: 0.0}}
+  - {model: smollm2_135m, method: AdamW, schedule: const, seed: 42, optimizer: {name: adamw, lr: 0.0015, lambda_pullback: 0.0}}
+  - {model: smollm2_135m, method: AdamW, schedule: const, seed: 42, optimizer: {name: adamw, lr: 0.002,  lambda_pullback: 0.0}}
+  - {model: smollm2_135m, method: AdamW, schedule: const, seed: 42, optimizer: {name: adamw, lr: 0.003,  lambda_pullback: 0.0}}
+  - {model: smollm2_135m, method: AdamW, schedule: const, seed: 42, optimizer: {name: adamw, lr: 0.005,  lambda_pullback: 0.0}}

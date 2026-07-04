@@ -1,0 +1,102 @@
+\section{Algorithm Derivation and Guarantees}\label{sec:theory}
+\iftoggle{colt}{}
+{
+In this section, we formally introduce the problem in which we are interested as well as derive a rigorous solution in a simplified setting.  We then demonstrate that a simple, heuristic approximation to this solution has convergence guarantees for convex problems and provably outperforms standard SGD in the quadratic setting.
+}
+
+\subsection{Formal Problem Setup}\label{ssec:problem_setup}
+Formally, we are interested in \emph{stochastic optimization}, where for some loss function $F: \rr^d \to \rr$ with minimum $\mustar = \argmin_{\theta} F(\theta)$, we wish to return some $\thetahat$ that is close to $\mustar$.  As is standard in the stochastic optimization literature \citep{polyak1992acceleration,ruppert1988efficient,defazio2024schedule,block2024butterfly,loshchilov2017fixing}, we will assume only that we have noisy gradient access to $F$, i.e., for any $\theta \in \rr^d$, we can sample some $g$ such that $\ee[g] = \nabla F(\theta)$.
+
+Our starting point is to recall the following empirical observation about the behavior of language model training: iterate averaging schemes like \ema\ and \bema\ are extraordinarily effective at improving the performance of LMs, both through stabilizing the optimization and through improving generalization \citep{izmailov2018averaging,kaddour2022stop,olmo20242}. While there has been a large body of work dedicated to understanding and improving such iterate averaging schemes, we instead focus on the question of how to improve training algorithms under the assumption that we will be returning an iterate average.  In particular, we ask the following fundamental question:
+\begin{quotation}
+    \emph{Given that we will return an iterate average after training, how should we modify optimization algorithms to minimize the loss of the returned weights?}
+\end{quotation} 
+We will answer this question theoretically in a simplified setting, and empirically by training large language models with modern optimization algorithms.  In theory, following a long line of work in optimization for deep learning, we will derive an answer to this question by considering a quadratic model \citep{duchi2011adaptive,gupta2018shampoo,zhang2019lookahead,block2025ema,block2024butterfly,busbridge2023scale}, and then prove convergence guarantees for our algorithm in a more general convex setting.  In particular, for our derivation, we will make the following four assumptions. First, the loss function $F$ is a quadratic function of the form \iftoggle{colt}{$F(\theta) = \nicefrac 12 \left( \theta - \mustar \right)^\top \bA \left( \theta - \mustar \right)$}{
+    \begin{align}
+        F(\theta) = \frac{1}{2} \left( \theta - \mustar \right)^\top \bA \left( \theta - \mustar \right),
+    \end{align}
+}
+for a \emph{diagonal} positive definite matrix $\bA$ (for the general, non-diagonal case, see \Cref{app:stoch_control_derivation}).  Second, in order to further simplify the analysis, we will follow prior work \citep{block2025ema,block2024butterfly,malladi2022sdes,mandt2015continuous,block2020generative} and consider a continuous time limit of the optimization process, where the dynamics of the parameters $\theta_t$ are given by a stochastic differential equation (SDE).  Third, we will assume that we are returning a simple time average of the iterates, as opposed to more sophisticated schemes like \ema\ and \bema. Fourth, we will consider a Bayesian setting, where $\mustar$ is a random variable with a known prior distribution.  Finally, we will focus on the case of vanilla SGD with stationary, homoscedastic noise, i.e. the noise covariance $\bSigma$ is constant and does not depend on $\theta_t$.  We will model the modification to the base optimization algorithm as a \emph{control} input $u_t$ that can be added to the dynamics of $\theta_t$, affecting the trajectory of the optimization process.  Combining these assumptions, we thus return $\thetema[T]$:
+\begin{align}\label{eq:sde}
+    \thetema[T] = \frac 1T \int_0^T \theta_t d t \quad \text{where} \quad d \theta_t = \left[\bA \left( \mustar - \theta_t \right) + u_t\right] d t + \bSigma^{1/2} d W_t,
+\end{align}
+and $W_t$ a standard Brownian motion in $\rr^d$ \citep{kutoyants2004statistical,yong1999stochastic}.  Critically, we wish $\thetema[T]$ to be a good estimator of $\mustar$ while exerting as little control effort as possible; one way to formalize this desideratum is to seek a control strategy $u_t$ that minimizes the following objective:
+\iftoggle{colt}{
+\begin{align}\label{eq:objective}
+    J_T(u) = \ee\left[ \|\thetema[T] - \mustar\|^2 + \lambda \cdot \int_0^T \norm{u_t}^2 d t \right],
+\end{align}
+}{
+\begin{align}\label{eq:objective}
+    J_T(u) = \ee\left[ \norm{\thetema[T] - \mustar}^2 + \lambda \cdot \int_0^T \norm{u_t}^2 d t \right],
+\end{align}
+}
+where $\lambda > 0$ is a regularization parameter that controls the tradeoff between the quality of the returned estimator $\thetema[T]$ and how far from the base optimization algorithm the control strategy $u_t$ is allowed to deviate.  We will refer to the problem of minimizing $J_T(u)$ over all progressively measurable control strategies $u_t$ as the \emph{optimal control problem} for the iterate-average estimator.  Note that in the case that $u_t = 0$ for all $t$, \eqref{eq:sde} reduces to the well-known Ornstein-Uhlenbeck process \citep{kutoyants2004statistical,mandt2015continuous}, and we recover the setting considered in \citet{block2025ema}.
+
+
+\subsection{Derivation of the Optimal Control Strategy}\label{ssec:derivation}
+We now present the optimal control solution for the iterate-average estimator.
+\begin{theorem}\label{thm:optimal_control_solution}
+    Suppose that $\mustar$ is drawn from a known prior distribution and $\theta_t$ evolves according to \eqref{eq:sde} for some control strategy $u_t$\footnote{Formally, we assume $u_t$ is \emph{progressively measurable}, i.e. can only include information from observations up to time $t$.} and that $\bA = \diag(\alpha_1, \dots, \alpha_d)$ is a diagonal positive definite matrix.  Let $\muhat_t = \ee\left[ \mustar | \theta_s, s \leq t \right]$.  Then the optimal control strategy $u_t$ that minimizes the objective $J_T(u)$ defined in \eqref{eq:objective} is given for each coordinate $i \in \{1, \dots, d\}$ by
+    \begin{align}\label{eq:optimal_control_solution}
+        \ustar_i(t) &= \frac{\left( 1 - e^{- \alpha_i (T - t)} \right)^2}{\alpha_i^2 \lambda T^2 + T - t - \nicefrac{2}{ \alpha_i} (1 - e^{- \alpha_i (T - t)}) + \frac{1 - e^{- 2 \alpha_i (T - t)}}{2 \alpha_i}} (\muhat_i(t) - \theta_i(t)) \\
+        &\quad + \frac{\alpha_i(1 - e^{- \alpha_i (T - t)})}{\alpha_i^2 \lambda T^2 + T - t - \nicefrac{2}{ \alpha_i} (1 - e^{- \alpha_i (T - t)}) + \frac{1 - e^{- 2 \alpha_i (T - t)}}{2 \alpha_i}} \left( t \cdot \muhat_i(t) - \int_0^t \theta_i(s) d s \right).
+    \end{align}
+\end{theorem}
+We defer a complete proof of this result to \Cref{app:stoch_control_derivation}, as well as generalizing beyond the diagonal $\bA$ setting.  After some algebra and augmenting the state, the analysis rests on classical results from the theory of linear quadratic stochastic control \citep{georgiou2013separation,kwakernaak1972linear} including solving the Riccati equation and applying the principle of certainty equivalence.  While \eqref{eq:optimal_control_solution} is attractive in that it is a closed-form expression for the optimal control strategy, it is not easily implementable in practice, as it depends on $\muhat_t$, the posterior mean of $\mustar$ given the trajectory of $\theta_s$ up to time $t$.  Even in the case of a Gaussian prior, which would imply that $\muhat_t$ is given by a Kalman filter \citep{kutoyants2004statistical,georgiou2013separation,yong1999stochastic}, the resulting control strategy would be difficult to implement in practice, especially at the scale of language models.  Thus, we simplify \eqref{eq:optimal_control_solution} to obtain a more practical control strategy by making the following approximations: (i) we replace $\muhat_t \approx \thetema[t]$ and (ii) we suppose that $t \ll T$.  The first assumption is connected with the fundamental motivation of our work: we wish to return $\thetema[T]$ as an estimate of $\mustar$ at the end of training, so it is natural to use $\thetema[t]$ as an estimate of $\mustar$ at time $t$.  The second assumption is motivated primarily by a desire for simplicity and the observation that the optimal control strategy is most impactful in the early stages of training, when the optimization trajectory is far from the optimum and thus there is more room for improvement.   Assuming $T \gg1$, we approximate $T -t \approx T$ and $\exp(-\alpha_i (T - t)) \approx 0$. With these approximations, we obtain the following practical control:
+\begin{align}\label{eq:practical_control_strategy}
+    u_t = T^{-1} \left( \eye + \lambda \bA^2 T\right)^{-1} \left( \thetema[t] - \theta_t\right).
+\end{align}
+
+While \eqref{eq:practical_control_strategy} is a valid approximation to the optimal control strategy, it is not yet ready for implementation, as it remains in continuous time.  Furthermore, the modification to the base optimization algorithm is a function of $\bA$, which is unknown in practice.  Moreover, practical iterate averaging schemes in deep learning tend to use exponential instead of uniform weighting.  We thus discretize \eqref{eq:practical_control_strategy} and replace $\bA$ with a diagonal matrix $\bC$ to arrive at the following update strategy: given current parameters $\theta_k$ at iteration $k$, stochastic gradient $g_k$, and learning rate $\eta$, parameters are updated according to
+\begin{align}\label{eq:stylized_update}
+    \theta_{k+1} = \theta_k - \eta \cdot g_k +  \bC \left( \thetema[k] - \theta_k \right), \quad \thetema[k+1] = (1 - \beta) \cdot \thetema[k] + \beta \cdot \theta_{k+1},
+\end{align}
+where $\beta$ is the averaging parameter. Thus we are left with \eqref{eq:stylized_update}, which is a simple modification to the base optimization algorithm that can be implemented with minimal computational overhead. Indeed, $\bC$ is a diagonal matrix and thus the matmul can be accomplished coordinate wise, at roughly the same cost as the preconditioning step in Adam or AdamW \citep{loshchilov2017fixing,kingma2014adam}.   While there still exist several additional tweaks to \eqref{eq:stylized_update} required to make it work well in practice (\Cref{sec:method}), we have now derived a simple, practical modification to the base optimization algorithm that is motivated by the optimal control solution to the iterate-average estimator in a simplified setting.
+
+
+
+\begin{algorithm}[t]
+\caption{\textbf{\pace}: \textbf Pullback \textbf Averaging \textbf Control for \textbf Efficient Optimization}
+\label{alg:controlled-bema}
+\begin{algorithmic}[1]
+\Require Learning rate $\eta$, pullback strength $c$, EMA power $\kappa$, scale $\varepsilon$, update frequency $\mathrm{uf}$.
+\State $\thetema[0] \gets \theta_0$
+\For{$t = 1, 2, \dots, T$}
+    \State $\theta_t \gets \mathrm{AdamW.step}(\theta_{t-1};\, \eta)$ and $\hat v_t \gets \mathrm{AdamW.preconditioner}(\theta_t')$.
+    \If{$t \mod \mathrm{uf} = 0$}
+    \State $\lambda_{t,i} \gets \min\!\bigl(\eta\, c\, (1+t)^{-\kappa} / (\sqrt{\hat v_{t,i}} + \varepsilon),\ 1\bigr)$ \Comment{Clipped per-coordinate pullback gain}
+    \State $\theta_t \gets \theta_t + \lambda_t \odot (\theta_{t-1}^{\mathrm{EMA}} - \theta_{t-1})$ 
+    \State $\thetema \gets (1 - \beta_t)\, \thetema[t-1] + \beta_t\, \theta_t,\quad \beta_t = (1+t)^{-\kappa}$ \Comment{EMA update}
+    \EndIf
+\EndFor
+\State \Return $\thetema[T]$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Convergence Guarantee in the Convex Setting}\label{ssec:convex_guarantees}
+
+We derived \eqref{eq:stylized_update} above as a practical approximation to the optimal control strategy for the iterate-average estimator in a simplified setting through heuristics: while we provided a rigorous derivation of the optimal control strategy in the quadratic setting, we then made use of several approximations and discretization in order to arrive at the update rule.  In this section we provide formal guarantees for this update.  We first show that for arbitrary convex loss functions, the iterate-average estimator returned by \eqref{eq:stylized_update} converges at the same rate as SGD, up to a constant factor depending on $\bC$ and $\beta$.
+\begin{theorem}\label{thm:convex_convergence}
+    Suppose that $F: \rr^d \to \rr$ is a convex, $G$-Lipschitz function and suppose for each $k$ we have access to a stochastic gradient $g_k$ such that $\ee[g_k] = \nabla F(\theta_k)$ and $\ee[\norm{g_k - \nabla F(\theta_k)}^2] \leq \sigma^2$.  Suppose that $\theta_k$ evolves according to \eqref{eq:stylized_update} for some diagonal matrix $\bC$ with entries in $[0, 1]$ and some $\beta \in (0, 1)$. Let $\thetabar_T = T^{-1} \sum_{k=0}^{T-1} \theta_k$ be the flat average. Then it holds that for optimally tuned learning rate $\eta$,
+    \iftoggle{colt}{$\ee\left[ F(\thetabar_T) - F(\mustar) \right] \leq \nicefrac{\sqrt{2 - \beta}}{\beta} \cdot \norm{\theta_1 - \mustar} \cdot \sqrt{\nicefrac{(G^2 + \sigma^2)}{T}}$.}{
+    \begin{align}
+        \ee\left[ F(\thetabar_T) - F(\mustar) \right] \leq \frac{\sqrt{2 - \beta}}{\beta} \cdot \norm{\theta_1 - \mustar} \cdot \sqrt{\frac{G^2 + \sigma^2}{T}}.
+    \end{align}
+    }
+\end{theorem}
+The proof of \Cref{thm:convex_convergence} is given in \Cref{app:convex_proofs} and follows by a standard analysis of SGD coupled with a recursive analysis to ensure that the update does not drift too far away from SGD itself.  In particular, \Cref{thm:convex_convergence} ensures that the iterate-average estimator returned by \eqref{eq:stylized_update} enjoys the same $O(1/\sqrt{T})$ and is worse only by a multiplicative factor depending on the strength of the \ema\ update.  Unfortunately, this issue is intrinsic to the analysis and likely cannot be improved\iftoggle{colt}{.}{ without additional assumptions.} 
+
+
+
+While the previous result shows that \eqref{eq:stylized_update} is never that much worse than SGD for convex functions, in the special case of quadratics, it can be quite a lot better.  As stated above, locally approximating the loss function of a LM by a quadratic is a common heuristic in optimization for deep learning \citep{block2025ema,block2024butterfly,zhang2019lookahead,zhang2019algorithmic}, where the Hessian of the loss is used as a proxy for local curvature.  In this setting, we show that \eqref{eq:stylized_update} enjoys improved convergence compared to SGD.
+\begin{proposition}\label{prop:improved_convergence_quadratic}
+    Suppose that $F(\theta) = \nicefrac 12 (\theta - \mustar)^\top \bA (\theta - \mustar)$ for some diagonal positive definite matrix $\bA$ and that $\theta_k$ evolves according to \eqref{eq:stylized_update} for some diagonal matrix $\bC$ with entries in $[0, 1]$ and some $\beta \in (0, 1)$.  Suppose further that the stochastic gradients are given by $g_k = \bA (\theta_k - \mustar) + \xi_k$, where $\xi_k$ is a zero-mean noise term with covariance $\sigma^2 \eye$.  Then for any learning rate $\eta$ such that $\normop{\eta \bA} < 1$ and choice of $\beta$, there is some $\bC$ such that $\lim_{T \to \infty} \ee\left[ \|\thetema[T] - \mustar\|^2 \right]$ is strictly smaller than the limiting squared error of the iterate-average estimator returned by SGD.
+\end{proposition}
+The proof of \Cref{prop:improved_convergence_quadratic} is given in \Cref{app:convex_proofs} and demonstrates that \eqref{eq:stylized_update} can rigorously improve the convergence of the iterate-average estimator in the quadratic setting.  
+Finally, we show that the improvement over SGD can be arbitrarily large for certain choices of $\bC$ and $\beta$ for some problems.
+\begin{proposition}\label{prop:arbitrarily_large_improvement}
+    For any $\epsilon > 0$, there is some quadratic problem and some choice of $\bC$ and $\beta$ such that the limiting squared error of the iterate-average estimator returned by \eqref{eq:stylized_update} is at least a factor of $\epsilon$ smaller than the limiting squared error of the iterate-average estimator returned by SGD.
+\end{proposition}
+
+
+

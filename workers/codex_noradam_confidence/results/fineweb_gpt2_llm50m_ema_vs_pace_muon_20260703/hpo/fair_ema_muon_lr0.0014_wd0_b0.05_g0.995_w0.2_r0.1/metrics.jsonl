@@ -1,0 +1,20 @@
+{"step": 75, "phase": "train", "train_loss": 7.861113548278809, "lr": 0.00105, "step_time_ms": 35.83540499676019, "tokens_per_sec": 114300.36859832647}
+{"step": 75, "phase": "eval", "train_loss": 7.861113548278809, "val_loss": 7.805336654186249, "val_acc": 0.113372802734375, "lr": 0.00105, "mean_step_time_ms": 38.38456278628049, "tokens_per_sec": 106709.56506150444}
+{"step": 100, "phase": "train", "train_loss": 7.286310195922852, "lr": 0.0014, "step_time_ms": 35.84706599940546, "tokens_per_sec": 114263.18684123085}
+{"step": 150, "phase": "train", "train_loss": 6.878650665283203, "lr": 0.0014, "step_time_ms": 36.407362000318244, "tokens_per_sec": 112504.71813816656}
+{"step": 150, "phase": "eval", "train_loss": 6.878650665283203, "val_loss": 6.9280441999435425, "val_acc": 0.13726806640625, "lr": 0.0014, "mean_step_time_ms": 36.07305835951895, "tokens_per_sec": 113547.34492367067}
+{"step": 200, "phase": "train", "train_loss": 6.63247537612915, "lr": 0.0014, "step_time_ms": 36.4140320016304, "tokens_per_sec": 112484.11051587491}
+{"step": 225, "phase": "train", "train_loss": 6.405390739440918, "lr": 0.0014, "step_time_ms": 36.40238200023305, "tokens_per_sec": 112520.10926026152}
+{"step": 225, "phase": "eval", "train_loss": 6.405390739440918, "val_loss": 6.599204003810883, "val_acc": 0.148712158203125, "lr": 0.0014, "mean_step_time_ms": 36.4111896668328, "tokens_per_sec": 112492.89126444212}
+{"step": 300, "phase": "train", "train_loss": 6.421607971191406, "lr": 0.0014, "step_time_ms": 36.40974200970959, "tokens_per_sec": 112497.36399965968}
+{"step": 300, "phase": "eval", "train_loss": 6.421607971191406, "val_loss": 6.431350767612457, "val_acc": 0.14697265625, "lr": 0.0014, "mean_step_time_ms": 36.415344707396194, "tokens_per_sec": 112480.05567191777}
+{"step": 375, "phase": "train", "train_loss": 6.285092830657959, "lr": 0.0014, "step_time_ms": 36.41100200184155, "tokens_per_sec": 112493.47106110503}
+{"step": 375, "phase": "eval", "train_loss": 6.285092830657959, "val_loss": 6.310765504837036, "val_acc": 0.160400390625, "lr": 0.0014, "mean_step_time_ms": 36.41465883973675, "tokens_per_sec": 112482.17422623011}
+{"step": 400, "phase": "train", "train_loss": 6.053127288818359, "lr": 0.0014, "step_time_ms": 36.37010099191684, "tokens_per_sec": 112619.97872676584}
+{"step": 450, "phase": "train", "train_loss": 6.053744316101074, "lr": 0.0014, "step_time_ms": 36.403171994606964, "tokens_per_sec": 112517.667433124}
+{"step": 450, "phase": "eval", "train_loss": 6.053744316101074, "val_loss": 6.186241030693054, "val_acc": 0.160308837890625, "lr": 0.0014, "mean_step_time_ms": 36.412969812712014, "tokens_per_sec": 112487.3917471587}
+{"step": 500, "phase": "train", "train_loss": 5.773658275604248, "lr": 0.0011899999999999999, "step_time_ms": 36.483282994595356, "tokens_per_sec": 112270.59803271494}
+{"step": 525, "phase": "train", "train_loss": 6.000724792480469, "lr": 0.0009274999999999999, "step_time_ms": 36.43212199676782, "tokens_per_sec": 112428.25768873382}
+{"step": 525, "phase": "eval", "train_loss": 6.000724792480469, "val_loss": 6.0652918219566345, "val_acc": 0.17279052734375, "lr": 0.0009274999999999999, "mean_step_time_ms": 36.43587288116881, "tokens_per_sec": 112416.68378190383}
+{"step": 600, "phase": "train", "train_loss": 5.8035688400268555, "lr": 0.00013999999999999996, "step_time_ms": 35.84235500602517, "tokens_per_sec": 114278.20519358882}
+{"step": 600, "phase": "eval", "train_loss": 5.8035688400268555, "val_loss": 5.923116564750671, "val_acc": 0.183685302734375, "lr": 0.00013999999999999996, "mean_step_time_ms": 36.03739308038106, "tokens_per_sec": 113659.71980447952}

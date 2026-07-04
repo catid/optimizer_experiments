@@ -164,16 +164,21 @@ class EMA_Nesterov(torch.optim.Optimizer):
                     param_state['lookahead_buffer'] = (torch.zeros_like(p), -1)
     
     def get_lr_lambda(self):
+        scheduled_group = self.param_groups[0]
         if isinstance(self.inner_optimizer, list):
-            lr_lambda = self.inner_optimizer[0].param_groups[0]["lr"] / self.inner_optimizer[0].param_groups[0]["initial_lr"]
+            inner_group = self.inner_optimizer[0].param_groups[0]
         else:
-            lr_lambda = self.inner_optimizer.param_groups[0]["lr"] / self.inner_optimizer.param_groups[0]["initial_lr"]
-        return lr_lambda
+            inner_group = self.inner_optimizer.param_groups[0]
+        current_lr = scheduled_group.get("lr", inner_group["lr"])
+        initial_lr = scheduled_group.get("initial_lr", inner_group.get("initial_lr", current_lr))
+        return current_lr / initial_lr
 
     @torch.no_grad()
-    def lookahead_step(self):
+    def lookahead_step(self, lookahead_stepsize=None):
         """Performs nesterov's lookahead."""
-        if self.use_scheduled_lookahead_stepsize:
+        if lookahead_stepsize is not None:
+            lookahead_stepsize = float(lookahead_stepsize)
+        elif self.use_scheduled_lookahead_stepsize:
             lookahead_stepsize = self.lookahead_stepsize * self.get_lr_lambda()
         else:
             lookahead_stepsize = self.lookahead_stepsize

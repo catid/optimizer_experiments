@@ -56,6 +56,18 @@ def as_float(row: dict[str, str], key: str) -> float:
     return float(value) if value not in ("", None) else float("nan")
 
 
+def finite_float(value: object, default: float) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
+def rank_value(row: dict[str, object], key: str, *, higher_is_better: bool = False) -> float:
+    return finite_float(row.get(key), -math.inf if higher_is_better else math.inf)
+
+
 def seed_from_dir(result_dir: Path) -> int:
     rows = read_rows(result_dir / "summary.csv")
     if not rows:
@@ -103,7 +115,7 @@ def aggregate_summaries(result_dirs: list[Path]) -> tuple[list[dict[str, object]
             record[f"{metric}_std"] = stdev(vals)
         aggregate.append(record)
 
-    aggregate.sort(key=lambda row: (float(row["final_val_loss_mean"]), float(row["best_val_loss_mean"])))
+    aggregate.sort(key=lambda row: (rank_value(row, "final_val_loss_mean"), rank_value(row, "best_val_loss_mean")))
     return per_seed, aggregate
 
 
@@ -157,7 +169,8 @@ def plot_bars(output_dir: Path, aggregate: list[dict[str, object]]) -> None:
         ("mean_step_s_mean", "Mean Step Time", "step time ms (lower is better)", "mean_step_time.png"),
     ]
     for key, title, xlabel, filename in specs:
-        ranked = sorted(aggregate, key=lambda row: float(row[key]), reverse="accuracy" in key)
+        reverse = "accuracy" in key
+        ranked = sorted(aggregate, key=lambda row: rank_value(row, key, higher_is_better=reverse), reverse=reverse)
         labels = [str(row["label"]) for row in ranked]
         values = [float(row[key]) for row in ranked]
         if key.endswith("_s_mean"):
@@ -176,7 +189,7 @@ def plot_bars(output_dir: Path, aggregate: list[dict[str, object]]) -> None:
 
 def write_report(output_dir: Path, aggregate: list[dict[str, object]], per_seed: list[dict[str, object]]) -> None:
     best_final = aggregate[0]
-    best_transient = min(aggregate, key=lambda row: float(row["best_val_loss_mean"]))
+    best_transient = min(aggregate, key=lambda row: rank_value(row, "best_val_loss_mean"))
     lines = [
         "# CIFAR-10 Peer-Feedback Aggregate",
         "",
@@ -222,8 +235,8 @@ def write_report(output_dir: Path, aggregate: list[dict[str, object]], per_seed:
     for row in per_seed:
         by_seed[int(row["seed"])].append(row)
     for seed, rows in sorted(by_seed.items()):
-        final_winner = min(rows, key=lambda row: float(row["final_val_loss"]))
-        transient_winner = min(rows, key=lambda row: float(row["best_val_loss"]))
+        final_winner = min(rows, key=lambda row: rank_value(row, "final_val_loss"))
+        transient_winner = min(rows, key=lambda row: rank_value(row, "best_val_loss"))
         lines.append(
             f"| {seed} | {final_winner['label']} | {float(final_winner['final_val_loss']):.4f} | "
             f"{transient_winner['label']} | {float(transient_winner['best_val_loss']):.4f} |"

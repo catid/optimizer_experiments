@@ -1,0 +1,21 @@
+id: fig_appendix_full_train_curves
+paper: "Fig 11"
+desc: "Fig 1 curves with last-25% zoom (same runs as Fig 1)"
+dataset: smoltalk
+
+# Identical run set to Fig 1 (this appendix figure re-plots Fig 1's curves with a
+# last-25%-of-training zoom inset; no additional runs). Headline best-per-method
+# configs: AdamW/EMA on their best decay schedule (cos), PACE constant-LR.
+curves:
+  # ---- SmolLM2-1.7B ----
+  - {model: smollm2_1.7b, method: AdamW, schedule: cos,   seed: 42, optimizer: {name: adamw, lr: 0.001,  lambda_pullback: 0.0}}
+  - {model: smollm2_1.7b, method: EMA,   schedule: cos,   seed: 42, optimizer: {name: ema,   lr: 0.001,  lambda_pullback: 0.0,  ema_kappa: 0.5}}
+  - {model: smollm2_1.7b, method: PACE,  schedule: const, seed: 42, optimizer: {name: pace,  lr: 0.001,  lambda_pullback: 0.15, ema_kappa: 0.2}}
+  # ---- Qwen3-1.7B ----
+  - {model: qwen3_1.7b,   method: AdamW, schedule: cos,   seed: 42, optimizer: {name: adamw, lr: 0.0005, lambda_pullback: 0.0}}
+  - {model: qwen3_1.7b,   method: EMA,   schedule: cos,   seed: 42, optimizer: {name: ema,   lr: 0.0005, lambda_pullback: 0.0,  ema_kappa: 0.5}}
+  - {model: qwen3_1.7b,   method: PACE,  schedule: const, seed: 42, optimizer: {name: pace,  lr: 0.0005, lambda_pullback: 0.25, ema_kappa: 0.5}}
+  # ---- Gemma3-1B ----
+  - {model: gemma3_1b,    method: AdamW, schedule: cos,   seed: 42, optimizer: {name: adamw, lr: 0.001,  lambda_pullback: 0.0}}
+  - {model: gemma3_1b,    method: EMA,   schedule: cos,   seed: 42, optimizer: {name: ema,   lr: 0.001,  lambda_pullback: 0.0,  ema_kappa: 0.5}}
+  - {model: gemma3_1b,    method: PACE,  schedule: const, seed: 42, optimizer: {name: pace,  lr: 0.001,  lambda_pullback: 0.15, ema_kappa: 0.5}}

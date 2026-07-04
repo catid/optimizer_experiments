@@ -54,6 +54,11 @@ class TrialConfig:
     ema_warmup_frac: float = 0.30
     ema_rest_frac: float = 0.20
     muown_mag_lr_mult: float = 1.0
+    pace_c: float = 0.0
+    pace_kappa: float = 0.5
+    pace_precond: str = "adam"
+    pace_beta2: float = 0.999
+    pace_update_freq: int = 1
     seed: int = 123
     steps: int = 800
     eval_every: int = 100
@@ -112,6 +117,7 @@ def parse_args() -> argparse.Namespace:
             "fineweb_tokenized_hpo",
             "fineweb_ema_anchor_hpo",
             "muown_ema_hpo",
+            "fineweb_pace_hpo",
         ],
         default="anchor_deep",
     )
@@ -382,7 +388,11 @@ def prepare_hf_text_cache(args: argparse.Namespace, *, require_existing: bool = 
         return prepare_hf_token_cache(args, require_existing=require_existing)
 
     args.cache_dir.mkdir(parents=True, exist_ok=True)
-    safe = _safe_name(f"{args.hf_dataset}_{args.hf_config}_{args.hf_split}_{args.hf_text_field}_shuf{args.hf_shuffle_buffer}_seed{args.seed}")
+    safe_val_split = getattr(args, "hf_val_split", "") or "inline"
+    safe = _safe_name(
+        f"{args.hf_dataset}_{args.hf_config}_{args.hf_split}_{safe_val_split}_{args.hf_text_field}_"
+        f"shuf{args.hf_shuffle_buffer}_seed{args.seed}"
+    )
     train_path = args.cache_dir / f"{safe}_train_{args.max_train_bytes}.uint8.npy"
     val_path = args.cache_dir / f"{safe}_validation_{args.max_val_bytes}.uint8.npy"
     if require_existing:
@@ -392,8 +402,9 @@ def prepare_hf_text_cache(args: argparse.Namespace, *, require_existing: bool = 
         return train_path, val_path
 
     name = args.hf_config or None
-    if args.hf_val_split:
-        val_ds = load_dataset(args.hf_dataset, name=name, split=args.hf_val_split, streaming=True)
+    hf_val_split = getattr(args, "hf_val_split", "")
+    if hf_val_split:
+        val_ds = load_dataset(args.hf_dataset, name=name, split=hf_val_split, streaming=True)
         train_ds = load_dataset(args.hf_dataset, name=name, split=args.hf_split, streaming=True)
         if args.hf_shuffle_buffer > 0:
             train_ds = train_ds.shuffle(buffer_size=args.hf_shuffle_buffer, seed=args.seed)
@@ -424,7 +435,7 @@ def prepare_hf_token_cache(args: argparse.Namespace, *, require_existing: bool =
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     eos = "eos" if args.tokenizer_add_eos else "noeos"
     safe = _safe_name(
-        f"{args.hf_dataset}_{args.hf_config}_{args.hf_split}_{args.hf_text_field}_"
+        f"{args.hf_dataset}_{args.hf_config}_{args.hf_split}_{getattr(args, 'hf_val_split', '') or 'inline'}_{args.hf_text_field}_"
         f"{args.tokenizer_name}_{eos}_shuf{args.hf_shuffle_buffer}_seed{args.seed}"
     )
     train_path = args.cache_dir / f"{safe}_train_{args.max_train_tokens}.tok.npy"
@@ -437,8 +448,9 @@ def prepare_hf_token_cache(args: argparse.Namespace, *, require_existing: bool =
     tokenizer = _load_hf_tokenizer(args.tokenizer_name)
 
     name = args.hf_config or None
-    if args.hf_val_split:
-        val_ds = load_dataset(args.hf_dataset, name=name, split=args.hf_val_split, streaming=True)
+    hf_val_split = getattr(args, "hf_val_split", "")
+    if hf_val_split:
+        val_ds = load_dataset(args.hf_dataset, name=name, split=hf_val_split, streaming=True)
         train_ds = load_dataset(args.hf_dataset, name=name, split=args.hf_split, streaming=True)
         if args.hf_shuffle_buffer > 0:
             train_ds = train_ds.shuffle(buffer_size=args.hf_shuffle_buffer, seed=args.seed)
@@ -762,10 +774,30 @@ class EMANesterovOptimizer:
         self.step_index += 1
         return loss
 
+    def _flat_params(self) -> list[nn.Parameter]:
+        return [p for group in self.param_groups for p in group["params"]]
+
+    @staticmethod
+    def _clone_state_value(value: Any) -> Any:
+        if torch.is_tensor(value):
+            return value.detach().clone()
+        if isinstance(value, dict):
+            return {key: EMANesterovOptimizer._clone_state_value(val) for key, val in value.items()}
+        if isinstance(value, list):
+            return [EMANesterovOptimizer._clone_state_value(val) for val in value]
+        if isinstance(value, tuple):
+            return tuple(EMANesterovOptimizer._clone_state_value(val) for val in value)
+        return value
+
     def state_dict(self) -> dict[str, Any]:
+        param_to_index = {p: index for index, p in enumerate(self._flat_params())}
         return {
             "base_optimizer": self.base_optimizer.state_dict(),
-            "state": self.state,
+            "state": {
+                param_to_index[p]: self._clone_state_value(state)
+                for p, state in self.state.items()
+                if p in param_to_index
+            },
             "step_index": self.step_index,
             "total_steps": self.total_steps,
             "beta": self.beta,
@@ -776,8 +808,566 @@ class EMANesterovOptimizer:
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.base_optimizer.load_state_dict(state_dict["base_optimizer"])
-        self.state = state_dict.get("state", {})
+        self.param_groups = self.base_optimizer.param_groups
+        flat_params = self._flat_params()
+        packed_state = state_dict.get("state", {})
+        if packed_state and not all(isinstance(index, (int, str)) for index in packed_state):
+            packed_items = enumerate(packed_state.values())
+        else:
+            packed_items = packed_state.items()
+        self.state = {}
+        for index, state in packed_items:
+            int_index = int(index)
+            if int_index < len(flat_params):
+                self.state[flat_params[int_index]] = self._clone_state_value(state)
         self.step_index = int(state_dict.get("step_index", 0))
+
+
+class StackMuon(PlainMuon):
+    """PlainMuon plus individually toggleable AnchorMuon stack components.
+
+    Base PlainMuon already uses the five-step Gram Newton-Schulz polar step, so
+    the addable increments are SODA anchor updates (replacing weight decay on
+    every parameter group, as in root AnchorMuon), row-only PMuonEq
+    preconditioning before GramNS, and NorMuon row normalization after GramNS.
+    With every toggle off this class must remain step-for-step identical to
+    PlainMuon. The fallback path stays PlainMuon's AdamW-style update so each
+    increment is attributable to the matrix path plus, for SODA, the shared
+    anchor pull.
+    """
+
+    def __init__(
+        self,
+        matrix_params: list[nn.Parameter],
+        fallback_groups: list[dict[str, Any]],
+        *,
+        lr: float,
+        weight_decay: float,
+        momentum: float = 0.95,
+        use_soda: bool = False,
+        soda_lambda_scale: float = 1.0,
+        soda_lambda_power: float = 1.0,
+        row_gamma: float = 0.0,
+        pmuoneq_beta: float = 0.90,
+        pmuoneq_eps: float = 1e-6,
+        use_normuon: bool = False,
+        normuon_beta2: float = 0.93,
+        normuon_eps: float = 1e-10,
+    ) -> None:
+        super().__init__(
+            matrix_params,
+            fallback_groups,
+            lr=lr,
+            weight_decay=0.0 if use_soda else weight_decay,
+            momentum=momentum,
+        )
+        if use_soda:
+            for group in self.param_groups:
+                group["weight_decay"] = 0.0
+        self.use_soda = bool(use_soda)
+        self.soda_lambda_scale = float(soda_lambda_scale)
+        self.soda_lambda_power = float(soda_lambda_power)
+        self.row_gamma = float(row_gamma)
+        self.pmuoneq_beta = float(pmuoneq_beta)
+        self.pmuoneq_eps = float(pmuoneq_eps)
+        self.use_normuon = bool(use_normuon)
+        self.normuon_beta2 = float(normuon_beta2)
+        self.normuon_eps = float(normuon_eps)
+        self._stack_step = 0
+        # Anchors live outside self.state: PlainMuon's fallback path lazily
+        # initializes its Adam state with an `if not state` check, which an
+        # anchor entry would break.
+        self._soda_anchors: dict[int, torch.Tensor] = {}
+
+    def _soda_anchor(self, p: torch.Tensor) -> torch.Tensor:
+        anchor = self._soda_anchors.get(id(p))
+        if anchor is None:
+            anchor = self._soda_anchors[id(p)] = torch.clone(p.detach(), memory_format=torch.preserve_format)
+        return anchor
+
+    def _soda_weight(self, t: int) -> float:
+        return min(1.0, self.soda_lambda_scale / float(t + 1) ** self.soda_lambda_power)
+
+    @torch.no_grad()
+    def step(self, closure: Any | None = None) -> Any:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        self._stack_step += 1
+        if self.use_soda:
+            weight = self._soda_weight(self._stack_step)
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None:
+                        p.lerp_(self._soda_anchor(p).to(p.dtype), weight)
+        for group in self.param_groups:
+            if group.get("use_muon", False):
+                self._step_muon_group(group)
+            else:
+                self._step_adamw_group(group)
+        return loss
+
+    def _step_muon_group(self, group: dict[str, Any]) -> None:
+        lr = float(group["lr"])
+        wd = float(group.get("weight_decay", 0.0))
+        beta = float(group["momentum"])
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            if wd:
+                p.mul_(1.0 - lr * wd)
+            g = p.grad.detach().to(torch.float32)
+            state = self.state[p]
+            momentum = state.get("momentum_buffer")
+            if momentum is None or momentum.shape != p.shape:
+                momentum = state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
+            momentum.lerp_(g, 1.0 - beta)
+            source = torch.lerp(g, momentum, beta)
+            matrix = root_optimizer._matrix_view(source)
+            if self.row_gamma > 0.0:
+                grad_matrix = root_optimizer._matrix_view(g)
+                rows = matrix.shape[0]
+                row_ema = state.get("pmuoneq_row_ema")
+                if row_ema is None or row_ema.shape != (rows,):
+                    row_ema = state["pmuoneq_row_ema"] = torch.ones(rows, device=matrix.device, dtype=torch.float32)
+                row_ema.mul_(self.pmuoneq_beta).add_(
+                    grad_matrix.square().mean(dim=1), alpha=1.0 - self.pmuoneq_beta
+                )
+                row_factor = root_optimizer._diag_inverse_power(
+                    row_ema, gamma=self.row_gamma, eps=self.pmuoneq_eps
+                )
+                matrix = matrix * row_factor.unsqueeze(1)
+            update = self._orthogonalizer(matrix)
+            update = update * (0.2 * math.sqrt(max(update.shape[-2], update.shape[-1])))
+            if self.use_normuon:
+                rows = update.shape[0]
+                second = state.get("normuon_second_momentum")
+                if second is None or second.shape != (rows, 1):
+                    second = state["normuon_second_momentum"] = torch.zeros(
+                        rows, 1, device=update.device, dtype=torch.float32
+                    )
+                update = root_optimizer._normuon_row_normalize(
+                    update, second, beta2=self.normuon_beta2, eps=self.normuon_eps
+                )
+            p.add_(update.reshape_as(p).to(p.dtype), alpha=-lr)
+
+
+class PaceInjectMuon(PlainMuon):
+    """Muon with the PACE pullback injected BEFORE orthogonalization.
+
+    Instead of the paper's post-step weight-space pullback, the displacement
+    toward the iterate EMA is blended into the polar-step source:
+
+        disp   = ema - theta                     (matrix view, fp32)
+        source = muon_source + s_t * ||muon_source||_F / ||disp||_F * disp
+        update = polar(source) * 0.2 * sqrt(max(m, n))
+
+    with s_t = c * (1 + t)^(-kappa). The displacement is Frobenius-normalized
+    against the momentum-gradient source so ``c`` is a dimensionless mixing
+    ratio (c=0 recovers PlainMuon exactly; c -> inf steps toward the EMA).
+    This explores the PACE paper's open question of applying the base
+    optimizer's own preconditioning to the pullback term: here the pullback
+    direction is orthogonalized together with the gradient, so it changes
+    which direction Muon takes instead of adding a separate weight-space move.
+    Fallback (vector/scalar) tensors keep PlainMuon's AdamW path untouched.
+    The returned model is the EMA: the runner swaps via swap_to_ema().
+    """
+
+    def __init__(
+        self,
+        matrix_params: list[nn.Parameter],
+        fallback_groups: list[dict[str, Any]],
+        *,
+        lr: float,
+        weight_decay: float,
+        momentum: float = 0.95,
+        pullback_c: float = 0.0,
+        kappa: float = 0.5,
+        update_freq: int = 1,
+        min_decay: float = 1e-4,
+    ) -> None:
+        if pullback_c < 0.0:
+            raise ValueError("pullback_c must be non-negative")
+        if not 0.0 < kappa <= 1.0:
+            raise ValueError("kappa must be in (0, 1]")
+        if update_freq < 1:
+            raise ValueError("update_freq must be >= 1")
+        super().__init__(matrix_params, fallback_groups, lr=lr, weight_decay=weight_decay, momentum=momentum)
+        self.pullback_c = float(pullback_c)
+        self.kappa = float(kappa)
+        self.update_freq = int(update_freq)
+        self.min_decay = float(min_decay)
+        self.step_index = 0
+        self._swapped = False
+        self._pace_state: dict[int, dict[str, torch.Tensor]] = {}
+
+    def _flat_params(self) -> list[nn.Parameter]:
+        return [p for group in self.param_groups for p in group["params"]]
+
+    @staticmethod
+    def _clone_state_value(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().clone()
+        if isinstance(value, dict):
+            return {key: PaceInjectMuon._clone_state_value(val) for key, val in value.items()}
+        if isinstance(value, list):
+            return [PaceInjectMuon._clone_state_value(val) for val in value]
+        if isinstance(value, tuple):
+            return tuple(PaceInjectMuon._clone_state_value(val) for val in value)
+        return value
+
+    def _decay_t(self, t: int) -> float:
+        return max((1.0 + float(t)) ** (-self.kappa), self.min_decay)
+
+    def _pace_entry(self, p: torch.Tensor) -> dict[str, torch.Tensor]:
+        entry = self._pace_state.get(id(p))
+        if entry is None:
+            entry = self._pace_state[id(p)] = {"param": p, "ema": p.detach().to(torch.float32, copy=True)}
+        return entry
+
+    @torch.no_grad()
+    def step(self, closure: Any | None = None) -> Any:
+        if self._swapped:
+            raise RuntimeError("PaceInjectMuon.step() called while weights are swapped to the EMA")
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        self.step_index += 1
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    self._pace_entry(p)
+        for group in self.param_groups:
+            if group.get("use_muon", False):
+                self._step_muon_group(group)
+            else:
+                self._step_adamw_group(group)
+        decay = self._decay_t(self.step_index)
+        if self.step_index % self.update_freq == 0:
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    ema = self._pace_entry(p)["ema"]
+                    ema.mul_(1.0 - decay).add_(p.detach().to(torch.float32), alpha=decay)
+        return loss
+
+    def _step_muon_group(self, group: dict[str, Any]) -> None:
+        lr = float(group["lr"])
+        wd = float(group.get("weight_decay", 0.0))
+        beta = float(group["momentum"])
+        s_t = self.pullback_c * self._decay_t(self.step_index)
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            g = p.grad.detach().to(torch.float32)
+            state = self.state[p]
+            momentum = state.get("momentum_buffer")
+            if momentum is None or momentum.shape != p.shape:
+                momentum = state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
+            momentum.lerp_(g, 1.0 - beta)
+            source = torch.lerp(g, momentum, beta)
+            matrix = root_optimizer._matrix_view(source)
+            if s_t > 0.0:
+                ema = self._pace_entry(p)["ema"]
+                disp = root_optimizer._matrix_view(ema - p.detach().to(torch.float32))
+                disp_norm = float(disp.norm())
+                if disp_norm > 0.0:
+                    matrix = matrix + disp * (s_t * float(matrix.norm()) / disp_norm)
+            update = self._orthogonalizer(matrix)
+            update = update * (0.2 * math.sqrt(max(update.shape[-2], update.shape[-1])))
+            if wd:
+                p.mul_(1.0 - lr * wd)
+            p.add_(update.reshape_as(p).to(p.dtype), alpha=-lr)
+
+    @torch.no_grad()
+    def swap_to_ema(self) -> None:
+        if self._swapped:
+            return
+        for entry in self._pace_state.values():
+            p = entry["param"]
+            backup = entry.get("live_backup")
+            if backup is None or backup.shape != p.shape:
+                backup = entry["live_backup"] = torch.empty_like(p)
+            backup.copy_(p.detach())
+            p.copy_(entry["ema"].to(p.dtype))
+        self._swapped = True
+
+    @torch.no_grad()
+    def swap_to_live(self) -> None:
+        if not self._swapped:
+            return
+        for entry in self._pace_state.values():
+            if "live_backup" in entry:
+                entry["param"].copy_(entry["live_backup"])
+        self._swapped = False
+
+    def state_dict(self) -> dict[str, Any]:
+        state_dict = super().state_dict()
+        param_to_index = {p: index for index, p in enumerate(self._flat_params())}
+        state_dict.update(
+            {
+                "pace_state": {
+                    param_to_index[entry["param"]]: {
+                        key: value
+                        for key, value in entry.items()
+                        if key != "param"
+                    }
+                    for entry in self._pace_state.values()
+                    if entry.get("param") in param_to_index
+                },
+                "pace_step_index": self.step_index,
+                "pace_pullback_c": self.pullback_c,
+                "pace_kappa": self.kappa,
+                "pace_update_freq": self.update_freq,
+                "pace_min_decay": self.min_decay,
+            }
+        )
+        return state_dict
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        super().load_state_dict(state_dict)
+        flat_params = self._flat_params()
+        self._pace_state = {}
+        for index, packed in state_dict.get("pace_state", {}).items():
+            int_index = int(index)
+            if int_index >= len(flat_params):
+                continue
+            p = flat_params[int_index]
+            entry = {
+                key: self._clone_state_value(value)
+                for key, value in packed.items()
+                if key != "param"
+            }
+            entry["param"] = p
+            self._pace_state[id(p)] = entry
+        self.step_index = int(state_dict.get("pace_step_index", 0))
+        self.pullback_c = float(state_dict.get("pace_pullback_c", self.pullback_c))
+        self.kappa = float(state_dict.get("pace_kappa", self.kappa))
+        self.update_freq = int(state_dict.get("pace_update_freq", self.update_freq))
+        self.min_decay = float(state_dict.get("pace_min_decay", self.min_decay))
+        self._swapped = False
+
+
+class PaceOptimizer:
+    """PACE pullback wrapper from arXiv:2606.25086 (papers/md/2606.25086v2_pace.md).
+
+    Wraps any base optimizer. Each step it snapshots the pre-step weights,
+    updates a dedicated second-moment estimate of the (already clipped)
+    gradients, runs the base step, then pulls the live weights toward a
+    decaying EMA of the iterates with the clipped per-coordinate gain
+
+        lam = min(lr * c * (1 + t)^(-kappa) / (sqrt(v_hat) + eps), 1)
+
+    measured from the pre-step weights, exactly as in the reference PACE code.
+    The reference implementation reuses AdamW's own second moment for the
+    gain; a wrapper cannot see base-optimizer internals uniformly across
+    Muon-family bases, so it maintains its own ``v`` (paper theory only asks
+    for a Hessian-diagonal proxy). ``precond="scalar"`` drops the ``v``
+    preconditioner entirely as an ablation. The returned model is the EMA:
+    call ``swap_to_ema()`` before evaluation and ``swap_to_live()`` after.
+    With ``pullback_c=0`` this is the EMA-evaluated baseline of the paper.
+    """
+
+    def __init__(
+        self,
+        base_optimizer: torch.optim.Optimizer,
+        *,
+        pullback_c: float,
+        kappa: float,
+        precond: str = "adam",
+        beta2: float = 0.999,
+        eps: float = 1e-8,
+        update_freq: int = 1,
+        min_decay: float = 1e-4,
+    ) -> None:
+        if pullback_c < 0.0:
+            raise ValueError("pullback_c must be non-negative")
+        if not 0.0 < kappa <= 1.0:
+            raise ValueError("kappa must be in (0, 1]")
+        if precond not in ("adam", "scalar", "row"):
+            raise ValueError("precond must be 'adam', 'scalar', or 'row'")
+        if update_freq < 1:
+            raise ValueError("update_freq must be >= 1")
+        self.base_optimizer = base_optimizer
+        self.param_groups = base_optimizer.param_groups
+        self.state: dict[nn.Parameter, dict[str, Any]] = {}
+        self.pullback_c = float(pullback_c)
+        self.kappa = float(kappa)
+        self.precond = str(precond)
+        self.beta2 = float(beta2)
+        self.eps = float(eps)
+        self.update_freq = int(update_freq)
+        self.min_decay = float(min_decay)
+        self.step_index = 0
+        self._swapped = False
+
+    def _flat_params(self) -> list[nn.Parameter]:
+        return [p for group in self.param_groups for p in group["params"]]
+
+    @staticmethod
+    def _clone_state_value(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().clone()
+        if isinstance(value, dict):
+            return {key: PaceOptimizer._clone_state_value(val) for key, val in value.items()}
+        if isinstance(value, list):
+            return [PaceOptimizer._clone_state_value(val) for val in value]
+        if isinstance(value, tuple):
+            return tuple(PaceOptimizer._clone_state_value(val) for val in value)
+        return value
+
+    def _decay_t(self, t: int) -> float:
+        return max((1.0 + float(t)) ** (-self.kappa), self.min_decay)
+
+    @torch.no_grad()
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        self.base_optimizer.zero_grad(set_to_none=set_to_none)
+
+    @torch.no_grad()
+    def step(self, closure: Any | None = None) -> Any:
+        if self._swapped:
+            raise RuntimeError("PaceOptimizer.step() called while weights are swapped to the EMA")
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        self.step_index += 1
+        t = self.step_index
+        decay = self._decay_t(t)
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state.setdefault(p, {})
+                ema = state.get("ema")
+                if ema is None or ema.shape != p.shape:
+                    ema = state["ema"] = p.detach().to(torch.float32, copy=True)
+                pre = state.get("pre")
+                if pre is None or pre.shape != p.shape:
+                    pre = state["pre"] = torch.empty_like(p, dtype=torch.float32)
+                pre.copy_(p.detach())
+                if self.precond == "adam" and self.pullback_c > 0.0:
+                    v = state.get("v")
+                    if v is None or v.shape != p.shape:
+                        v = state["v"] = torch.zeros_like(p, dtype=torch.float32)
+                    g = p.grad.detach().to(torch.float32)
+                    v.mul_(self.beta2).addcmul_(g, g, value=1.0 - self.beta2)
+                elif self.precond == "row" and self.pullback_c > 0.0:
+                    # Row-granular curvature proxy: per-row gradient power on the
+                    # matrix view (same granularity as NorMuon/PMuonEq). Vector
+                    # and scalar tensors fall back to the scalar gain below.
+                    if root_optimizer._is_matrix_like_parameter(p, min_matrix_dim=2):
+                        g_mv = root_optimizer._matrix_view(p.grad.detach()).to(torch.float32)
+                        rows = g_mv.shape[0]
+                        v_row = state.get("v_row")
+                        if v_row is None or v_row.shape != (rows,):
+                            v_row = state["v_row"] = torch.zeros(rows, device=p.device, dtype=torch.float32)
+                        v_row.mul_(self.beta2).add_(g_mv.square().mean(dim=1), alpha=1.0 - self.beta2)
+
+        base_loss = self.base_optimizer.step()
+        if loss is None:
+            loss = base_loss
+
+        for group in self.param_groups:
+            lr = float(group.get("lr", 0.0))
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state.get(p)
+                if not state or "ema" not in state:
+                    continue
+                ema = state["ema"]
+                pre = state["pre"]
+                if self.pullback_c > 0.0:
+                    if self.precond == "adam":
+                        bias2 = max(1.0 - self.beta2**t, 1e-16)
+                        lam = (state["v"] / bias2).sqrt().add_(self.eps).reciprocal_()
+                        lam.mul_(lr * self.pullback_c * decay).clamp_(max=1.0)
+                        diff = (ema - pre).mul_(lam)
+                    elif self.precond == "row" and "v_row" in state:
+                        bias2 = max(1.0 - self.beta2**t, 1e-16)
+                        lam_row = (state["v_row"] / bias2).sqrt().add_(self.eps).reciprocal_()
+                        lam_row.mul_(lr * self.pullback_c * decay).clamp_(max=1.0)
+                        diff_mv = root_optimizer._matrix_view(ema - pre).mul_(lam_row.unsqueeze(1))
+                        diff = diff_mv.reshape(p.shape)
+                    else:
+                        lam_scalar = min(lr * self.pullback_c * decay, 1.0)
+                        diff = (ema - pre).mul_(lam_scalar)
+                    p.add_(diff.to(p.dtype))
+                if t % self.update_freq == 0:
+                    ema.mul_(1.0 - decay).add_(p.detach().to(torch.float32), alpha=decay)
+        return loss
+
+    @torch.no_grad()
+    def swap_to_ema(self) -> None:
+        if self._swapped:
+            return
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state.get(p)
+                if not state or "ema" not in state:
+                    continue
+                backup = state.get("live_backup")
+                if backup is None or backup.shape != p.shape:
+                    backup = state["live_backup"] = torch.empty_like(p)
+                backup.copy_(p.detach())
+                p.copy_(state["ema"].to(p.dtype))
+        self._swapped = True
+
+    @torch.no_grad()
+    def swap_to_live(self) -> None:
+        if not self._swapped:
+            return
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state.get(p)
+                if not state or "live_backup" not in state:
+                    continue
+                p.copy_(state["live_backup"])
+        self._swapped = False
+
+    def state_dict(self) -> dict[str, Any]:
+        param_to_index = {p: index for index, p in enumerate(self._flat_params())}
+        return {
+            "base_optimizer": self.base_optimizer.state_dict(),
+            "state": {
+                param_to_index[p]: state
+                for p, state in self.state.items()
+                if p in param_to_index
+            },
+            "step_index": self.step_index,
+            "pullback_c": self.pullback_c,
+            "kappa": self.kappa,
+            "precond": self.precond,
+            "beta2": self.beta2,
+            "eps": self.eps,
+            "update_freq": self.update_freq,
+            "min_decay": self.min_decay,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.base_optimizer.load_state_dict(state_dict["base_optimizer"])
+        self.param_groups = self.base_optimizer.param_groups
+        flat_params = self._flat_params()
+        packed_state = state_dict.get("state", {})
+        self.state = {}
+        for index, state in packed_state.items():
+            int_index = int(index)
+            if int_index < len(flat_params):
+                self.state[flat_params[int_index]] = self._clone_state_value(state)
+        self.step_index = int(state_dict.get("step_index", 0))
+        self.pullback_c = float(state_dict.get("pullback_c", self.pullback_c))
+        self.kappa = float(state_dict.get("kappa", self.kappa))
+        self.precond = str(state_dict.get("precond", self.precond))
+        self.beta2 = float(state_dict.get("beta2", self.beta2))
+        self.eps = float(state_dict.get("eps", self.eps))
+        self.update_freq = int(state_dict.get("update_freq", self.update_freq))
+        self.min_decay = float(state_dict.get("min_decay", self.min_decay))
+        self._swapped = False
 
 
 def make_optimizer(model: nn.Module, trial: TrialConfig) -> torch.optim.Optimizer:
@@ -796,6 +1386,37 @@ def make_optimizer(model: nn.Module, trial: TrialConfig) -> torch.optim.Optimize
             kwargs["muown_mag_lr_mult"] = trial.muown_mag_lr_mult
         return cls(model, **kwargs)
 
+    def make_pace(base: torch.optim.Optimizer, *, pullback_c: float | None = None) -> PaceOptimizer:
+        return PaceOptimizer(
+            base,
+            pullback_c=trial.pace_c if pullback_c is None else pullback_c,
+            kappa=trial.pace_kappa,
+            precond=trial.pace_precond,
+            beta2=trial.pace_beta2,
+            update_freq=trial.pace_update_freq,
+        )
+
+    def make_plain_muon() -> PlainMuon:
+        matrix, fallback = split_muon_groups(model, trial.weight_decay)
+        return PlainMuon(matrix, fallback, lr=trial.lr, weight_decay=trial.weight_decay)
+
+    def make_stack_muon(*, use_soda: bool, row_gamma: float, use_normuon: bool) -> StackMuon:
+        wd = 0.0 if use_soda else trial.weight_decay
+        matrix, fallback = split_muon_groups(model, wd)
+        return StackMuon(
+            matrix,
+            fallback,
+            lr=trial.lr,
+            weight_decay=wd,
+            use_soda=use_soda,
+            soda_lambda_scale=trial.soda_lambda_scale,
+            soda_lambda_power=trial.soda_lambda_power,
+            row_gamma=row_gamma,
+            pmuoneq_beta=trial.pmuoneq_beta,
+            use_normuon=use_normuon,
+            normuon_beta2=trial.normuon_beta2,
+        )
+
     if trial.family == "adamw":
         return torch.optim.AdamW(
             make_decay_groups(model, trial.weight_decay),
@@ -806,8 +1427,55 @@ def make_optimizer(model: nn.Module, trial: TrialConfig) -> torch.optim.Optimize
     if trial.family == "adamatan2":
         return AdamAtan2(make_decay_groups(model, trial.weight_decay), lr=trial.lr, betas=(0.9, 0.95))
     if trial.family == "muon":
+        return make_plain_muon()
+    if trial.family == "pace_adamw":
+        return make_pace(
+            torch.optim.AdamW(
+                make_decay_groups(model, trial.weight_decay),
+                lr=trial.lr,
+                betas=(0.9, 0.95),
+                eps=1e-8,
+            )
+        )
+    if trial.family == "emaeval_adamw":
+        return make_pace(
+            torch.optim.AdamW(
+                make_decay_groups(model, trial.weight_decay),
+                lr=trial.lr,
+                betas=(0.9, 0.95),
+                eps=1e-8,
+            ),
+            pullback_c=0.0,
+        )
+    if trial.family == "pace_muon":
+        return make_pace(make_plain_muon())
+    if trial.family == "pace_inject_muon":
         matrix, fallback = split_muon_groups(model, trial.weight_decay)
-        return PlainMuon(matrix, fallback, lr=trial.lr, weight_decay=trial.weight_decay)
+        return PaceInjectMuon(
+            matrix,
+            fallback,
+            lr=trial.lr,
+            weight_decay=trial.weight_decay,
+            pullback_c=trial.pace_c,
+            kappa=trial.pace_kappa,
+            update_freq=trial.pace_update_freq,
+        )
+    if trial.family == "emaeval_muon":
+        return make_pace(make_plain_muon(), pullback_c=0.0)
+    if trial.family == "muon_soda":
+        return make_stack_muon(use_soda=True, row_gamma=0.0, use_normuon=False)
+    if trial.family == "pace_muon_soda":
+        return make_pace(make_stack_muon(use_soda=True, row_gamma=0.0, use_normuon=False))
+    if trial.family == "muon_pmuoneq":
+        return make_stack_muon(use_soda=False, row_gamma=trial.row_gamma, use_normuon=False)
+    if trial.family == "pace_muon_pmuoneq":
+        return make_pace(make_stack_muon(use_soda=False, row_gamma=trial.row_gamma, use_normuon=False))
+    if trial.family == "muon_normuon":
+        return make_stack_muon(use_soda=False, row_gamma=0.0, use_normuon=True)
+    if trial.family == "pace_muon_normuon":
+        return make_pace(make_stack_muon(use_soda=False, row_gamma=0.0, use_normuon=True))
+    if trial.family == "pace_anchormuon":
+        return make_pace(make_anchor_base(root_optimizer.AnchorMuon))
     if trial.family == "muown":
         matrix, fallback = split_muon_groups(model, trial.weight_decay)
         return Muown(matrix, fallback, lr=trial.lr, weight_decay=trial.weight_decay)
@@ -966,6 +1634,11 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
                 # eval points and best_val_loss = min over eval rows is biased
                 # downward by lucky easy random draws.
                 val_gen.manual_seed(trial.seed + 20)
+                # PACE-style optimizers return the EMA weights, so validation
+                # must score the EMA, not the live iterate.
+                swap_to_ema = getattr(optimizer, "swap_to_ema", None)
+                if callable(swap_to_ema):
+                    swap_to_ema()
                 val_loss, val_acc = evaluate(
                     model,
                     val_stream,
@@ -975,6 +1648,9 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
                     generator=val_gen,
                     mode=args.eval_mode,
                 )
+                swap_to_live = getattr(optimizer, "swap_to_live", None)
+                if callable(swap_to_live):
+                    swap_to_live()
                 recent = step_times[-max(1, min(len(step_times), trial.eval_every)):]
                 mean_recent = float(np.mean(recent))
                 f.write(json.dumps({
@@ -993,6 +1669,9 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
     final_eval = eval_rows[-1]
     final_full_eval: dict[str, float] = {}
     if args.final_eval_batches > 0:
+        swap_to_ema = getattr(optimizer, "swap_to_ema", None)
+        if callable(swap_to_ema):
+            swap_to_ema()
         full_loss, full_acc = evaluate(
             model,
             val_stream,
@@ -1002,6 +1681,9 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
             generator=torch.Generator(device=device).manual_seed(trial.seed + 30),
             mode=args.eval_mode,
         )
+        swap_to_live = getattr(optimizer, "swap_to_live", None)
+        if callable(swap_to_live):
+            swap_to_live()
         final_full_eval = {
             "final_full_val_loss": full_loss,
             "final_full_val_acc": full_acc,
@@ -1039,14 +1721,25 @@ def run_trial(args: argparse.Namespace, trial: TrialConfig) -> dict[str, Any]:
 def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
     if args.preset == "smoke":
         return [
-            TrialConfig("smoke_adamw", "adamw", 5e-4, steps=4, eval_every=2),
-            TrialConfig("smoke_anchor", "anchormuon", 1e-3, steps=4, eval_every=2),
-            TrialConfig("smoke_anchormuown", "anchormuown", 1e-3, steps=4, eval_every=2),
-            TrialConfig("smoke_muown", "muown", 1e-3, weight_decay=0.0, steps=4, eval_every=2),
-            TrialConfig("smoke_ema_anchor", "ema_anchormuon", 1e-3, ema_beta=0.3, steps=4, eval_every=2),
-            TrialConfig("smoke_ema_anchormuown", "ema_anchormuown", 1e-3, ema_beta=0.3, steps=4, eval_every=2),
-            TrialConfig("smoke_ema_muon", "ema_muon", 1e-3, ema_beta=0.3, steps=4, eval_every=2),
-            TrialConfig("smoke_ema_muown", "ema_muown", 1e-3, weight_decay=0.0, ema_beta=0.3, steps=4, eval_every=2),
+            TrialConfig("smoke_adamw", "adamw", 5e-4, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_anchor", "anchormuon", 1e-3, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_anchormuown", "anchormuown", 1e-3, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_muown", "muown", 1e-3, weight_decay=0.0, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_ema_anchor", "ema_anchormuon", 1e-3, ema_beta=0.3, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_ema_anchormuown", "ema_anchormuown", 1e-3, ema_beta=0.3, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_ema_muon", "ema_muon", 1e-3, ema_beta=0.3, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_ema_muown", "ema_muown", 1e-3, weight_decay=0.0, ema_beta=0.3, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_pace_adamw", "pace_adamw", 5e-4, pace_c=0.01, pace_kappa=0.5, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_emaeval_muon", "emaeval_muon", 1e-3, pace_kappa=0.5, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_pace_muon", "pace_muon", 1e-3, pace_c=0.01, pace_kappa=0.5, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_pace_muon_scalar", "pace_muon", 1e-3, pace_c=0.01, pace_kappa=0.5, pace_precond="scalar", steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_muon_soda", "muon_soda", 1e-3, soda_lambda_scale=0.003, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_pace_muon_soda", "pace_muon_soda", 1e-3, soda_lambda_scale=0.003, pace_c=0.01, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_muon_pmuoneq", "muon_pmuoneq", 1e-3, row_gamma=0.35, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_pace_muon_pmuoneq", "pace_muon_pmuoneq", 1e-3, row_gamma=0.35, pace_c=0.01, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_muon_normuon", "muon_normuon", 1e-3, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_pace_muon_normuon", "pace_muon_normuon", 1e-3, pace_c=0.01, steps=4, eval_every=2, warmup_steps=1),
+            TrialConfig("smoke_pace_anchormuon", "pace_anchormuon", 1e-3, soda_lambda_scale=0.003, pace_c=0.01, steps=4, eval_every=2, warmup_steps=1),
         ]
 
     trials: list[TrialConfig] = []
@@ -1571,6 +2264,262 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
         warmup = min(args.warmup_steps, max(1, args.hpo_steps // 4))
         return [replace(trial, eval_every=eval_every, warmup_steps=warmup) for trial in trials]
 
+    if args.preset == "fineweb_pace_hpo":
+        by_name: dict[str, TrialConfig] = {}
+
+        def add(trial: TrialConfig) -> None:
+            by_name.setdefault(trial.name, trial)
+
+        # Reference rows rerun on this machine so PACE is judged against the
+        # current tokenized-FineWeb 8K winners under identical hardware.
+        for lr in (4e-4, 5e-4, 6e-4):
+            add(TrialConfig(f"pace_ref_adamw_lr{lr:g}", "adamw", lr, steps=args.hpo_steps))
+        for lr in (1.2e-3, 1.4e-3, 1.6e-3, 1.8e-3):
+            add(TrialConfig(f"pace_ref_muon_lr{lr:g}", "muon", lr, weight_decay=0.05, steps=args.hpo_steps))
+        for lr in (1.4e-3, 1.6e-3):
+            add(
+                TrialConfig(
+                    f"pace_ref_ema_muon_lr{lr:g}_b0.1_g0.995",
+                    "ema_muon",
+                    lr,
+                    weight_decay=0.05,
+                    ema_beta=0.10,
+                    ema_gamma=0.995,
+                    ema_warmup_frac=0.20,
+                    ema_rest_frac=0.10,
+                    steps=args.hpo_steps,
+                )
+            )
+        anchor_refs = (
+            (1.6e-3, 0.15, 1e-3),
+            (1.6e-3, 0.0, 3e-3),
+            (1.4e-3, 0.15, 1e-3),
+        )
+        for lr, row_gamma, soda_lambda_scale in anchor_refs:
+            add(
+                TrialConfig(
+                    f"pace_ref_anchor_lr{lr:g}_rg{row_gamma:g}_soda{soda_lambda_scale:g}_flr1_rms",
+                    "anchormuon",
+                    lr,
+                    row_gamma=row_gamma,
+                    pmuoneq_beta=0.90,
+                    normuon_beta2=0.93,
+                    fallback_lr_mult=1.0,
+                    fallback_mode="rms",
+                    soda_lambda_scale=soda_lambda_scale,
+                    steps=args.hpo_steps,
+                )
+            )
+
+        # EMA-evaluated controls (PACE with c=0). These isolate how much of any
+        # PACE gain is just returning the EMA instead of the live iterate.
+        for lr in (4e-4, 5e-4, 6e-4):
+            for kappa in (0.3, 0.5, 0.7):
+                add(
+                    TrialConfig(
+                        f"pace_emaeval_adamw_lr{lr:g}_k{kappa:g}",
+                        "emaeval_adamw",
+                        lr,
+                        pace_kappa=kappa,
+                        steps=args.hpo_steps,
+                    )
+                )
+        for lr in (1.2e-3, 1.4e-3, 1.6e-3):
+            for kappa in (0.3, 0.5, 0.7):
+                add(
+                    TrialConfig(
+                        f"pace_emaeval_muon_lr{lr:g}_k{kappa:g}",
+                        "emaeval_muon",
+                        lr,
+                        weight_decay=0.05,
+                        pace_kappa=kappa,
+                        steps=args.hpo_steps,
+                    )
+                )
+
+        pace_cs = (1e-3, 3e-3, 1e-2, 3e-2, 1e-1)
+        pace_kappas = (0.3, 0.5)
+
+        # Paper-faithful PACE around AdamW.
+        for lr in (4e-4, 5e-4, 6e-4):
+            for c in pace_cs:
+                for kappa in pace_kappas:
+                    add(
+                        TrialConfig(
+                            f"pace_adamw_lr{lr:g}_c{c:g}_k{kappa:g}",
+                            "pace_adamw",
+                            lr,
+                            pace_c=c,
+                            pace_kappa=kappa,
+                            steps=args.hpo_steps,
+                        )
+                    )
+        # Constant-LR PACE arm: the paper sells PACE partly as an alternative
+        # to LR decay, so test it without the WSD decay tail as well.
+        for c in (3e-3, 1e-2, 3e-2):
+            add(
+                TrialConfig(
+                    f"pace_adamw_lr0.0005_c{c:g}_k0.5_const",
+                    "pace_adamw",
+                    5e-4,
+                    pace_c=c,
+                    pace_kappa=0.5,
+                    final_lr_scale=1.0,
+                    wsd_decay_frac=0.0,
+                    steps=args.hpo_steps,
+                )
+            )
+
+        # PACE on base Muon (GramNS is already part of the local base Muon).
+        for lr in (1.2e-3, 1.4e-3, 1.6e-3):
+            for wd in (0.0, 0.05):
+                for c in pace_cs:
+                    for kappa in pace_kappas:
+                        add(
+                            TrialConfig(
+                                f"pace_muon_lr{lr:g}_wd{wd:g}_c{c:g}_k{kappa:g}",
+                                "pace_muon",
+                                lr,
+                                weight_decay=wd,
+                                pace_c=c,
+                                pace_kappa=kappa,
+                                steps=args.hpo_steps,
+                            )
+                        )
+        for c in (3e-3, 1e-2, 3e-2):
+            add(
+                TrialConfig(
+                    f"pace_muon_lr0.0014_wd0.05_c{c:g}_k0.5_scalar",
+                    "pace_muon",
+                    1.4e-3,
+                    weight_decay=0.05,
+                    pace_c=c,
+                    pace_kappa=0.5,
+                    pace_precond="scalar",
+                    steps=args.hpo_steps,
+                )
+            )
+            add(
+                TrialConfig(
+                    f"pace_muon_lr0.0014_wd0.05_c{c:g}_k0.5_const",
+                    "pace_muon",
+                    1.4e-3,
+                    weight_decay=0.05,
+                    pace_c=c,
+                    pace_kappa=0.5,
+                    final_lr_scale=1.0,
+                    wsd_decay_frac=0.0,
+                    steps=args.hpo_steps,
+                )
+            )
+
+        # Single-increment controls without PACE, so each PACE+increment row
+        # has a same-machine baseline.
+        for lr in (1.2e-3, 1.4e-3, 1.6e-3):
+            for soda_lambda_scale in (1e-3, 3e-3, 1e-2):
+                add(
+                    TrialConfig(
+                        f"muon_soda_lr{lr:g}_soda{soda_lambda_scale:g}",
+                        "muon_soda",
+                        lr,
+                        soda_lambda_scale=soda_lambda_scale,
+                        steps=args.hpo_steps,
+                    )
+                )
+            for row_gamma in (0.15, 0.35, 0.55):
+                add(
+                    TrialConfig(
+                        f"muon_pmuoneq_lr{lr:g}_rg{row_gamma:g}",
+                        "muon_pmuoneq",
+                        lr,
+                        weight_decay=0.05,
+                        row_gamma=row_gamma,
+                        steps=args.hpo_steps,
+                    )
+                )
+            for normuon_beta2 in (0.90, 0.93):
+                add(
+                    TrialConfig(
+                        f"muon_normuon_lr{lr:g}_nb{normuon_beta2:g}",
+                        "muon_normuon",
+                        lr,
+                        weight_decay=0.05,
+                        normuon_beta2=normuon_beta2,
+                        steps=args.hpo_steps,
+                    )
+                )
+
+        # PACE plus each single increment.
+        combo_cs = (3e-3, 1e-2, 3e-2)
+        for lr in (1.4e-3, 1.6e-3):
+            for c in combo_cs:
+                for kappa in pace_kappas:
+                    for soda_lambda_scale in (1e-3, 3e-3):
+                        add(
+                            TrialConfig(
+                                f"pace_muon_soda_lr{lr:g}_soda{soda_lambda_scale:g}_c{c:g}_k{kappa:g}",
+                                "pace_muon_soda",
+                                lr,
+                                soda_lambda_scale=soda_lambda_scale,
+                                pace_c=c,
+                                pace_kappa=kappa,
+                                steps=args.hpo_steps,
+                            )
+                        )
+                    for row_gamma in (0.15, 0.35):
+                        add(
+                            TrialConfig(
+                                f"pace_muon_pmuoneq_lr{lr:g}_rg{row_gamma:g}_c{c:g}_k{kappa:g}",
+                                "pace_muon_pmuoneq",
+                                lr,
+                                weight_decay=0.05,
+                                row_gamma=row_gamma,
+                                pace_c=c,
+                                pace_kappa=kappa,
+                                steps=args.hpo_steps,
+                            )
+                        )
+                    add(
+                        TrialConfig(
+                            f"pace_muon_normuon_lr{lr:g}_nb0.93_c{c:g}_k{kappa:g}",
+                            "pace_muon_normuon",
+                            lr,
+                            weight_decay=0.05,
+                            normuon_beta2=0.93,
+                            pace_c=c,
+                            pace_kappa=kappa,
+                            steps=args.hpo_steps,
+                        )
+                    )
+
+        # PACE on the full AnchorMuon stack.
+        for lr, row_gamma, soda_lambda_scale in anchor_refs:
+            for c in combo_cs:
+                for kappa in pace_kappas:
+                    add(
+                        TrialConfig(
+                            f"pace_anchor_lr{lr:g}_rg{row_gamma:g}_soda{soda_lambda_scale:g}_flr1_rms_c{c:g}_k{kappa:g}",
+                            "pace_anchormuon",
+                            lr,
+                            row_gamma=row_gamma,
+                            pmuoneq_beta=0.90,
+                            normuon_beta2=0.93,
+                            fallback_lr_mult=1.0,
+                            fallback_mode="rms",
+                            soda_lambda_scale=soda_lambda_scale,
+                            pace_c=c,
+                            pace_kappa=kappa,
+                            steps=args.hpo_steps,
+                        )
+                    )
+
+        trials = list(by_name.values())
+        if args.max_hpo_trials:
+            trials = trials[: args.max_hpo_trials]
+        eval_every = max(1, args.hpo_steps // max(args.eval_bins, 1))
+        warmup = min(args.warmup_steps, max(1, args.hpo_steps // 4))
+        return [replace(trial, eval_every=eval_every, warmup_steps=warmup) for trial in trials]
+
     if args.preset == "anchor_harder":
         by_name: dict[str, TrialConfig] = {}
 
@@ -1752,29 +2701,60 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
 
 
 def final_trials_from_hpo(args: argparse.Namespace, hpo_rows: list[dict[str, Any]]) -> list[TrialConfig]:
+    def best_loss(row: dict[str, Any]) -> float:
+        try:
+            value = float(row["best_val_loss"])
+        except (KeyError, TypeError, ValueError):
+            return math.inf
+        return value if math.isfinite(value) else math.inf
+
+    final_steps = int(args.final_steps)
+    if getattr(args, "preset", "") == "smoke" and hpo_rows:
+        smoke_steps = [
+            int(float(row["steps"]))
+            for row in hpo_rows
+            if row.get("steps") not in (None, "")
+        ]
+        if smoke_steps:
+            final_steps = min(smoke_steps)
+
     by_family: dict[str, list[dict[str, Any]]] = {}
     for row in hpo_rows:
+        if "best_val_loss" in row and not math.isfinite(best_loss(row)):
+            continue
         family = str(row["family"])
         by_family.setdefault(family, []).append(row)
-    eval_every = max(1, args.final_steps // max(args.eval_bins, 1))
-    warmup = min(args.warmup_steps, max(1, args.final_steps // 4))
+    eval_every = max(1, final_steps // max(args.eval_bins, 1))
+    warmup = min(args.warmup_steps, max(1, final_steps // 4))
     trials: list[TrialConfig] = []
     seen_names: set[str] = set()
     for family in (
         "anchormuon",
+        "pace_anchormuon",
         "anchormuown",
         "ema_anchormuon",
         "ema_anchormuown",
         "muown",
         "ema_muown",
         "ema_muon",
+        "pace_muon_soda",
+        "pace_muon_pmuoneq",
+        "pace_muon_normuon",
+        "muon_soda",
+        "muon_pmuoneq",
+        "muon_normuon",
+        "pace_muon",
+        "pace_inject_muon",
+        "emaeval_muon",
+        "pace_adamw",
+        "emaeval_adamw",
         "adamw",
         "adamatan2",
         "muon",
     ):
         if family not in by_family:
             continue
-        rows = sorted(by_family[family], key=lambda r: float(r["best_val_loss"]))
+        rows = sorted(by_family[family], key=best_loss)
         for row in rows[: max(1, int(args.final_top_per_family))]:
             name = f"final_{row['name']}"
             if name in seen_names:
@@ -1798,8 +2778,15 @@ def final_trials_from_hpo(args: argparse.Namespace, hpo_rows: list[dict[str, Any
                     ema_warmup_frac=float(row.get("ema_warmup_frac", 0.30)),
                     ema_rest_frac=float(row.get("ema_rest_frac", 0.20)),
                     muown_mag_lr_mult=float(row.get("muown_mag_lr_mult", 1.0)),
+                    pace_c=float(row.get("pace_c", 0.0)),
+                    pace_kappa=float(row.get("pace_kappa", 0.5)),
+                    pace_precond=str(row.get("pace_precond", "adam")),
+                    pace_beta2=float(row.get("pace_beta2", 0.999)),
+                    pace_update_freq=int(float(row.get("pace_update_freq", 1))),
+                    final_lr_scale=float(row.get("final_lr_scale", 0.1)),
+                    wsd_decay_frac=float(row.get("wsd_decay_frac", 0.2)),
                     seed=args.seed,
-                    steps=args.final_steps,
+                    steps=final_steps,
                     eval_every=eval_every,
                     warmup_steps=warmup,
                 )
@@ -1988,6 +2975,7 @@ def make_plots(args: argparse.Namespace, final_rows: list[dict[str, Any]]) -> No
     plots_dir.mkdir(parents=True, exist_ok=True)
     labels = {
         "anchormuon": "AnchorMuon",
+        "pace_anchormuon": "PACE + AnchorMuon",
         "anchormuown": "AnchorMuown",
         "ema_anchormuon": "EMA-Nesterov + AnchorMuon",
         "ema_anchormuown": "EMA-Nesterov + AnchorMuown",
@@ -1997,6 +2985,17 @@ def make_plots(args: argparse.Namespace, final_rows: list[dict[str, Any]]) -> No
         "muown": "Muown",
         "ema_muon": "EMA-Nesterov + Muon",
         "ema_muown": "EMA-Nesterov + Muown",
+        "pace_adamw": "PACE-AdamW",
+        "emaeval_adamw": "AdamW @ EMA",
+        "pace_muon": "PACE + Muon",
+        "pace_inject_muon": "PACE-inject + Muon",
+        "emaeval_muon": "Muon @ EMA",
+        "muon_soda": "Muon + SODA",
+        "pace_muon_soda": "PACE + Muon + SODA",
+        "muon_pmuoneq": "Muon + PMuonEq",
+        "pace_muon_pmuoneq": "PACE + Muon + PMuonEq",
+        "muon_normuon": "Muon + NorMuon",
+        "pace_muon_normuon": "PACE + Muon + NorMuon",
     }
     accuracy_label = "Byte accuracy" if args.tokenizer_mode == "byte" else "Token accuracy"
     for metric, ylabel, out_name in [
@@ -2035,6 +3034,7 @@ def make_plots(args: argparse.Namespace, final_rows: list[dict[str, Any]]) -> No
 def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], final_rows: list[dict[str, Any]]) -> None:
     labels = {
         "anchormuon": "AnchorMuon",
+        "pace_anchormuon": "PACE + AnchorMuon",
         "anchormuown": "AnchorMuown",
         "ema_anchormuon": "EMA-Nesterov + AnchorMuon",
         "ema_anchormuown": "EMA-Nesterov + AnchorMuown",
@@ -2044,6 +3044,17 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
         "muown": "Muown",
         "ema_muon": "EMA-Nesterov + Muon",
         "ema_muown": "EMA-Nesterov + Muown",
+        "pace_adamw": "PACE-AdamW",
+        "emaeval_adamw": "AdamW @ EMA",
+        "pace_muon": "PACE + Muon",
+        "pace_inject_muon": "PACE-inject + Muon",
+        "emaeval_muon": "Muon @ EMA",
+        "muon_soda": "Muon + SODA",
+        "pace_muon_soda": "PACE + Muon + SODA",
+        "muon_pmuoneq": "Muon + PMuonEq",
+        "pace_muon_pmuoneq": "PACE + Muon + PMuonEq",
+        "muon_normuon": "Muon + NorMuon",
+        "pace_muon_normuon": "PACE + Muon + NorMuon",
     }
     final_sorted = sorted(
         final_rows,
@@ -2098,7 +3109,7 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
     ]
     for rank, row in enumerate(final_sorted, start=1):
         config = f"lr={float(row['lr']):g}, wd={float(row.get('weight_decay', 0.0)):g}"
-        if row["family"] in ("anchormuon", "anchormuown", "ema_anchormuon", "ema_anchormuown"):
+        if row["family"] in ("anchormuon", "pace_anchormuon", "anchormuown", "ema_anchormuon", "ema_anchormuown"):
             config += (
                 f", row_gamma={float(row['row_gamma']):g}, pmuon_beta={float(row['pmuoneq_beta']):g}, "
                 f"normuon_beta2={float(row['normuon_beta2']):g}, fallback={row['fallback_mode']}@{float(row['fallback_lr_mult']):g}x, "
@@ -2108,6 +3119,20 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
             config += f", mag_lr={float(row.get('muown_mag_lr_mult', 1.0)):g}x"
         if row["family"] in ("ema_muon", "ema_muown", "ema_anchormuon", "ema_anchormuown"):
             config += f", ema_beta={float(row['ema_beta']):g}, ema_gamma={float(row['ema_gamma']):g}"
+        if row["family"] in ("muon_soda", "pace_muon_soda"):
+            config += f", soda={float(row.get('soda_lambda_scale', 1.0)):g}"
+        if row["family"] in ("muon_pmuoneq", "pace_muon_pmuoneq"):
+            config += f", row_gamma={float(row['row_gamma']):g}, pmuon_beta={float(row['pmuoneq_beta']):g}"
+        if row["family"] in ("muon_normuon", "pace_muon_normuon"):
+            config += f", normuon_beta2={float(row['normuon_beta2']):g}"
+        if str(row["family"]).startswith(("pace_", "emaeval_")):
+            config += f", pace_c={float(row.get('pace_c', 0.0)):g}, kappa={float(row.get('pace_kappa', 0.5)):g}"
+            if str(row.get("pace_precond", "adam")) != "adam":
+                config += f", precond={row['pace_precond']}"
+            if int(float(row.get("pace_update_freq", 1))) != 1:
+                config += f", uf={int(float(row['pace_update_freq']))}"
+        if float(row.get("final_lr_scale", 0.1)) == 1.0 or float(row.get("wsd_decay_frac", 0.2)) == 0.0:
+            config += ", const-lr"
         if "final_full_val_loss" in row:
             full_loss = f"{float(row['final_full_val_loss']):.4f}"
             full_acc = f"{100.0 * float(row['final_full_val_acc']):.2f}%"
@@ -2143,11 +3168,16 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
             "| Family | Trial | LR | Best val loss | Final val loss | Step time |",
             "|---|---|---:|---:|---:|---:|",
         ]
-        for row in sorted(hpo_rows, key=lambda r: (str(r["family"]), float(r["best_val_loss"]))):
+        # hpo_rows may come from a hand-written selection CSV in --final-only
+        # mode, which carries only the fields needed to build TrialConfigs.
+        for row in sorted(hpo_rows, key=lambda r: (str(r["family"]), finite_metric(r, "best_val_loss"))):
+            final_loss = finite_metric(row, "final_val_loss")
+            step_ms = finite_metric(row, "mean_step_time_ms")
             lines.append(
                 f"| {row['family']} | `{row['name']}` | {float(row['lr']):g} | "
-                f"{float(row['best_val_loss']):.4f} | {float(row['final_val_loss']):.4f} | "
-                f"{float(row['mean_step_time_ms']):.2f} ms |"
+                f"{finite_metric(row, 'best_val_loss'):.4f} | "
+                f"{final_loss if math.isfinite(final_loss) else float('nan'):.4f} | "
+                f"{f'{step_ms:.2f} ms' if math.isfinite(step_ms) else 'n/a'} |"
             )
     (args.output_dir / "summary.md").write_text("\n".join(lines) + "\n")
 

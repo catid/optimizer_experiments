@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -45,6 +46,11 @@ def read_rows(path: Path) -> list[dict[str, str]]:
 def as_float(row: dict[str, str], key: str) -> float:
     value = row.get(key, "")
     return float(value) if value not in ("", None) else float("nan")
+
+
+def finite_metric(row: dict[str, str], key: str, *, default: float) -> float:
+    value = as_float(row, key)
+    return value if math.isfinite(value) else default
 
 
 def load_curves(result_dir: Path) -> list[dict[str, str]]:
@@ -95,7 +101,13 @@ def plot_loss_curves(result_dir: Path, curves: list[dict[str, str]]) -> None:
 
 
 def plot_accuracy_best_vs_adamw(result_dir: Path, curves: list[dict[str, str]], summaries: list[dict[str, str]]) -> str:
-    best = min(summaries, key=lambda row: as_float(row, "best_val_loss"))
+    best = min(
+        summaries,
+        key=lambda row: (
+            finite_metric(row, "best_val_loss", default=math.inf),
+            -finite_metric(row, "best_val_accuracy", default=-math.inf),
+        ),
+    )
     best_name = best["name"]
     selected = {"adamw_lr0.0025_wd0.005", best_name}
     fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
@@ -115,7 +127,7 @@ def plot_accuracy_best_vs_adamw(result_dir: Path, curves: list[dict[str, str]], 
 
 
 def plot_speed(result_dir: Path, summaries: list[dict[str, str]]) -> None:
-    ranked = sorted(summaries, key=lambda row: as_float(row, "mean_step_s"))
+    ranked = sorted(summaries, key=lambda row: finite_metric(row, "mean_step_s", default=math.inf))
     labels = [LABELS.get(row["name"], row["name"]) for row in ranked]
     step_ms = [1000.0 * as_float(row, "mean_step_s") for row in ranked]
     examples_per_s = [as_float(row, "overall_examples_per_s") for row in ranked]
@@ -135,7 +147,13 @@ def plot_speed(result_dir: Path, summaries: list[dict[str, str]]) -> None:
 
 
 def write_report(result_dir: Path, summaries: list[dict[str, str]], best_name: str) -> None:
-    by_loss = sorted(summaries, key=lambda row: (as_float(row, "best_val_loss"), -as_float(row, "best_val_accuracy")))
+    by_loss = sorted(
+        summaries,
+        key=lambda row: (
+            finite_metric(row, "best_val_loss", default=math.inf),
+            -finite_metric(row, "best_val_accuracy", default=-math.inf),
+        ),
+    )
     lines = [
         "# CIFAR-10 NorMuon Aspect Ablation",
         "",

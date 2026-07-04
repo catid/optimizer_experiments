@@ -1,0 +1,26 @@
+id: fig_appendix_tulu_qwen
+paper: "Fig 10"
+desc: "Qwen3-1.7B on Tulu-3: c x kappa sweep at lr in {3e-4, 5e-4}"
+dataset: tulu3
+
+# Exact exp27 run set (Qwen3-1.7B fine-tuned on allenai/tulu-3-sft-mixture,
+# constant LR). 2 AdamW + 6 EMA (kappa {0.2,0.5,0.7} x lr {3e-4,5e-4}) +
+# 6 PACE cells = 14 runs. The figure's trajectory row is drawn at lr=3e-4.
+curves:
+  # ---- AdamW baselines ----
+  - {model: qwen3_1.7b, method: AdamW, schedule: const, seed: 42, optimizer: {name: adamw, lr: 0.0003, lambda_pullback: 0.0}}
+  - {model: qwen3_1.7b, method: AdamW, schedule: const, seed: 42, optimizer: {name: adamw, lr: 0.0005, lambda_pullback: 0.0}}
+  # ---- EMA baselines (c=0) ----
+  - {model: qwen3_1.7b, method: EMA, schedule: const, seed: 42, optimizer: {name: ema, lr: 0.0003, lambda_pullback: 0.0, ema_kappa: 0.2}}
+  - {model: qwen3_1.7b, method: EMA, schedule: const, seed: 42, optimizer: {name: ema, lr: 0.0005, lambda_pullback: 0.0, ema_kappa: 0.2}}
+  - {model: qwen3_1.7b, method: EMA, schedule: const, seed: 42, optimizer: {name: ema, lr: 0.0003, lambda_pullback: 0.0, ema_kappa: 0.5}}
+  - {model: qwen3_1.7b, method: EMA, schedule: const, seed: 42, optimizer: {name: ema, lr: 0.0005, lambda_pullback: 0.0, ema_kappa: 0.5}}
+  - {model: qwen3_1.7b, method: EMA, schedule: const, seed: 42, optimizer: {name: ema, lr: 0.0003, lambda_pullback: 0.0, ema_kappa: 0.7}}
+  - {model: qwen3_1.7b, method: EMA, schedule: const, seed: 42, optimizer: {name: ema, lr: 0.0005, lambda_pullback: 0.0, ema_kappa: 0.7}}
+  # ---- PACE cells (exp27 populated grid) ----
+  - {model: qwen3_1.7b, method: PACE, schedule: const, seed: 42, optimizer: {name: pace, lr: 0.0005, lambda_pullback: 0.05, ema_kappa: 0.2}}
+  - {model: qwen3_1.7b, method: PACE, schedule: const, seed: 42, optimizer: {name: pace, lr: 0.0003, lambda_pullback: 0.1,  ema_kappa: 0.2}}
+  - {model: qwen3_1.7b, method: PACE, schedule: const, seed: 42, optimizer: {name: pace, lr: 0.0003, lambda_pullback: 0.1,  ema_kappa: 0.5}}
+  - {model: qwen3_1.7b, method: PACE, schedule: const, seed: 42, optimizer: {name: pace, lr: 0.0005, lambda_pullback: 0.25, ema_kappa: 0.5}}
+  - {model: qwen3_1.7b, method: PACE, schedule: const, seed: 42, optimizer: {name: pace, lr: 0.0003, lambda_pullback: 0.25, ema_kappa: 0.7}}
+  - {model: qwen3_1.7b, method: PACE, schedule: const, seed: 42, optimizer: {name: pace, lr: 0.0005, lambda_pullback: 0.15, ema_kappa: 0.7}}

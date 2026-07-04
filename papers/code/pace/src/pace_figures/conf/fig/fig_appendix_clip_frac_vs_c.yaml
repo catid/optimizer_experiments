@@ -1,0 +1,18 @@
+id: fig_appendix_clip_frac_vs_c
+paper: "Fig 13"
+desc: "SmolLM2-1.7B: end-of-training coordinate-saturation fraction vs c"
+dataset: smoltalk
+
+# Appendix Fig 13 reuses the same SmolLM2-1.7B (exp14) telemetry cache as Fig 12,
+# but plots the end-of-training lambda-clip fraction against c, one line per lr,
+# one panel per kappa. Same underlying PACE runs (no AdamW/EMA points). Values
+# from the shared cache in fig_appendix_clip_frac.py: LRS=[3e-4,1e-3],
+# KAPPAS=[0.2,0.5,0.7], C_VALUES=[0.005,0.015,0.05,0.15,0.5],
+# ema_update_freq=1, const schedule, seed 42.
+sweep:
+  model: smollm2_1.7b
+  base: {method: PACE, optimizer: {name: pace, ema_update_freq: 1}, schedule: const, seed: 42}
+  grid:
+    optimizer.lr: [0.0003, 0.001]
+    optimizer.ema_kappa: [0.2, 0.5, 0.7]
+    optimizer.lambda_pullback: [0.005, 0.015, 0.05, 0.15, 0.5]

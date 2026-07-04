@@ -158,6 +158,38 @@ def test_unnamed_parameter_constructor_deduplicates_shared_tensors() -> None:
     assert len(opt.param_groups[0]["params"]) == 1
 
 
+def test_dict_group_accepts_single_parameter_tensor() -> None:
+    p = nn.Parameter(torch.zeros(2, 2))
+    opt = AnchorMuon([{"params": p}], ns_compute_dtype=torch.float32)
+
+    assert len(opt.param_groups) == 1
+    assert opt.param_groups[0]["params"] == [p]
+
+    p.grad = torch.ones_like(p)
+    opt.step()
+
+    assert opt.last_stats["matrix_count"] == 1.0
+
+
+def test_dict_group_deduplicates_shared_tensors() -> None:
+    p = nn.Parameter(torch.tensor([1.0]))
+    opt = AnchorMuon(
+        [{"params": [p, p], "use_matrix_update": False}],
+        lr=0.1,
+        fallback_mode="rms",
+        fallback_betas=(0.0, 0.0),
+    )
+
+    assert len(opt.param_groups) == 1
+    assert opt.param_groups[0]["params"] == [p]
+
+    p.grad = torch.ones_like(p)
+    opt.step()
+
+    assert opt.last_stats["fallback_count"] == 1.0
+    assert torch.allclose(p.detach(), torch.tensor([0.9]), atol=1e-6, rtol=1e-6)
+
+
 def test_sparse_gradients_fail_with_clear_error() -> None:
     model = SparseEmbeddingNet()
     opt = AnchorMuon(model)
@@ -233,6 +265,43 @@ def test_matrix_dict_group_propagates_fallback_settings_for_fallback_params() ->
 
     assert "exp_avg" in opt.state[p]
     assert "exp_avg_sq" in opt.state[p]
+
+
+def test_standard_dict_group_infers_matrix_update_for_matrix_params() -> None:
+    p = nn.Parameter(torch.zeros(4, 4))
+    opt = AnchorMuon(
+        [{"params": [p], "lr": 0.01}],
+        ns_compute_dtype=torch.float32,
+    )
+
+    p.grad = torch.ones_like(p)
+    opt.step()
+
+    assert opt.param_groups[0]["use_matrix_update"] is True
+    assert opt.last_stats["matrix_count"] == 1.0
+    assert "momentum_buffer" in opt.state[p]
+    assert "exp_avg_sq" not in opt.state[p]
+
+
+def test_mixed_standard_dict_group_splits_fallback_lr() -> None:
+    matrix = nn.Parameter(torch.zeros(2, 2))
+    vector = nn.Parameter(torch.tensor([1.0]))
+    opt = AnchorMuon(
+        [{"params": [matrix, vector]}],
+        lr=0.1,
+        fallback_lr=0.001,
+        fallback_mode="rms",
+        fallback_betas=(0.0, 0.0),
+        ns_compute_dtype=torch.float32,
+    )
+
+    assert [(group["use_matrix_update"], group["lr"]) for group in opt.param_groups] == [(True, 0.1), (False, 0.001)]
+
+    matrix.grad = torch.zeros_like(matrix)
+    vector.grad = torch.ones_like(vector)
+    opt.step()
+
+    assert torch.allclose(vector.detach(), torch.tensor([0.999]), atol=1e-6, rtol=1e-6)
 
 
 def test_adamc_fallback_applies_optional_lr_squared_decay() -> None:
@@ -390,6 +459,46 @@ def test_anchor_state_dict_resume_matches_uninterrupted_training() -> None:
 
     for a, b in zip(uninterrupted.parameters(), resumed.parameters(), strict=True):
         assert torch.allclose(a, b, atol=1e-6, rtol=1e-6)
+
+
+def test_anchor_bfloat16_state_dict_load_restores_fp32_math_state() -> None:
+    matrix = nn.Parameter(torch.randn(4, 4, dtype=torch.bfloat16))
+    fallback = nn.Parameter(torch.randn(4, dtype=torch.bfloat16))
+    opt = AnchorMuon(
+        [
+            {"params": [matrix], "use_matrix_update": True, "lr": 1e-3},
+            {"params": [fallback], "use_matrix_update": False, "lr": 1e-3},
+        ],
+        fallback_mode="atan2",
+        ns_compute_dtype=torch.float32,
+    )
+    matrix.grad = torch.randn_like(matrix)
+    fallback.grad = torch.randn_like(fallback)
+    opt.step()
+
+    restored_matrix = nn.Parameter(matrix.detach().clone())
+    restored_fallback = nn.Parameter(fallback.detach().clone())
+    restored = AnchorMuon(
+        [
+            {"params": [restored_matrix], "use_matrix_update": True, "lr": 1e-3},
+            {"params": [restored_fallback], "use_matrix_update": False, "lr": 1e-3},
+        ],
+        fallback_mode="atan2",
+        ns_compute_dtype=torch.float32,
+    )
+    restored.load_state_dict(copy.deepcopy(opt.state_dict()))
+
+    restored_matrix.grad = torch.randn_like(restored_matrix)
+    restored_fallback.grad = torch.randn_like(restored_fallback)
+    restored.step()
+
+    matrix_state = restored.state[restored_matrix]
+    fallback_state = restored.state[restored_fallback]
+    assert matrix_state["momentum_buffer"].dtype == torch.float32
+    assert matrix_state["pmuoneq_row_ema"].dtype == torch.float32
+    assert matrix_state["normuon_second_momentum"].dtype == torch.float32
+    assert fallback_state["exp_avg"].dtype == torch.float32
+    assert fallback_state["exp_avg_sq"].dtype == torch.float32
 
 
 def test_anchor_short_training_sanity_loss_decreases() -> None:

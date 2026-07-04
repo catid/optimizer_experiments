@@ -112,6 +112,48 @@ def _state_tensor(
     return value
 
 
+def _dedupe_optimizer_params(params: Iterable[Tensor] | Iterable[dict[str, Any]]) -> list[Any]:
+    items = list(params)
+    if not items:
+        return items
+    seen: set[int] = set()
+    if isinstance(items[0], dict):
+        groups: list[dict[str, Any]] = []
+        for original in items:
+            group = dict(original)
+            params_value = group["params"]
+            params_in = [params_value] if isinstance(params_value, Tensor) else list(params_value)
+            names_in = list(group.get("param_names", []))
+            keep_names = len(names_in) == len(params_in)
+            params_out: list[Tensor] = []
+            names_out: list[str] = []
+            for idx, param in enumerate(params_in):
+                if id(param) in seen:
+                    continue
+                seen.add(id(param))
+                params_out.append(param)
+                if keep_names:
+                    names_out.append(names_in[idx])
+            if not params_out:
+                continue
+            group["params"] = params_out
+            if keep_names:
+                group["param_names"] = names_out
+            else:
+                group.pop("param_names", None)
+            groups.append(group)
+        return groups
+
+    params_out: list[Any] = []
+    for param in items:
+        if isinstance(param, Tensor):
+            if id(param) in seen:
+                continue
+            seen.add(id(param))
+        params_out.append(param)
+    return params_out
+
+
 @torch.no_grad()
 def gram_newton_schulz(update: Tensor, *, steps: int = 5, eps: float = 1e-7) -> Tensor:
     """Approximate the polar/zero-power direction of a matrix or matrix batch.
@@ -375,7 +417,7 @@ class AnchorMuon(torch.optim.Optimizer):
             anchor_weight_sum=0.0,
             anchor_beta_current=b1,
         )
-        super().__init__(params, defaults)
+        super().__init__(_dedupe_optimizer_params(params), defaults)
         self._train_mode = True
         self.last_stats: dict[str, float] = {}
 
@@ -415,6 +457,15 @@ class AnchorMuon(torch.optim.Optimizer):
                     param.lerp_(end=z.to(device=param.device, dtype=param.dtype), weight=1.0 - beta)
         self._train_mode = True
         return self
+
+    def state_dict(self) -> dict[str, Any]:
+        state_dict = super().state_dict()
+        state_dict["anchor_train_mode"] = self._train_mode
+        return state_dict
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self._train_mode = bool(state_dict.get("anchor_train_mode", True))
+        super().load_state_dict(state_dict)
 
     def _group_schedule(self, group: dict[str, Any]) -> tuple[int, float, float, float]:
         k = int(group.get("anchor_step", 0))
@@ -481,14 +532,20 @@ class AnchorMuon(torch.optim.Optimizer):
         return bool(mode)
 
     def _ensure_common_state(self, param: Tensor, state: dict[str, Any], *, soda: bool) -> None:
-        if "z" not in state or tuple(state["z"].shape) != tuple(param.shape) or state["z"].device != param.device:
+        z = state.get("z")
+        if isinstance(z, Tensor) and tuple(z.shape) == tuple(param.shape):
+            if z.device != param.device or z.dtype != torch.float32:
+                state["z"] = z.to(device=param.device, dtype=torch.float32)
+        else:
             state["z"] = _as_float(param).clone(memory_format=torch.preserve_format)
+        soda_init = state.get("soda_init")
         if soda and (
-            "soda_init" not in state
-            or tuple(state["soda_init"].shape) != tuple(param.shape)
-            or state["soda_init"].device != param.device
+            not isinstance(soda_init, Tensor)
+            or tuple(soda_init.shape) != tuple(param.shape)
         ):
             state["soda_init"] = _as_float(param).clone(memory_format=torch.preserve_format)
+        elif soda and isinstance(soda_init, Tensor) and (soda_init.device != param.device or soda_init.dtype != torch.float32):
+            state["soda_init"] = soda_init.to(device=param.device, dtype=torch.float32)
 
     def _ensure_matrix_state(self, param: Tensor, state: dict[str, Any]) -> tuple[Tensor, Tensor, Tensor]:
         matrix, _ = _matrix_view(param)
@@ -542,6 +599,8 @@ class AnchorMuon(torch.optim.Optimizer):
             for param in group["params"]:
                 if param.grad is None:
                     continue
+                if param.grad.is_sparse:
+                    raise RuntimeError("AnchorMuon does not support sparse gradients")
                 total_params += 1
                 grad = _as_float(param.grad)
                 state = self.state[param]
@@ -618,8 +677,10 @@ class AnchorMuon(torch.optim.Optimizer):
                     update = _restore_matrix_view(update_matrix, original_shape)
                 else:
                     exp_avg_sq = self._ensure_fallback_state(param, state)
+                    state["fallback_step"] = int(state.get("fallback_step", 0)) + 1
+                    fallback_step = int(state["fallback_step"])
                     exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-                    denom = (exp_avg_sq / max(1.0 - beta2**t, float(group["eps"]))).sqrt().add_(float(group["eps"]))
+                    denom = (exp_avg_sq / max(1.0 - beta2**fallback_step, float(group["eps"]))).sqrt().add_(float(group["eps"]))
                     update = grad / denom
 
                 if weight_decay != 0.0:

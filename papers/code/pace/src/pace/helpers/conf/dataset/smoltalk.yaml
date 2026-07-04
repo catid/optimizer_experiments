@@ -1,0 +1,7 @@
+# smol-smoltalk SFT dataset
+# https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk
+name: HuggingFaceTB/smol-smoltalk
+url: https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk
+# Prepare with pace-data, then override: dataset.path=/path/to/data
+path: ???
+max_samples: null

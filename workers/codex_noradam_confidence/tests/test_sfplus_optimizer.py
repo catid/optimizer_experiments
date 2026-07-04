@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 
@@ -97,3 +98,117 @@ def test_polyak_mode_requires_current_function_value() -> None:
     loss.backward()
     with pytest.raises(RuntimeError, match="function_value"):
         opt.step()
+
+
+def test_sfplus_constructor_deduplicates_shared_params_in_raw_inputs() -> None:
+    for params in (
+        lambda p: [p, p],
+        lambda p: [{"params": [p, p], "use_muon": False}],
+        lambda p: [{"params": p, "use_muon": False}],
+    ):
+        param = torch.nn.Parameter(torch.ones(1))
+        opt = SFPlusAnchorMuon(params(param), lr=0.1, sfplus_polyak=False)
+
+        assert sum(candidate is param for group in opt.param_groups for candidate in group["params"]) == 1
+
+        param.grad = torch.ones_like(param)
+        opt.step()
+
+        assert opt.last_stats["fallback_params"] == 1.0
+
+
+def test_sfplus_uses_effective_matrix_shape_for_leading_singleton_params() -> None:
+    torch.manual_seed(300)
+    param = torch.nn.Parameter(torch.randn(1, 6, 8) * 0.02)
+    opt = SFPlusAnchorMuon([param], lr=1e-3, sfplus_polyak=False, min_matrix_dim=2)
+
+    param.grad = torch.randn_like(param)
+    opt.step()
+
+    assert opt.last_stats["matrix_params"] == 1.0
+    assert opt.last_stats["fallback_params"] == 0.0
+    state = opt.state[param]
+    assert state["sfplus_row_ema"].shape == (6,)
+    assert state["sfplus_col_ema"].shape == (8,)
+    assert "sfplus_exp_avg" not in state
+
+
+def test_sfplus_fallback_bias_correction_uses_per_parameter_step() -> None:
+    p1 = torch.nn.Parameter(torch.tensor([1.0]))
+    p2 = torch.nn.Parameter(torch.tensor([1.0]))
+    opt = SFPlusAnchorMuon(
+        [{"params": [p1, p2], "use_muon": False}],
+        lr=0.1,
+        betas=(0.0, 0.9),
+        sfplus_polyak=False,
+        sfplus_c_warmup_enabled=True,
+        sfplus_c_warmup=10,
+        sfplus_beta_anneal=False,
+        sfplus_adamc_decay=False,
+        sfplus_inner_momentum=False,
+        weight_decay=0.0,
+    )
+
+    p1.grad = torch.tensor([1.0])
+    p2.grad = None
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+    p1.grad = None
+    p2.grad = torch.tensor([1.0])
+    opt.step()
+
+    assert torch.allclose(p2.detach(), torch.tensor([0.9]), atol=1e-6, rtol=1e-6)
+    assert opt.state[p2]["sfplus_fallback_step"] == 1
+
+
+def test_sfplus_eval_mode_survives_state_dict_round_trip() -> None:
+    p = torch.nn.Parameter(torch.tensor([1.0, -2.0, 3.0]))
+    opt = SFPlusAnchorMuon([p], lr=0.1, sfplus_polyak=False)
+    for grad in (
+        torch.tensor([0.3, -0.2, 0.1]),
+        torch.tensor([0.1, 0.2, -0.3]),
+    ):
+        p.grad = grad
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+    opt.eval()
+    eval_value = p.detach().clone()
+
+    restored_param = torch.nn.Parameter(eval_value.clone())
+    restored = SFPlusAnchorMuon([restored_param], lr=0.1, sfplus_polyak=False)
+    restored.load_state_dict(copy.deepcopy(opt.state_dict()))
+
+    assert restored._train_mode is False
+    restored.train()
+    assert not torch.allclose(restored_param.detach(), eval_value)
+
+
+def test_sfplus_bfloat16_state_dict_load_restores_fp32_state() -> None:
+    param = torch.nn.Parameter(torch.randn(4, 4, dtype=torch.bfloat16))
+    opt = SFPlusAnchorMuon(
+        [{"params": [param], "use_matrix_update": True}],
+        lr=1e-3,
+        sfplus_polyak=False,
+    )
+    param.grad = torch.randn_like(param)
+    opt.step()
+
+    restored_param = torch.nn.Parameter(param.detach().clone())
+    restored = SFPlusAnchorMuon(
+        [{"params": [restored_param], "use_matrix_update": True}],
+        lr=1e-3,
+        sfplus_polyak=False,
+    )
+    restored.load_state_dict(copy.deepcopy(opt.state_dict()))
+
+    restored_param.grad = torch.randn_like(restored_param)
+    restored.step()
+
+    state = restored.state[restored_param]
+    assert state["sfplus_z"].dtype == torch.float32
+    assert state["sfplus_x"].dtype == torch.float32
+    assert state["sfplus_y"].dtype == torch.float32
+    assert state["sfplus_matrix_momentum"].dtype == torch.float32
+    assert state["sfplus_row_ema"].dtype == torch.float32
+    assert state["sfplus_col_ema"].dtype == torch.float32
+    assert state["sfplus_normuon_second"].dtype == torch.float32

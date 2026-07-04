@@ -615,10 +615,20 @@ def hpo_trials(args: argparse.Namespace) -> list[TrialConfig]:
 
 
 def final_trials_from_hpo(args: argparse.Namespace, hpo_rows: list[dict[str, Any]]) -> list[TrialConfig]:
+    def best_loss(row: dict[str, Any]) -> float:
+        try:
+            value = float(row["best_val_loss"])
+        except (KeyError, TypeError, ValueError):
+            return math.inf
+        return value if math.isfinite(value) else math.inf
+
     best: dict[str, dict[str, Any]] = {}
     for row in hpo_rows:
+        loss = best_loss(row)
+        if "best_val_loss" in row and not math.isfinite(loss):
+            continue
         family = str(row["family"])
-        if family not in best or float(row["best_val_loss"]) < float(best[family]["best_val_loss"]):
+        if family not in best or loss < best_loss(best[family]):
             best[family] = row
     trials: list[TrialConfig] = []
     eval_every = max(1, args.final_steps // max(args.eval_bins, 1))
@@ -737,6 +747,14 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def finite_metric(row: dict[str, Any], key: str, *, default: float = math.inf) -> float:
+    try:
+        value = float(row[key])
+    except (KeyError, TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) else default
+
+
 def load_eval_curve(trial_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line in (trial_dir / "metrics.jsonl").read_text().splitlines():
@@ -800,7 +818,7 @@ def make_plots(args: argparse.Namespace, final_rows: list[dict[str, Any]]) -> No
 
 
 def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], final_rows: list[dict[str, Any]]) -> None:
-    final_sorted = sorted(final_rows, key=lambda r: float(r["final_val_loss"]))
+    final_sorted = sorted(final_rows, key=lambda r: finite_metric(r, "final_val_loss"))
     lines = [
         "# Synthetic 50M LLM Optimizer Comparison",
         "",
@@ -855,11 +873,14 @@ def write_summary(args: argparse.Namespace, hpo_rows: list[dict[str, Any]], fina
         "| Family | Trial | LR | Best val loss | Final val loss | Step time |",
         "|---|---|---:|---:|---:|---:|",
     ]
-    for row in sorted(hpo_rows, key=lambda r: (str(r["family"]), float(r["best_val_loss"]))):
+    for row in sorted(hpo_rows, key=lambda r: (str(r["family"]), finite_metric(r, "best_val_loss"))):
+        final_loss = finite_metric(row, "final_val_loss")
+        step_ms = finite_metric(row, "mean_step_time_ms")
         lines.append(
             f"| {row['family']} | `{row['name']}` | {float(row['lr']):g} | "
-            f"{float(row['best_val_loss']):.4f} | {float(row['final_val_loss']):.4f} | "
-            f"{float(row['mean_step_time_ms']):.2f} ms |"
+            f"{finite_metric(row, 'best_val_loss'):.4f} | "
+            f"{final_loss if math.isfinite(final_loss) else float('nan'):.4f} | "
+            f"{f'{step_ms:.2f} ms' if math.isfinite(step_ms) else 'n/a'} |"
         )
     (args.output_dir / "summary.md").write_text("\n".join(lines) + "\n")
 

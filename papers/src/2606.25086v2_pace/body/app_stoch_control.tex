@@ -1,0 +1,288 @@
+\section{Mathematical Derivation of \pace}\label{app:stoch_control_derivation}\label{sec:app-stoch-control}
+
+In this appendix we provide a complete formal derivation of our proposed algorithm.  Recall that we abstract the master optimization problem as the following stochastic control problem:
+\begin{align}\label{eq:stoch_control_problem}
+    \min_{u} J_T(u) = \ee\left[ \norm{\thetema[T] - \mustar}^2 + \lambda \cdot \int_0^T \norm{u_t}^2 d t \right], \quad  d \theta_t^u = \left[ \bA \left( \mustar - \theta_t^u \right) + u_t \right] d t + \bSigma^{1/2} d W_t.
+\end{align}
+In other words, we are running (a continuous time limit of) stochastic gradient descent on a quadratic objective $f(\theta) = \frac 12 \left(\theta - \mustar  \right)^\top \bA \left( \theta - \mustar\right)$ perturbed by some control input $u_t$, and we wish to choose $u_t$ so as to minimize the mean squared error of the returned iterate $\thetema[T]$ as an estimator of $\mustar$, plus a regularization term ensuring that the control inputs $u_t$ are not too large.  We provide a complete characterization of the optimal control strategy for this problem, and then show how to derive a simple approximation to this optimal control strategy that is both practical and empirically effective.
+
+In \Cref{app:relaxed_objective} we first consider a relaxed objective, which leads to a simpler optimal control strategy that helps illustrate the main ideas of the analysis.  Then, in \Cref{app:original_objective}, we derive the optimal control strategy for the actual objective defined in \eqref{eq:stoch_control_problem}, subject to the assumption that $\mustar$ is known to the learner.  Because this is, of course, an unrealistic assumption, we then show how the principle of \emph{certainty equivalence} can be used to derive the optimal controller even when $\mustar$ is unknown, and how this optimal controller can be approximated to yield a simple and practical algorithm.  Finally, in \Cref{app:unknown_mustar}, we show how the optimal controller can be approximated even when $\mustar$ is unknown, and how this approximation leads to the form of the controller used in our proposed algorithm.  
+
+
+
+\subsection{Optimal Control for the Relaxed Objective}\label{app:relaxed_objective}
+
+We begin with the simplest variation of the problem, where we assume $\mustar$ is known to the controller and we wish to minimize the relaxed objective
+\begin{align}\label{eq:relaxed_objective}
+    J_T'(u) = \ee\left[ T^{-1} \cdot\int_0^T \norm{\theta_t^u - \mustar}^2 d t + \lambda \cdot \int_0^T \norm{u_t}^2 d t \right].
+\end{align}
+While we actually want to minimize the $J_T(u)$ defined in \eqref{eq:stoch_control_problem}, which we will do in the sequel, but observe that (i) $J_T(u) \leq J_T'(u)$ for all $u$ by Jensen's inequality and (ii) minimizing $J_T'(u)$ leads to a more analytically tractable problem.
+
+Recall that $\theta_t^u$ evolves according to the SDE \eqref{eq:sde},
+\begin{align}
+    d \theta_t^u = \left[ \bA \left( \mustar - \theta_t^u \right) + u_t \right] d t + \bSigma^{1/2} d W_t.
+\end{align}
+We claim the following result.
+\begin{theorem}\label{thm:optimal_control_relaxed}
+    Suppose that $\theta_t^u$ evolves according to \eqref{eq:sde} for some progressively measurable $u_t$.  Then the optimal control $u_t$ that minimizes the relaxed objective $J_T'(u)$ defined in \eqref{eq:relaxed_objective} is given by
+    \begin{align}\label{eq:optimal_control_relaxed}
+        u_t = \frac{\bP_t \left( \mustar - \theta_t^u \right)}{\lambda}, \quad \text{where} \quad \bPdot_t = \bA^\top P_t + P_t \bA + \lambda^{-1} P_t^2 - T^{-1} \eye, \quad \text{and} \quad P_T = 0.
+    \end{align}
+    In the special case that $\bA = \diag(\alpha_1, \dots, \alpha_d)$ is diagonal, we have that
+    \begin{align}\label{eq:optimal_control_relaxed_diagonal}
+        u_i(t) = \frac{1}{\lambda T} \cdot \frac{1 - e^{- 2 \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} (T -t)}}{\left( \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} + \alpha_i \right) + \left( \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} - \alpha_i \right) e^{- 2 \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} (T - t)}} \left( \mustar_i - \theta_i(t) \right).
+    \end{align}
+\end{theorem}
+\begin{proof}
+    The proof proceeds by first centering the dynamics and then applying the standard Riccati equation given in \Cref{thm:lqg} to solve for the optimal control.  Indeed, let
+    \begin{align}\label{eq:centered-dynamics}
+        x_t = \theta_t^u - \mustar, \quad \text{so} \quad d x_t = \left[ - \bA x_t + u_t \right] d t + \bSigma^{1/2} d W_t.
+    \end{align}
+    We can then rewrite $J_T'(u)$ as
+    \begin{align}
+        J_T'(u) = \ee\left[ \frac 1T \int_0^T \norm{x_t}^2 d t + \lambda \int_0^T \norm{u_t}^2 d t \right].
+    \end{align}
+    Now, writing
+    \begin{align}
+        \bQ = T^{-1} \cdot \eye \quad \text{and} \quad \bR = \lambda \cdot \eye,
+    \end{align}
+    we can again rewrite $J_T'(u)$ as
+    \begin{align}
+        J_T'(u) = \ee\left[ \int_0^T \left( x_t^\top \bQ x_t + u_t^\top \bR u_t \right) d t \right],
+    \end{align}
+    We now observe that combining \eqref{eq:centered-dynamics} with the above expression for $J_T'(u)$, we have reduced the problem of minimizing $J_T'(u)$ to a standard linear-quadratic-Gaussian (LQG) control problem as in \Cref{thm:lqg}.  Applying the Riccati equation from \Cref{thm:lqg} yields the desired result, in particular the case found in \Cref{cor:lqg-scalarcost}.
+
+    For the special case, we use \Cref{lem:scalar-riccati-solution}.  Indeed, setting
+    \begin{align}
+        r = \lambda, \quad q = T^{-1}, \quad q_f = 0, \quad \text{and} \quad a = - \alpha_i,
+    \end{align}
+    that result tells us that we can solve the scalar Riccati equation to get
+    \begin{align}
+        p_i(t) = -\frac{\lambda \left( \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} - \alpha_i \right)\left( 1 - e^{- 2 \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} (T - t)} \right)}{1 + \frac{\sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} - \alpha_i}{\sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} + \alpha_i} e^{- 2 \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} (T - t)}}.
+    \end{align}
+    Thus,
+    \begin{align}
+        u_i(t) &= - \lambda^{-1} p_i(t) x_t^{(i)} \\
+        &=\frac{ \left( \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} - \alpha_i \right)\left( 1 - e^{- 2 \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} (T - t)} \right)}{1 + \frac{\sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} - \alpha_i}{\sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} + \alpha_i} e^{- 2 \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} (T - t)}} (\mustar_i - \theta_t^{(i)}) \\
+        &= \frac{1}{\lambda T} \cdot \frac{1 - e^{- 2 \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} (T - t)}}{\sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} + \alpha_i + \left(\sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} - \alpha_i\right)   e^{- 2 \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} (T - t)}}.
+    \end{align}
+    The result follows.
+\end{proof}
+
+We now construct an approximation to the above optimal control where we assume that $t \ll T$.  Indeed, we suppose that
+\begin{align}
+    T - t \gg \frac{1}{2 \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}}} \geq \frac{1}{2 \alpha_i},
+\end{align}
+so that we can approximate $e^{- 2 \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} (T - t)} \approx 0$.  Then we have that
+\begin{align}\label{eq:approx-optimal-control}
+    u_i(t) \approx \frac{1}{\lambda T} \cdot \frac{1}{\sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} + \alpha_i},
+\end{align}
+which is the form of the control used in our proposed algorithm.
+
+
+
+
+
+\subsection{Optimal Algorithm for the Original Objective}\label{app:original_objective}
+
+We now continue by considering the simplified setting where the controller is aware of the true minimizer $\mustar$, but where we wish to minimize the original objective $J_T(u)$ defined in \eqref{eq:stoch_control_problem} rather than the relaxed objective $J_T'(u)$ defined in \eqref{eq:relaxed_objective}.
+
+\begin{theorem}\label{thm:original_objective}
+    Suppose that $\theta_t^u$ evolves according to \eqref{eq:sde} for some progressively measurable $u_t$.  Then the optimal control $u_t$ that minimizes the original objective $J_T(u)$ defined in \eqref{eq:stoch_control_problem} is given by
+    \begin{align}
+        \ustar_t =  \lambda^{-1} \left( \bM_t (\mustar - \theta_t) + \bN_t \int_0^t (\mustar - \theta_s) d s \right),
+    \end{align}
+    where
+    \begin{align}
+        - \dot{\bM_t} &= - \bA^\top \bM_t - \bM_t \bA + \bN_t + \bN_t^\top - \lambda^{-1} \bM_t^2, \quad \bM_T = 0, \\
+        - \dot{\bN_t} &= - \bA^\top \bN_t + \bS_t - \lambda^{-1} \bM_t \bN_t, \quad \bN_T = 0, \\
+        - \dot{\bS_t} &= - \lambda^{-1} \bN_t^\top \bN_t, \quad \bS_T = T^{-2} \eye.
+    \end{align}
+    Moreover, in the special case that $\bA = \diag(\alpha_1, \dots, \alpha_d)$ is diagonal, we have that for $\alpha_i \neq 0$, 
+    \begin{align}\label{eq:optimal_controller_diagonal_nonzero}
+        \ustar_i(t) = \frac{1 - e^{- \alpha_i (T - t)}}{\alpha_i \lambda T^2 + \nicefrac{(T - t)}{\alpha_i} - \frac{2}{\alpha_i^2} \cdot \left( 1 - e^{- \alpha_i (T - t)} \right) + \frac{1 - e^{- 2 \alpha_i (T - t)}}{2 \alpha_i^2}} \left( \frac{1 - e^{- \alpha_i (T -t)}}{\alpha_i} \left( \mustar - \theta_t \right) + \int_0^t \left( \mustar - \theta_s \right) d s\right)
+    \end{align}
+    whereas for $\alpha_i = 0$, we have
+    \begin{align}\label{eq:optimal_controller_diagonal_zero}
+        \ustar_i(t) = \frac{(T - t)^2}{\lambda T^2 + \nicefrac{(T - t)^3}{3}} \cdot \left( \mustar - \theta_t \right) + \frac{(T - t)}{\lambda T^2 + \nicefrac{(T - t)^3}{3}} \cdot \int_0^t \left( \mustar - \theta_s \right) d s.
+    \end{align}
+
+\end{theorem}
+\begin{proof}
+    We introduce the accumulated centered process
+    \begin{align}
+        y_t^u = \int_0^t \left( \theta_s^u - \mustar \right) d s.
+    \end{align}
+    Then we observe that
+    \begin{align}
+        J_T(u) = \ee\left[ \frac 1{T^2} \norm{y_T}^2 + \lambda \int_0^T \norm{u_t}^2 d t \right], \quad \text{and} \quad d y_t^u = x_t d t.
+    \end{align}
+    This is not quite in the form of an LQG problem, but suppose that we augment the state to be $z_t^u = (x_t^u, y_t^u)$.  Then we have that
+    \begin{align}
+        d z_t^u = \left( \bF z_t + \bG u_t \right) d t + \bE d W_t, \quad \text{where} \quad \bF = \begin{bmatrix} -\bA & 0 \\ \eye & 0 \end{bmatrix}, \quad \bG = \begin{bmatrix} \eye \\ 0 \end{bmatrix}, \quad \bE = \begin{bmatrix} \bSigma^{1/2} \\ 0 \end{bmatrix}.
+    \end{align}
+    We then may take $\bQ$ to be zero and
+    \begin{align}
+        \bQ_f = \begin{bmatrix} 0 & 0 \\ 0 & T^{-2} \eye \end{bmatrix}, \quad \bR = \lambda \eye.
+    \end{align}
+    This then again becomes an LQG problem, and we can apply the Riccati equation from \Cref{thm:lqg} to solve for the optimal control.  Indeed, the Riccati equation in this case is given by
+    \begin{align}
+        - \dot{\bP_t} = \bF^\top \bP_t + \bP_t \bF - \lambda^{-1} \bP_t \bG \bG^\top \bP_t, \quad \text{and} \quad \bP_T = \bQ_f.
+    \end{align}
+    Writing
+    \begin{align}\label{eq:riccati-decomposition}
+        \bP_t = \begin{bmatrix}
+            \bM_t & \bN_t \\ \bN_t^\top & \bS_t
+        \end{bmatrix},
+    \end{align}
+    we get that
+    \begin{align}
+        \ustar_t = - \lambda^{-1} \left( \bM_t x_t + \bN_t y_t \right)
+    \end{align}
+    or, alternatively
+    \begin{align}\label{eq:riccati_augmented_optimal_control}
+        \ustar_t = - \lambda^{-1} \left( \bM_t (\theta_t - \mustar) + \bN_t \int_0^t \left( \theta_s - \mustar \right) d s \right),
+    \end{align}
+    where
+    \begin{align}
+        - \dot{\bM_t} &= - \bA^\top \bM_t - \bM_t \bA + \bN_t + \bN_t^\top - \lambda^{-1} \bM_t^2, \quad \bM_T = 0, \\
+        - \dot{\bN_t} &= - \bA^\top \bN_t + \bS_t - \lambda^{-1} \bM_t \bN_t, \quad \bN_T = 0, \label{eq:decomposed_riccati} \\
+        - \dot{\bS_t} &= - \lambda^{-1} \bN_t^\top \bN_t, \quad \bS_T = T^{-2} \eye
+    \end{align}
+    is derived by plugging in the decomposition in \eqref{eq:riccati-decomposition} into the Riccati equation in \eqref{eq:riccati_general} and rearranging.
+    The first result follows.
+
+    For the special case that $\bA$ is diagonal, the coordinates decouple and we derive the solution in \Cref{lem:original_objective_solution_scalar}.
+\end{proof}
+
+\begin{lemma}\label{lem:original_objective_solution_scalar}
+    Suppose that $\bA = \diag(\alpha_1, \dots, \alpha_d)$ is diagonal.  Then the above system of ODEs for $\bM_t$, $\bN_t$, and $\bS_t$ decouples into $d$ independent systems of ODEs, one for each coordinate.  In particular, for each $i \in [d]$, we have that \eqref{eq:decomposed_riccati} decouples and can be solved to yield a closed-form solution for $\ustar_i(t)$, given in \eqref{eq:optimal_controller_diagonal_nonzero} and \eqref{eq:optimal_controller_diagonal_zero}.
+\end{lemma}
+\begin{proof}
+    In the case where $\bA$ is diagonal, it is immediate that the system decouples into $d$ independent systems of ODEs, one for each coordinate because now every matrix is diagonal (note that $\bSigma$ may be taken to be diagonal without loss of generality by the rotational invariance of Brownian motion).  Thus, we can solve for each coordinate separately.  
+    
+    In particular, we know that the optimal controller is given by \eqref{eq:riccati_augmented_optimal_control}, i.e. for the $i^{th}$ coordinate, 
+    \begin{align}
+        \ustar_i(t) = \lambda^{-1} \left( M_t (\mustar_i - \theta_t^{(i)}) + N_t \int_0^t (\mustar_i - \theta_s^{(i)}) d s \right),
+    \end{align}
+    where $M_t$ and $N_t$ solve the system of ODEs from \eqref{eq:decomposed_riccati}  in the scalar setting, i.e.
+    \begin{align}
+        - \dot{M}_t = - 2 \alpha_i M_t + 2 N_t - \lambda^{-1} M_t^2, \quad M_T = 0, \\
+        - \dot{N}_t = - \alpha_i N_t + S_t - \lambda^{-1} M_t N_t, \quad N_T = 0,\label{eq:scalar_riccati_odes} \\
+        - \dot{S}_t = - \lambda^{-1} N_t^2, \quad S_T = T^{-2}.
+    \end{align}
+    Note that we are now in the scalar setting, so we are not bolding the variables; for notational simplicity, we omit the subscript $i$ in the remainder of this proof.  Now, let $\tau = T - t$ be the time to go and define the following functions:
+    \begin{align}
+        h(\tau) = \int_0^\tau e^{- \alpha s} d s = \begin{cases}
+            \frac{1 - e^{- \alpha \tau}}{\alpha}, & \alpha \neq 0, \\
+            \tau, & \alpha = 0,
+        \end{cases}
+    \end{align}
+    and
+    \begin{align}
+        g(\tau) = \int_0^\tau h(s)^2 d s = \begin{cases}
+            \frac{\tau}{\alpha^2} - \frac{2(1 - e^{- \alpha \tau})}{2\alpha^3} + \frac{1 - e^{- 2 \alpha \tau}}{2 \alpha^3}, & \alpha \neq 0, \\
+            \frac{\tau^3}{3}, & \alpha = 0.
+        \end{cases}
+    \end{align}
+    We claim that the solution to the above system of ODEs is given by
+    \begin{align}\label{eq:scalar_riccati_solution_augmented}
+        M_t = \frac{h(\tau)^2}{T^2 + \nicefrac{g(\tau)}{\lambda}}, \quad N_t = \frac{h(\tau)}{T^2 + \nicefrac{g(\tau)}{\lambda}}, \quad S_t = \frac{1}{T^2 + \nicefrac{g(\tau)}{\lambda}}.
+    \end{align}
+    Let $D(\tau) = T^2 + \nicefrac{g(\tau)}{\lambda}$.  We verify that the above is indeed a solution by plugging into the ODEs.  First, we have that
+    \begin{align}
+        h'(\tau) = e^{- \alpha \tau} = 1 - \alpha h(\tau), \quad g'(\tau) = h(\tau)^2, \quad \text{and} \quad D'(\tau) = \lambda^{-1} h(\tau)^2.
+    \end{align}
+    Observing that $\nicefrac{d}{d \tau} = - \nicefrac{d}{d t}$, can plug in \eqref{eq:scalar_riccati_solution_augmented} into \eqref{eq:scalar_riccati_odes} to observe that this is indeed the solution.
+
+    Thus, plugging back in, we see that the optimal control is given by
+    \begin{align}
+        \ustar(t) &= \frac{h(T - t)}{\lambda T^2 + g(T - t)} \cdot \left( h(T -t) (\mustar - \theta_t) + \int_0^t \left( \mustar - \theta_s \right) ds \right).
+    \end{align}
+    In particular, for $\alpha = 0$, we have that
+    \begin{align}
+        \ustar(t) = \frac{(T - t)^2}{\lambda T^2 + \nicefrac{(T - t)^3}{3}} \cdot \left( \mustar - \theta_t \right) + \frac{(T - t)}{\lambda T^2 + \nicefrac{(T - t)^3}{3}} \cdot \int_0^t \left( \mustar - \theta_s \right) d s.
+    \end{align}
+    For $\alpha \neq 0$, we have that
+    \begin{align}
+        \ustar(t) = \frac{1 - e^{- \alpha (T - t)}}{\alpha \lambda T + \nicefrac{(T - t)}{\alpha} - \frac{2}{ \alpha^2} \cdot \left( 1 - e^{- \alpha (T - t)} \right) + \frac{1 - e^{- 2 \alpha_i (T - t)}}{2 \alpha_i^2}} \left( \frac{1 - e^{- \alpha (T -t)}}{\alpha} \left( \mustar - \theta_t \right) + \int_0^t \left( \mustar - \theta_s \right) d s\right).
+    \end{align}
+    The result follows.
+\end{proof}
+
+
+
+
+\subsection{Generalizing to the Case Where $\mustar$ is Unknown}\label{app:unknown_mustar}
+
+The above results are a promising start but all rely on the assumption that $\mustar$ is known to the controller, which is certainly not the case in practice.  Indeed, the entire goal of optimization is to \emph{find} $\mustar$; thus, if the learner had access to $\mustar$ from the start there would be no need to run any optimization algorithm at all.  In this section we show how to modify the above optimal controllers to the case where $\mustar$ is unknown, and in particular we show that the same form of controller is still optimal, but with $\mustar$ replaced by an estimate of $\mustar$.
+
+The key factor in generalizing to the case where $\mustar$ is unknown is the \emph{separation principle} from control theory, which is also known as \emph{certainty equivalence} \citep{georgiou2013separation,van1981certainty,kwakernaak1972linear}.  This principle essentially states that for an LQG control problem where the state is not directly observed, the optimal control can be obtained by first estimating the state as the conditional expectation of the state given the observations and then plugging this estimate into the optimal control for the fully observed case.  More formally, we have the following result.
+\begin{theorem}\label{thm:separation_principle}
+    Consider an LQG problem as in \eqref{eq:lqg-dynamics} and \eqref{eq:lqg-cost} where the state $x_t^u$ is not directly observed, but rather we have access to an observation process $y_t = \phi(x_t^u, \mustar)$ for some unknown $\mustar$ drawn from a known prior distribution with $\phi$ invertible in the first argument.  Suppose that the corresponding full-information LQG problem where the state is directly observed has an optimal control given by $u_t = \bK_t x_t$ for some matrix $\bK_t$.  Then the optimal control for the partially observed problem is given by $u_t = \bK_t \hat{x}_t$, where $\hat{x}_t = \ee\left[ \phi^{-1}(y_t, \mustar) \mid y_s, s \leq t \right]$ is the conditional expectation of the state given the observations.  
+\end{theorem}
+\begin{proof}
+    This is a classical result in control theory, and we refer the reader to \citet{georgiou2013separation,van1981certainty,kwakernaak1972linear} for a complete proof.  In order to translate those works to our setting, we may apply \citet[Theorem 14]{georgiou2013separation} to the original control problem augmented with the state $\mu_t$ such that $\mu_0 = \mustar$ and $d \mu_t = 0$ for all $t$; the observation process $\theta_t = \mustar + x_t$ is then a linear function of the state, and the optimal control for the fully observed problem is given by $u_t = \bK_t x_t$ where $\bK_t$ is the solution to the Riccati equation as in \Cref{thm:lqg}.  Applying \citet[Theorem 14]{georgiou2013separation} then yields the desired result.
+\end{proof}
+We thus have the following two corollaries, for the relaxed and original objectives respectively.
+\begin{corollary}
+    Let $J_T'(u)$ denote the relaxed objective in \eqref{eq:relaxed_objective} and suppose that $\theta_t^u$ evolves according to \eqref{eq:sde} for some progressively measurable $u_t$.  Let $\muhat_t = \ee\left[ \mustar \mid \theta_s^u, s \leq t \right]$ be the conditional expectation of $\mustar$ given the trajectory of $\theta_t^u$ up to time $t$.  Then the optimal control $u_t$ that minimizes $J_T'(u)$ is given by
+    \begin{align}
+        \ustar(t) = \frac{\bP_t \left( \muhat_t - \theta_t^u \right)}{\lambda}
+    \end{align}
+    where $\bP_t$ is the solution to the same Riccati equation as in \eqref{eq:optimal_control_relaxed}.  In the special case that $\bA = \diag(\alpha_1, \dots, \alpha_d)$ is diagonal, we have that
+    \begin{align}
+        \ustar_i(t) = \frac{1}{\lambda T} \cdot \frac{1 - e^{- 2 \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} (T -t)}}{\left( \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} + \alpha_i \right) + \left( \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} - \alpha_i \right) e^{- 2 \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}} (T - t)}} \left( \muhat_i(t) - \theta_i(t) \right)
+    \end{align}
+    for each $i \in [d]$.
+\end{corollary}
+\begin{proof}
+    This follows immediately by combining \Cref{thm:optimal_control_relaxed} with \Cref{thm:separation_principle}.
+\end{proof}
+For the original objective, we have the following result.
+\begin{corollary}\label{cor:optimal_control_unknown_mustar}
+    Let $J_T(u)$ denote the original objective in \eqref{eq:stoch_control_problem} and suppose that $\theta_t^u$ evolves according to \eqref{eq:sde} for some progressively measurable $u_t$.  Let $\muhat_t = \ee\left[ \mustar \mid \theta_s^u, s \leq t \right]$ be the conditional expectation of $\mustar$ given the trajectory of $\theta_t^u$ up to time $t$.  Then the optimal control $u_t$ that minimizes $J_T(u)$ is given by
+    \begin{align}
+        \ustar_t =  \lambda^{-1} \left( \bM_t (\muhat_t - \theta_t) + \bN_t \left(t \cdot \muhat_t  - \int_0^t \theta_s d s \right) \right),
+    \end{align}
+    where $\bM_t$, $\bN_t$, and $\bS_t$ are the solutions to the same system of ODEs as in \Cref{thm:original_objective}.  In the special case that $\bA = \diag(\alpha_1, \dots, \alpha_d)$ is diagonal, we have that for $\alpha_i \neq 0$,
+    \begin{align}
+        \ustar_i(t) = \frac{1 - e^{- \alpha_i (T - t)}}{\alpha_i \lambda T^2 + \nicefrac{(T - t)}{\alpha_i} - \frac{3}{2 \alpha_i^2} \cdot \left( 1 - e^{- \alpha_i (T - t)} \right)} \left( \frac{1 - e^{- \alpha_i (T -t)}}{\alpha_i} \left( \muhat_i(t) - \theta_t^{(i)} \right) + \left(t \cdot \muhat_i(t) - \int_0^t  \theta_s^{(i)}  d s\right)\right)
+    \end{align}
+    whereas for $\alpha_i = 0$, we have
+    \begin{align}
+        \ustar_i(t) = \frac{(T - t)^2}{\lambda T^2 + \nicefrac{(T - t)^3}{3}} \cdot \left( \muhat_i(t) - \theta_t^{(i)} \right) + \frac{(T - t)}{\lambda T^2 + \nicefrac{(T - t)^3}{3}} \cdot \left(t \cdot \muhat_i(t) - \int_0^t \theta_s^{(i)}  d s \right).
+    \end{align}
+\end{corollary}
+\begin{proof}
+    This follows immediately by combining \Cref{thm:original_objective} with \Cref{thm:separation_principle}.
+\end{proof}
+
+Thus, at least in theory, we have a complete answer to the question of how to control optimization algorithms in order to minimize the mean squared error of the returned iterate average as an estimator of $\mustar$.  Unfortunately, the above optimal controllers are not implementable in practice because they require computing $\muhat_t = \ee\left[ \mustar \mid \theta_s^u, s \leq t \right]$, even in the simplified diagonal setting where the coordinates decouple.  In the following subsection, we show how to derive a practical algorithm by approximating $\muhat_t$ with a simple estimator of $\mustar$ that can be computed from the trajectory of $\theta_t^u$ up to time $t$.
+
+\subsection{Deriving a Practical Algorithm through Approximation}\label{app:practical_algorithm}
+
+As remarked above, the optimal controllers derived in the previous subsections are not implementable in practice.  For the general setting, solving the Riccati equations is already highly nontrivial in high dimensions and certainly beyond reach at the scale of language models.  Even in the diagonal setting, the optimal controllers require computing $\muhat_t = \ee\left[ \mustar \mid \theta_s^u, s \leq t \right]$, which is not computable in closed form and would require solving a high-dimensional integral at every time step.  Moreover, the updates themselves are quite complicated.  We thus propose three simplifications:
+\begin{enumerate}
+    \item We will consider only the diagonal setting, where the coordinates decouple and we can solve for the optimal controller in closed form.
+    \item We will approximate $\muhat_t = \frac 1t \int_0^t \theta_s^u d s$, which is a natural estimator of $\mustar$ given the trajectory of $\theta_t^u$ up to time $t$.
+    \item We will approximate the optimal controller by its form when $t \ll T$, which is the regime we are in for most of the optimization trajectory.
+\end{enumerate}
+The first approximation allows for the closed-form solution to the optimal controller, which we derived above.  The second approximation is a natural one, as $\muhat_t$ becomes simple to estimate and is naturally aligned with the core motivation of this work: using iterate averaging to get better estimates of $\mustar$.  The third approximation is also natural and can be used to greatly simplify the form of the optimal controller.  In particular we will make the following approximations:
+\begin{align}
+    T -t \approx T \quad \text{and} \quad e^{- \alpha_i(T - t)} \approx 0,
+\end{align}
+where the second of these relies on the assumption that $T - t \gg \frac{1}{2 \sqrt{\alpha_i^2 + \nicefrac{1}{\lambda T}}}$.  Critically, by replacing $\muhat_t$ with the iterate average, the second term in \Cref{cor:optimal_control_unknown_mustar} drops out, which is a significant simplification and makes the resulting controller much more practical to implement.
+
+
+
+With these approximations, we have that the optimal controller in \Cref{cor:optimal_control_unknown_mustar} is approximated by
+\begin{align}
+    \ustar_i(t) = \frac{1}{T \left(1 + \lambda \alpha_i^2 T\right)} \left( \muhat_i(t) - \theta_i(t) \right),
+\end{align}
+which is a simple and practical controller that can be empirically implemented.  In particular, we can write the above in vector form as
+\begin{align}\label{eq:approx_optimal_control_unknown_mustar}
+    \ustar(t) = \frac{1}{T} \cdot \left( \eye + \lambda \bA^2 T \right)^{-1} \left(\muhat(t) - \theta(t) \right).
+\end{align}
+This is the form of the controller used in our proposed algorithm, albeit with a discrete time approximation and additional simplifications.
+

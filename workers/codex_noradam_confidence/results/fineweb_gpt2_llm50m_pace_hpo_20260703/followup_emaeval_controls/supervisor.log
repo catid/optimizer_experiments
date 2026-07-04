@@ -1,0 +1,21 @@
+launched gpu=0 final_soda_emaeval_lr0.0016_soda0.001_k0.5
+launched gpu=1 final_pmuoneq_emaeval_lr0.0016_rg0.35_k0.5
+finished gpu=0 final_soda_emaeval_lr0.0016_soda0.001_k0.5
+launched gpu=0 final_normuon_emaeval_lr0.0016_nb0.93_k0.5
+finished gpu=1 final_pmuoneq_emaeval_lr0.0016_rg0.35_k0.5
+launched gpu=1 final_pace_adamw_lr0.0005_c0.003_k0.3_paperc
+finished gpu=1 final_pace_adamw_lr0.0005_c0.003_k0.3_paperc
+launched gpu=1 final_pace_adamw_lr0.0006_c0.003_k0.3_paperc
+finished gpu=0 final_normuon_emaeval_lr0.0016_nb0.93_k0.5
+finished gpu=1 final_pace_adamw_lr0.0006_c0.003_k0.3_paperc
+Traceback (most recent call last):
+  File "/home/catid/optimizer_experiments/workers/codex_noradam_confidence/experiments/run_wikitext_llm50m.py", line 2927, in <module>
+    "pace_muon_pmuoneq": "PACE + Muon + PMuonEq",
+^^^^^^
+  File "/home/catid/optimizer_experiments/workers/codex_noradam_confidence/experiments/run_wikitext_llm50m.py", line 2923, in main
+    "emaeval_muon": "Muon @ EMA",
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/catid/optimizer_experiments/workers/codex_noradam_confidence/experiments/run_wikitext_llm50m.py", line 2882, in write_summary
+    ys = [r["train_loss"] if metric == "train_loss" else r[metric] for r in curve]
+                                                     ^^^^^^^^^^^^^^^^^^^^^
+KeyError: 'final_val_loss'

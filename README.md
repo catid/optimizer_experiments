@@ -236,6 +236,99 @@ and
 
 ![FineWeb GPT-2-tokenized Muown HPO step time](workers/codex_noradam_confidence/results/fineweb_gpt2_llm50m_muown_plateau8k_20260602/plots/step_time_ms_bar.png)
 
+### GPT-2 Tokenized PACE Pullback HPO
+
+I then tested PACE pullback on the same GPT-2-tokenized FineWeb-Edu proxy.
+The reusable PACE+Muon implementation for new experiments is
+[`pace_muon.py`](pace_muon.py). The benchmark runner also has its own local
+copy for historical result reproduction. The pass included PACE-AdamW, PACE-Muon,
+PACE-AnchorMuon, `pace_c=0` EMA-evaluated controls, and single-increment Muon
+variants for SODA, PMuonEq, and NorMuon. The paper notes and reference code are
+in `papers/md/2606.25086v2_pace.md` and `papers/code/pace/`.
+
+Protocol matched the 8K tokenized replay setup: `51,045,888`-parameter GPT,
+FineWeb-Edu `gpt2` cache, `8,000,000` train tokens, `524,288` validation
+tokens, batch `16 x 256`, BF16, WSD with 100-step warmup and 20% decay,
+sequential validation, and `256` sequential final validation batches. This run
+used two RTX 5090 GPUs scheduled one trial per GPU. HPO ran `231` candidates
+for `600` steps and replayed `30` selected rows for `8,000` steps.
+
+8K selected replay, ranked by the larger final validation pass:
+
+| Rank | Optimizer | Selected config | Full val loss | Full token acc | Step time | Throughput |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | PACE + Muon + PMuonEq | `lr=0.0016`, `wd=0.05`, `row_gamma=0.35`, `pace_c=0.003`, `kappa=0.5` | 4.8841 | 25.73% | 28.29 ms | 144.8k tok/s |
+| 2 | Muon @ EMA | `lr=0.0016`, `wd=0.05`, `pace_c=0`, `kappa=0.5` | 4.8867 | 25.73% | 24.38 ms | 168.0k tok/s |
+| 3 | PACE + Muon | `lr=0.0016`, `wd=0.05`, `pace_c=0.001`, `kappa=0.5` | 4.8875 | 25.69% | 27.45 ms | 149.2k tok/s |
+| 4 | Plain Muon | `lr=0.0018`, `wd=0.05` | 4.8973 | 25.57% | 23.49 ms | 174.4k tok/s |
+| 5 | PACE + Muon + PMuonEq | `lr=0.0016`, `wd=0.05`, `row_gamma=0.35`, `pace_c=0.003`, `kappa=0.3` | 4.8992 | 25.59% | 28.57 ms | 143.4k tok/s |
+| 6 | Muon @ EMA | `lr=0.0016`, `wd=0.05`, `pace_c=0`, `kappa=0.3` | 4.9027 | 25.59% | 24.60 ms | 166.5k tok/s |
+| 7 | EMA-Nesterov + Muon | `lr=0.0016`, `wd=0.05`, `ema_beta=0.1`, `ema_gamma=0.995` | 4.9055 | 25.57% | 25.16 ms | 162.8k tok/s |
+| 8 | Muon + PMuonEq | `lr=0.0016`, `wd=0.05`, `row_gamma=0.55` | 4.9066 | 25.59% | 24.55 ms | 166.8k tok/s |
+
+Takeaway: PACE plus the cheap row-only PMuonEq increment gives the best
+tokenized-LM loss in this benchmark so far, but most of the gain is close to
+the EMA-evaluated Muon control: `4.8841` full validation loss versus `4.8867`,
+with about `16%` slower steps. PACE on plain Muon also beats same-run plain
+Muon, but by a smaller margin. PACE did not rescue AnchorMuon on this LM proxy:
+the best PACE-AnchorMuon replay reached `5.1002` full validation loss, only
+slightly better than the same-run AnchorMuon control at `5.1046`.
+
+Result bundle:
+`workers/codex_noradam_confidence/results/fineweb_gpt2_llm50m_pace_hpo_20260703/`.
+
+![FineWeb GPT-2-tokenized PACE validation loss](workers/codex_noradam_confidence/results/fineweb_gpt2_llm50m_pace_hpo_20260703/plots/val_loss_curve.png)
+
+![FineWeb GPT-2-tokenized PACE validation accuracy](workers/codex_noradam_confidence/results/fineweb_gpt2_llm50m_pace_hpo_20260703/plots/val_acc_curve.png)
+
+![FineWeb GPT-2-tokenized PACE step time](workers/codex_noradam_confidence/results/fineweb_gpt2_llm50m_pace_hpo_20260703/plots/step_time_ms_bar.png)
+
+#### Using PACE+Muon In New Experiments
+
+Other AI agents should start from the standalone optimizer in
+[`pace_muon.py`](pace_muon.py), not from the long benchmark runner:
+
+```python
+from pace_muon import PaceMuon
+
+optimizer = PaceMuon(
+    model,
+    lr=1.6e-3,
+    weight_decay=0.05,
+    pullback_c=1e-3,
+    kappa=0.5,
+    pace_precond="adam",
+)
+
+for batch in loader:
+    optimizer.zero_grad(set_to_none=True)
+    loss = loss_fn(model, batch)
+    loss.backward()
+    optimizer.step()
+
+with optimizer.use_ema_weights():
+    validate(model)
+```
+
+Treat the returned EMA weights as part of the method. Always evaluate inside
+`optimizer.use_ema_weights()` or by pairing `swap_to_ema()` with
+`swap_to_live()`. Include a `pullback_c=0` run in HPO; that is the "Muon @ EMA"
+control and shows how much of any gain is just EMA-weight evaluation.
+
+First grid for a new problem:
+
+| Knob | Suggested values |
+|---|---|
+| `lr` | reuse the tuned Muon LR, then try `0.8x`, `1.0x`, `1.125x` |
+| `weight_decay` | reuse the tuned Muon value, usually also try `0` |
+| `pullback_c` | `0`, `1e-3`, `3e-3`, `1e-2` |
+| `kappa` | start with `0.5`; add `0.3` if budget allows |
+| `pace_precond` | start with `"adam"`; `"scalar"` and `"row"` are ablations |
+
+`PaceMuon` is a normal `torch.optim.Optimizer` subclass, so trainer-side LR
+schedulers can mutate `optimizer.param_groups` as usual. Matrix-like tensors
+use Muon; scalar/vector tensors use an AdamW-style fallback.
+
 ## FineWeb-Edu 50M LLM AnchorMuon HPO
 
 After the fixed WikiText-selected AnchorMuon setting lost to plain Muon on the
@@ -691,6 +784,7 @@ workload is noisy or unstable.
 - Gram Newton-Schulz / polar update: [Dao-AILab gram-newton-schulz reference implementation](https://github.com/Dao-AILab/gram-newton-schulz/blob/main/gram_newton_schulz/gram_newton_schulz.py). AnchorMuon uses this family for matrix orthogonalization.
 - NorMuon / HTMuon lineage: [HTMuon: Improving Muon via Heavy-Tailed Spectral Correction](https://arxiv.org/abs/2603.10067) and the [HTMuon reference code](https://github.com/TDCSZ327/HTmuon). AnchorMuon uses the post-Gram row-normalization idea, not the full HTMuon optimizer.
 - PMuon lineage: the [PMuon track-3 implementation notes](https://github.com/zzp1012/modded-nanogpt/tree/pmuon-track3-3225/records/track_3_optimization/results/20260507_pmuon) motivated the pre-polar preconditioning idea. AnchorMuon implements only a cheap row-only PMuonEq approximation, not dense two-sided PMuon.
+- PACE pullback: [PACE: Per-coordinate Averaged Controlled EMA](https://arxiv.org/abs/2606.25086). The standalone PACE+Muon implementation is in `pace_muon.py`; the benchmark runner keeps a local copy for result reproduction.
 - WSD schedule context: [Understanding Warmup-Stable-Decay Learning Rates](https://arxiv.org/abs/2410.05192). WSD is implemented in the training harness, not in `optimizer.py`.
 - AdamATan2 fallback context: [Scaling Exponents Across Parameterizations and Optimizers](https://arxiv.org/abs/2407.05872) by Everett et al. introduces the Adam-atan2 code change in Appendix C.5, replacing Adam's unbounded `m / sqrt(v)` update with `atan2(m, sqrt(v))` to reduce epsilon sensitivity. AnchorMuon uses this as the default only after matrix-direction construction and only on fallback tensors.
 - AdamC fallback context: the optional fallback mode follows the AdamC-style

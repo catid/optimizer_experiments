@@ -1,0 +1,22 @@
+id: fig1
+paper: "Fig 1"
+desc: "Best-per-method validation loss (finetuning)"
+dataset: smoltalk          # finetuning data shared by all runs
+
+# Each run below is a complete training spec, e.g.:
+#   pace-train model=<model> optimizer=<optimizer.name> schedule=<schedule> seed=<seed> \
+#       optimizer.lr=<lr> optimizer.lambda_pullback=<c> optimizer.ema_kappa=<kappa>
+# baselines (AdamW/EMA) use their best decay schedule; PACE uses a constant LR
+curves:
+  # ---- SmolLM2-1.7B ----
+  - {model: smollm2_1.7b, method: AdamW, schedule: cos,   seed: 42, optimizer: {name: adamw, lr: 0.001,  lambda_pullback: 0.0}}
+  - {model: smollm2_1.7b, method: EMA,   schedule: cos,   seed: 42, optimizer: {name: ema,   lr: 0.001,  lambda_pullback: 0.0,  ema_kappa: 0.5}}
+  - {model: smollm2_1.7b, method: PACE,  schedule: const, seed: 42, optimizer: {name: pace,  lr: 0.001,  lambda_pullback: 0.15, ema_kappa: 0.2}}
+  # ---- Qwen3-1.7B ----
+  - {model: qwen3_1.7b,   method: AdamW, schedule: cos,   seed: 42, optimizer: {name: adamw, lr: 0.0005, lambda_pullback: 0.0}}
+  - {model: qwen3_1.7b,   method: EMA,   schedule: cos,   seed: 42, optimizer: {name: ema,   lr: 0.0005, lambda_pullback: 0.0,  ema_kappa: 0.5}}
+  - {model: qwen3_1.7b,   method: PACE,  schedule: const, seed: 42, optimizer: {name: pace,  lr: 0.0005, lambda_pullback: 0.25, ema_kappa: 0.5}}
+  # ---- Gemma3-1B ----
+  - {model: gemma3_1b,    method: AdamW, schedule: cos,   seed: 42, optimizer: {name: adamw, lr: 0.001,  lambda_pullback: 0.0}}
+  - {model: gemma3_1b,    method: EMA,   schedule: cos,   seed: 42, optimizer: {name: ema,   lr: 0.001,  lambda_pullback: 0.0,  ema_kappa: 0.5}}
+  - {model: gemma3_1b,    method: PACE,  schedule: const, seed: 42, optimizer: {name: pace,  lr: 0.001,  lambda_pullback: 0.15, ema_kappa: 0.5}}

@@ -400,6 +400,6 @@ class NorMuown(torch.optim.Optimizer):
                 state["v_norm"] = _wn_recompose(p.data, g, v_new)
                 if weight_decay != 0.0:
                     p.data.add_(W_old, alpha=-lr * weight_decay)
+                    g.copy_(p.data.norm(dim=1, keepdim=True))
 
         return loss
-

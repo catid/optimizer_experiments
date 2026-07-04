@@ -43,7 +43,7 @@ class VisionRotaryEmbedding(nn.Module):
         num_freqs = 1,
     ):
         super().__init__()
-        if custom_freqs:
+        if custom_freqs is not None:
             freqs = custom_freqs
         elif freqs_for == 'lang':
             freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
@@ -61,14 +61,15 @@ class VisionRotaryEmbedding(nn.Module):
         ft_seq_len = int(np.sqrt(x.shape[1]))
         if ft_seq_len * ft_seq_len != x.shape[1]:
             raise ValueError(f"VisionRotaryEmbedding requires a square patch grid, got {x.shape[1]} tokens")
-        t = torch.arange(ft_seq_len, device=x.device, dtype=self.freqs.dtype) / ft_seq_len * self.pt_seq_len
+        freqs_base = self.freqs.to(device=x.device)
+        t = torch.arange(ft_seq_len, device=x.device, dtype=freqs_base.dtype) / ft_seq_len * self.pt_seq_len
 
-        freqs = torch.einsum('..., f -> ... f', t, self.freqs)
+        freqs = torch.einsum('..., f -> ... f', t, freqs_base)
         freqs = repeat(freqs, '... n -> ... (n r)', r = 2) # 14*32
         freqs = broadcat((freqs[:, None, :], freqs[None, :, :]), dim = -1) # 14*14*64
 
-        freqs_cos = freqs.cos().view(-1, 1, freqs.shape[-1])
-        freqs_sin = freqs.sin().view(-1, 1, freqs.shape[-1])
+        freqs_cos = freqs.cos().view(-1, 1, freqs.shape[-1]).to(dtype=x.dtype)
+        freqs_sin = freqs.sin().view(-1, 1, freqs.shape[-1]).to(dtype=x.dtype)
         return  x * freqs_cos + rotate_half(x) * freqs_sin
 
 def rotate_freqs(freqs, angle_deg):

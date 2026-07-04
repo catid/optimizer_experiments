@@ -611,9 +611,10 @@ class AnchorMuon(torch.optim.Optimizer):
                 min_matrix_dim=min_matrix_dim,
             )
         if isinstance(items[0], dict):
-            groups = [dict(group) for group in items]  # type: ignore[arg-type]
-            for group in groups:
-                group.setdefault("use_matrix_update", group.get("use_muon", False))
+            groups: list[dict[str, Any]] = []
+            seen_params: set[int] = set()
+
+            def apply_defaults(group: dict[str, Any]) -> None:
                 is_matrix = bool(group["use_matrix_update"])
                 group.setdefault("lr", lr if is_matrix else fallback_lr)
                 group.pop("weight_decay", None)
@@ -635,6 +636,78 @@ class AnchorMuon(torch.optim.Optimizer):
                     group.setdefault("betas", fallback_betas)
                     group.setdefault("fallback_weight_decay", fallback_weight_decay)
                     group.setdefault("eps", eps)
+
+            def normalized_params(group: dict[str, Any]) -> tuple[list[torch.Tensor], list[str], bool]:
+                params_value = group.get("params", [])
+                params_in = [params_value] if isinstance(params_value, torch.Tensor) else list(params_value)
+                names_in = list(group.get("param_names", []))
+                keep_names = len(names_in) == len(params_in)
+                params_out: list[torch.Tensor] = []
+                names_out: list[str] = []
+                for idx, p in enumerate(params_in):
+                    ident = id(p)
+                    if ident in seen_params:
+                        continue
+                    seen_params.add(ident)
+                    params_out.append(p)
+                    if keep_names:
+                        names_out.append(names_in[idx])
+                return params_out, names_out, keep_names
+
+            for original in items:  # type: ignore[assignment]
+                group = dict(original)
+                params_in, names_in, keep_names = normalized_params(group)
+                if not params_in:
+                    continue
+                group["params"] = params_in
+                if keep_names:
+                    group["param_names"] = names_in
+                else:
+                    group.pop("param_names", None)
+                route_is_explicit = "use_matrix_update" in group or "use_muon" in group
+                if route_is_explicit:
+                    if "use_matrix_update" not in group:
+                        group["use_matrix_update"] = group["use_muon"]
+                    apply_defaults(group)
+                    groups.append(group)
+                    continue
+
+                matrix_params: list[torch.Tensor] = []
+                matrix_names: list[str] = []
+                fallback_params: list[torch.Tensor] = []
+                fallback_names: list[str] = []
+                for idx, p in enumerate(params_in):
+                    use_matrix = (
+                        isinstance(p, torch.Tensor)
+                        and p.requires_grad
+                        and _is_matrix_like_parameter(p, min_matrix_dim=min_matrix_dim)
+                    )
+                    if use_matrix:
+                        matrix_params.append(p)
+                        if keep_names:
+                            matrix_names.append(names_in[idx])
+                    else:
+                        fallback_params.append(p)
+                        if keep_names:
+                            fallback_names.append(names_in[idx])
+
+                base_group = {key: value for key, value in group.items() if key not in {"params", "param_names"}}
+                if matrix_params:
+                    matrix_group = dict(base_group)
+                    matrix_group["params"] = matrix_params
+                    if keep_names:
+                        matrix_group["param_names"] = matrix_names
+                    matrix_group["use_matrix_update"] = True
+                    apply_defaults(matrix_group)
+                    groups.append(matrix_group)
+                if fallback_params:
+                    fallback_group = dict(base_group)
+                    fallback_group["params"] = fallback_params
+                    if keep_names:
+                        fallback_group["param_names"] = fallback_names
+                    fallback_group["use_matrix_update"] = False
+                    apply_defaults(fallback_group)
+                    groups.append(fallback_group)
             return groups
 
         matrix_params: list[torch.Tensor] = []
@@ -722,7 +795,10 @@ class AnchorMuon(torch.optim.Optimizer):
     def _pre_matrix_source(self, p: torch.Tensor, grad: torch.Tensor, momentum_beta: float) -> tuple[torch.Tensor, torch.Tensor]:
         state = self.state[p]
         momentum = state.get("momentum_buffer")
-        if momentum is None or momentum.shape != grad.shape or momentum.device != grad.device:
+        if isinstance(momentum, torch.Tensor) and momentum.shape == grad.shape:
+            if momentum.device != grad.device or momentum.dtype != torch.float32:
+                momentum = state["momentum_buffer"] = momentum.to(device=grad.device, dtype=torch.float32)
+        else:
             momentum = state["momentum_buffer"] = torch.zeros_like(grad, dtype=torch.float32)
         g = grad.detach().to(torch.float32)
         momentum.lerp_(g, 1.0 - momentum_beta)
@@ -737,11 +813,17 @@ class AnchorMuon(torch.optim.Optimizer):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         state = self.state[p]
         row_ema = state.get("pmuoneq_row_ema")
-        if row_ema is None or row_ema.shape != (rows,) or row_ema.device != device:
+        if isinstance(row_ema, torch.Tensor) and row_ema.shape == (rows,):
+            if row_ema.device != device or row_ema.dtype != torch.float32:
+                row_ema = state["pmuoneq_row_ema"] = row_ema.to(device=device, dtype=torch.float32)
+        else:
             row_ema = state["pmuoneq_row_ema"] = torch.ones(rows, device=device, dtype=torch.float32)
         second = state.get("normuon_second_momentum")
         second_shape = (rows, 1)
-        if second is None or second.shape != second_shape or second.device != device:
+        if isinstance(second, torch.Tensor) and second.shape == second_shape:
+            if second.device != device or second.dtype != torch.float32:
+                second = state["normuon_second_momentum"] = second.to(device=device, dtype=torch.float32)
+        else:
             second = state["normuon_second_momentum"] = torch.zeros(*second_shape, device=device, dtype=torch.float32)
         return row_ema, second
 
@@ -850,14 +932,19 @@ class AnchorMuon(torch.optim.Optimizer):
         if mode not in FALLBACK_MODES:
             raise ValueError(f"fallback_mode must be one of {sorted(FALLBACK_MODES)}")
         exp_avg_sq = state.get("exp_avg_sq")
-        if exp_avg_sq is None or exp_avg_sq.shape != p.shape or exp_avg_sq.device != p.device:
+        if isinstance(exp_avg_sq, torch.Tensor) and exp_avg_sq.shape == p.shape:
+            if exp_avg_sq.device != p.device or exp_avg_sq.dtype != torch.float32:
+                exp_avg_sq = state["exp_avg_sq"] = exp_avg_sq.to(device=p.device, dtype=torch.float32)
+        else:
             exp_avg_sq = state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
             state["step"] = 0
         exp_avg = state.get("exp_avg")
         if mode in {"atan2", "adamc"} and (
-            exp_avg is None or exp_avg.shape != p.shape or exp_avg.device != p.device
+            not isinstance(exp_avg, torch.Tensor) or exp_avg.shape != p.shape
         ):
             exp_avg = state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+        elif isinstance(exp_avg, torch.Tensor) and (exp_avg.device != p.device or exp_avg.dtype != torch.float32):
+            exp_avg = state["exp_avg"] = exp_avg.to(device=p.device, dtype=torch.float32)
         state["step"] = int(state.get("step", 0)) + 1
         beta1, beta2 = group.get("betas", (0.9, 0.999))
         eps = float(group.get("eps", 1e-8))

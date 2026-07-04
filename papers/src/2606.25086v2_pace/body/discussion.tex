@@ -1,0 +1,16 @@
+\section{Discussion}\label{sec:discussion}
+
+In this work, we introduced \pace, a simple modification to existing LM optimization algorithms, formally derived in an optimal control formulation, that explicitly controls the training trajectory to improve the performance of the iterate-average estimator.  
+We then showed empirically that \pace\ can improve training performance in both pre- and post-training settings.
+
+\paragraph{Limitations.}  A theoretical limitation is the restrictiveness of the assumptions under which \pace\ was derived.  This is partly mitigated by the convergence guarantee in the convex setting, but rigorously incorporating momentum and adaptive preconditioning into the analysis of the optimizer is an important direction for future work.  
+\iftoggle{colt}{}{We emphasize that in all experiments, \pace\ is implemented with both momentum and adaptive preconditioning.  }
+There are several empirical limitations of the work as well.  First, due to resource constraints, we were unable to verify the efficacy of \pace\ at model scales larger than $2$B parameters for post-training and $124$M parameters for pretraining.  
+Second, \pace\ requires maintaining an additional copy of model weights during training and a more detailed exploration of the memory overhead and mitigations thereof will be important for practical implications.  Finally, consistent with literature in LM optimization \citep{vyas2024soap,liu2023sophia,defazio2024schedule}, our headline runs use a single training seed for compute reasons; the multi-seed robustness studies in \Cref{fig:appendix_multiseed_robust} and \Cref{fig:appendix_pretrain_csweep} confirm that the method ordering is stable across seeds.
+
+\paragraph{Future Work.} In addition to the directions for future work mentioned above, there are at least two additional questions raised by our work.  First, because our analysis is on SGD, our convergence guarantees do not require momentum and it is natural to explore the extent to which the pullback term alone can compensate for the lack of momentum; this would be a significant practical benefit of the method, as it would reduce the memory overhead of \pace\ by one copy of model weights.  Second, throughout our empirical study, we used AdamW as a base optimizer, but modern LM pretraining pipelines increasingly use second-order methods such as SOAP \citep{vyas2024soap} and MuON \citep{jordan2024muon}; exploring the extent to which \pace\ can be adapted to these optimizers and whether it provides similar benefits in that setting is an important direction for future work.  Moreover, it is natural to ask if these second-order preconditioners could be applied to the pullback term itself, which would be a more direct implementation of the optimal-control solution in \eqref{eq:practical_control_strategy}.
+
+
+
+
+

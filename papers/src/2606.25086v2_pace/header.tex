@@ -1,0 +1,129 @@
+\iftoggle{colt}{}{
+\usepackage[sort&compress,numbers]{natbib}
+}
+
+\usepackage{boxedminipage}
+\usepackage{multirow,nicefrac}
+\usepackage{makecell,upgreek}
+\usepackage{footnote}
+\usepackage{longtable}
+\usepackage{tablefootnote}
+\usepackage[T1]{fontenc}
+\usepackage{verbatim} 
+\usepackage[utf8]{inputenc}
+
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{adjustbox}
+
+
+\iftoggle{colt}{}{
+\usepackage[margin=1in]{geometry}
+}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\usepackage[dvipsnames]{xcolor}
+
+
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{subcaption}
+
+\usepackage{colortbl}
+\definecolor{lightgray}{gray}{0.9}  %
+
+
+\usepackage{amsmath}
+\usepackage{amsthm}
+\iftoggle{colt}{
+  
+}{
+\usepackage[breaklinks=true]{hyperref}
+}
+\hypersetup{
+	colorlinks=true,
+	linkcolor=blue,
+	citecolor=blue,
+	urlcolor=blue
+}
+
+\usepackage[capitalise,nameinlink]{cleveref}
+
+\usepackage{amsfonts,amssymb,mathrsfs}
+\usepackage{mathtools}
+
+
+\usepackage{appendix}
+\newcommand{\defeq}{:=}
+
+\theoremstyle{plain}
+	\newtheorem{theorem}{Theorem}
+	\newtheorem{thminformal}{Informal Theorem}
+	\newtheorem{oracle}{Oracle}
+
+	\newtheorem{lemma}{Lemma}
+	\newtheorem{claim}[lemma]{Claim}
+	\newtheorem{corollary}{Corollary}
+	\newtheorem{proposition}{Proposition}
+
+	\theoremstyle{definition}
+
+	\newtheorem{definition}{Definition}
+	\newtheorem{example}{Example}
+
+	\newtheorem{remark}{Remark}
+    \newtheorem{observation}[lemma]{Observation}
+
+  \newtheorem{fact}{Fact}	
+  \newtheorem{assumption}{Assumption}[section]
+  \newtheorem{condition}{Condition}[section]
+
+
+
+\Crefname{appendix}{Appendix}{Appendices}
+
+
+
+\usepackage{autonum}
+
+
+\usepackage[scaled]{beramono}
+\usepackage{listings}
+\definecolor{varorange}{RGB}{230,126,34}     %
+\definecolor{opblue}{RGB}{52,152,219}        %
+\definecolor{ifred}{RGB}{192,57,43}          %
+\definecolor{commentgray}{RGB}{150,150,150}  %
+\definecolor{codebg}{rgb}{0.98,0.98,0.98}    %
+
+\lstset{
+  language=Python,
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\footnotesize,
+  commentstyle=\color{commentgray}\itshape\footnotesize,
+  keywordstyle=\color{ifred}\bfseries,       %
+  morekeywords={if,else,elif,for,while,return}, %
+  showstringspaces=false,
+  numbers=none,
+  breaklines=true,
+  tabsize=1,
+  literate=
+    *{+}{{{\color{opblue}+}}}1
+     {-}{{{\color{opblue}-}}}1
+     {*}{{{\color{opblue}*}}}1
+     {/}{{{\color{opblue}/}}}1
+     {=}{{{\color{opblue}=}}}1
+     {(}{{{\color{black}(}}}1
+     {)}{{{\color{black})}}}1,
+  identifierstyle=\color{varorange},         %
+}
+
+
+
+
+
+\newsavebox\codebox
+
+
+
+\usepackage{authblk}

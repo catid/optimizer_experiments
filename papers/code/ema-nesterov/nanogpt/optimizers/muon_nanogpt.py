@@ -56,6 +56,7 @@ class Muon(torch.optim.Optimizer):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
         super().__init__(params, defaults)
 
+    @torch.no_grad()
     def step(self):
         for group in self.param_groups:
             lr = group['lr']
@@ -72,6 +73,7 @@ class Muon(torch.optim.Optimizer):
                     if g is None:
                         # continue
                         p.grad = torch.zeros_like(p)  # Force synchronization
+                        g = p.grad
                     state = self.state[p]
                     if 'momentum_buffer' not in state:
                         state['momentum_buffer'] = torch.zeros_like(g)

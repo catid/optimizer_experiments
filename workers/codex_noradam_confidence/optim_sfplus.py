@@ -16,6 +16,8 @@ import torch
 from torch import Tensor
 
 from optim_anchormuon import (
+    _dedupe_optimizer_params,
+    _effective_matrix_shape,
     _matrix_view,
     _restore_matrix_view,
     _state_tensor,
@@ -109,23 +111,33 @@ class SFPlusAnchorMuon(torch.optim.Optimizer):
             sfplus_beta_current=float(sfplus_beta1),
             sfplus_polyak_lr=1.0,
         )
-        super().__init__(params, defaults)
+        super().__init__(_dedupe_optimizer_params(params), defaults)
         self._train_mode = True
         self.last_stats: dict[str, float] = {}
 
     def _use_matrix_for_param(self, group: dict[str, Any], param: Tensor) -> bool:
+        effective_shape = _effective_matrix_shape(param)
         if "use_matrix_update" in group:
-            return bool(group["use_matrix_update"])
+            return bool(group["use_matrix_update"]) and len(effective_shape) >= 2
         if "use_muon" in group:
-            return bool(group["use_muon"])
-        if param.ndim < 2:
+            return bool(group["use_muon"]) and len(effective_shape) >= 2
+        if len(effective_shape) < 2:
             return False
-        rows = int(param.shape[0])
-        cols = int(param.numel() // max(rows, 1))
+        rows = effective_shape[0]
+        cols = math.prod(effective_shape[1:])
         return min(rows, cols) >= int(group["min_matrix_dim"])
 
     def _ensure_sf_state(self, param: Tensor, state: dict[str, Any]) -> None:
-        if "sfplus_z" not in state or tuple(state["sfplus_z"].shape) != tuple(param.shape) or state["sfplus_z"].device != param.device:
+        needs_init = False
+        for key in ("sfplus_z", "sfplus_x", "sfplus_y"):
+            value = state.get(key)
+            if isinstance(value, Tensor) and tuple(value.shape) == tuple(param.shape):
+                if value.device != param.device or value.dtype != torch.float32:
+                    state[key] = value.to(device=param.device, dtype=torch.float32)
+            else:
+                needs_init = True
+                break
+        if needs_init:
             base = param.detach().float()
             state["sfplus_z"] = base.clone(memory_format=torch.preserve_format)
             state["sfplus_x"] = base.clone(memory_format=torch.preserve_format)
@@ -171,6 +183,15 @@ class SFPlusAnchorMuon(torch.optim.Optimizer):
                     param.copy_(y.to(device=param.device, dtype=param.dtype))
         self._train_mode = True
         return self
+
+    def state_dict(self) -> dict[str, Any]:
+        state_dict = super().state_dict()
+        state_dict["sfplus_train_mode"] = self._train_mode
+        return state_dict
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self._train_mode = bool(state_dict.get("sfplus_train_mode", True))
+        super().load_state_dict(state_dict)
 
     @torch.no_grad()
     def _prepare_context(self, function_value: float | None) -> dict[str, float]:
@@ -283,14 +304,16 @@ class SFPlusAnchorMuon(torch.optim.Optimizer):
     def _adamc_direction(self, param: Tensor, grad: Tensor, group: dict[str, Any], state: dict[str, Any], step: int) -> Tensor:
         beta1, beta2 = group["betas"]
         exp_avg, exp_avg_sq = self._ensure_adam_state(param, state)
+        state["sfplus_fallback_step"] = int(state.get("sfplus_fallback_step", 0)) + 1
+        fallback_step = int(state["sfplus_fallback_step"])
         if bool(group["sfplus_inner_momentum"]):
             exp_avg.mul_(float(beta1)).add_(grad, alpha=1.0 - float(beta1))
-            bias1 = max(1.0 - float(beta1) ** step, float(group["eps"]))
+            bias1 = max(1.0 - float(beta1) ** fallback_step, float(group["eps"]))
             numer = exp_avg / bias1
         else:
             numer = grad
         exp_avg_sq.mul_(float(beta2)).addcmul_(grad, grad, value=1.0 - float(beta2))
-        bias2 = max(1.0 - float(beta2) ** step, float(group["eps"]))
+        bias2 = max(1.0 - float(beta2) ** fallback_step, float(group["eps"]))
         denom = (exp_avg_sq / bias2).sqrt().add_(float(group["eps"]))
         return numer / denom
 
@@ -360,4 +383,3 @@ class SFPlusAnchorMuon(torch.optim.Optimizer):
             "fallback_params": float(fallback_params),
         }
         return loss
-

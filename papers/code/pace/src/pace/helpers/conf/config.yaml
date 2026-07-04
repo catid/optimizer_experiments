@@ -1,0 +1,27 @@
+defaults:
+  - model: smollm2_135m
+  - dataset: smoltalk
+  - optimizer: pace
+  - schedule: const
+  - _self_
+
+seed: 42
+
+training:
+  epochs: 1
+  batch_size: 8
+  gradient_accumulation_steps: 16   # effective batch size = 128
+  grad_clip: 1.0
+  eval_interval: 100
+  eval_samples: null                # null = full validation set
+  max_steps: null                   # optional cap (e.g. smoke tests)
+
+wandb:
+  enabled: false
+  project: pace
+  entity: null
+  group: null
+
+hydra:
+  run:
+    dir: ${oc.env:PACE_RUN_DIR,runs}/${now:%Y%m%d_%H%M%S}

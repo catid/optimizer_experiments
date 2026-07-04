@@ -1,0 +1,33 @@
+launched gpu=0 final_pace_muon_adam_lr0.0016_c0.003_k0.5
+launched gpu=1 final_pace_muon_row_lr0.0016_c0.003_k0.5
+finished gpu=1 final_pace_muon_row_lr0.0016_c0.003_k0.5
+launched gpu=1 final_pace_muon_row_lr0.0016_c0.01_k0.5
+finished gpu=0 final_pace_muon_adam_lr0.0016_c0.003_k0.5
+launched gpu=0 final_pace_muon_row_lr0.0016_c0.03_k0.5
+finished gpu=1 final_pace_muon_row_lr0.0016_c0.01_k0.5
+launched gpu=1 final_pace_muon_scalar_lr0.0016_c0.003_k0.5
+finished gpu=0 final_pace_muon_row_lr0.0016_c0.03_k0.5
+launched gpu=0 final_pace_muon_scalar_lr0.0016_c0.03_k0.5
+finished gpu=1 final_pace_muon_scalar_lr0.0016_c0.003_k0.5
+launched gpu=1 final_pace_inject_lr0.0016_c0.01_k0.5
+finished gpu=0 final_pace_muon_scalar_lr0.0016_c0.03_k0.5
+launched gpu=0 final_pace_inject_lr0.0016_c0.03_k0.5
+finished gpu=1 final_pace_inject_lr0.0016_c0.01_k0.5
+launched gpu=1 final_pace_inject_lr0.0016_c0.1_k0.5
+finished gpu=0 final_pace_inject_lr0.0016_c0.03_k0.5
+launched gpu=0 final_emaeval_muon_lr0.0016_k0.7
+finished gpu=0 final_emaeval_muon_lr0.0016_k0.7
+launched gpu=0 final_emaeval_muon_lr0.0018_k0.5
+finished gpu=1 final_pace_inject_lr0.0016_c0.1_k0.5
+finished gpu=0 final_emaeval_muon_lr0.0018_k0.5
+Traceback (most recent call last):
+  File "/home/catid/optimizer_experiments/workers/codex_noradam_confidence/experiments/run_wikitext_llm50m.py", line 3091, in <module>
+    make_plots(args, final_rows)
+    ^^^^^^
+  File "/home/catid/optimizer_experiments/workers/codex_noradam_confidence/experiments/run_wikitext_llm50m.py", line 3087, in main
+    hpo_rows = launch_trials(args, hpo_trials(args))
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/catid/optimizer_experiments/workers/codex_noradam_confidence/experiments/run_wikitext_llm50m.py", line 3046, in write_summary
+    final_loss = finite_metric(row, "final_val_loss")
+                                                     ^
+KeyError: 'final_val_loss'

@@ -1,0 +1,16 @@
+id: fig_clip_frac_body
+paper: "Fig 2"
+desc: "SmolLM2-1.7B: clip-fraction of the pullback gain over training (lr=3e-4)"
+dataset: smoltalk
+
+# Body Fig 2 plots the lambda-clip fraction over training for SmolLM2-1.7B
+# (exp14 sweep), at lr=3e-4 only, kappa in {0.2,0.5,0.7}, c-gradient lines.
+# Pure PACE sweep (no AdamW/EMA points drawn). Values from
+# fig_appendix_clip_frac.py: LR=3e-4, KAPPAS=[0.2,0.5,0.7],
+# C_VALUES=[0.005,0.015,0.05,0.15,0.5], ema_update_freq=1, const schedule, seed 42.
+sweep:
+  model: smollm2_1.7b
+  base: {method: PACE, optimizer: {name: pace, lr: 0.0003, ema_update_freq: 1}, schedule: const, seed: 42}
+  grid:
+    optimizer.ema_kappa: [0.2, 0.5, 0.7]
+    optimizer.lambda_pullback: [0.005, 0.015, 0.05, 0.15, 0.5]

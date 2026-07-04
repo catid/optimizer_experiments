@@ -299,6 +299,23 @@ def _bucket_muon(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return list(buckets.values())
 
 
+def _effective_matrix_shape(x: Tensor) -> tuple[int, ...]:
+    return tuple(int(dim) for dim in x.shape if int(dim) > 1)
+
+
+def _has_matrix_shape(x: Tensor) -> bool:
+    return len(_effective_matrix_shape(x)) >= 2
+
+
+def _matrix_view(x: Tensor) -> Tensor:
+    effective_shape = _effective_matrix_shape(x)
+    if len(effective_shape) < 2:
+        raise ValueError("matrix update requires at least two non-singleton dimensions")
+    if len(effective_shape) == 2:
+        return x.reshape(effective_shape)
+    return x.reshape(effective_shape[0], math.prod(effective_shape[1:]))
+
+
 def _foreach_lerp_(params: list[Tensor], ends: list[Tensor], weight: float, enabled: bool) -> None:
     if not params:
         return
@@ -565,9 +582,13 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
 
     def _get_z(self, p: Tensor) -> Tensor:
         state = self.state[p]
-        if "z" not in state:
-            state["z"] = torch.clone(p.detach().to(torch.float32), memory_format=torch.preserve_format)
-        return state["z"]
+        z = state.get("z")
+        if isinstance(z, Tensor) and tuple(z.shape) == tuple(p.shape):
+            if z.device != p.device or z.dtype != torch.float32:
+                z = state["z"] = z.to(device=p.device, dtype=torch.float32)
+            return z
+        z = state["z"] = torch.clone(p.detach().to(torch.float32), memory_format=torch.preserve_format)
+        return z
 
     def _soda_lambda(self, group: dict[str, Any], t: int) -> float:
         warmup = int(group.get("soda_warmup_steps", self.soda_warmup_steps))
@@ -578,9 +599,13 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
 
     def _get_soda_anchor(self, p: Tensor, z: Tensor) -> Tensor:
         state = self.state[p]
-        if "soda_z0" not in state:
-            state["soda_z0"] = torch.clone(z.detach().to(torch.float32), memory_format=torch.preserve_format)
-        return state["soda_z0"]
+        anchor = state.get("soda_z0")
+        if isinstance(anchor, Tensor) and tuple(anchor.shape) == tuple(p.shape):
+            if anchor.device != p.device or anchor.dtype != torch.float32:
+                anchor = state["soda_z0"] = anchor.to(device=p.device, dtype=torch.float32)
+            return anchor
+        anchor = state["soda_z0"] = torch.clone(z.detach().to(torch.float32), memory_format=torch.preserve_format)
+        return anchor
 
     @staticmethod
     def _apply_soda_anchor_one(z: Tensor, anchor: Tensor, soda_lambda: float) -> None:
@@ -606,16 +631,23 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         t: int,
         soda_lambda: float,
     ) -> int:
-        items: list[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]] = []
+        items: list[tuple[Tensor, Tensor, Tensor, Tensor, Tensor, int]] = []
         for p in group["params"]:
             if p.grad is None:
                 continue
+            if p.grad.is_sparse:
+                raise RuntimeError("EquiMuseNorMuon does not support sparse gradients")
             state = self.state[p]
             z = self._get_z(p)
             anchor = self._get_soda_anchor(p, z)
-            if "exp_avg_sq" not in state:
-                state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32, memory_format=torch.preserve_format)
-            items.append((p, p.grad.detach().to(torch.float32), z, state["exp_avg_sq"], anchor))
+            exp_avg_sq = state.get("exp_avg_sq")
+            if isinstance(exp_avg_sq, Tensor) and exp_avg_sq.shape == p.shape:
+                if exp_avg_sq.device != p.device or exp_avg_sq.dtype != torch.float32:
+                    exp_avg_sq = state["exp_avg_sq"] = exp_avg_sq.to(device=p.device, dtype=torch.float32)
+            else:
+                exp_avg_sq = state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32, memory_format=torch.preserve_format)
+            state["fallback_step"] = int(state.get("fallback_step", 0)) + 1
+            items.append((p, p.grad.detach().to(torch.float32), z, exp_avg_sq, anchor, int(state["fallback_step"])))
 
         if bool(group.get("foreach", self.foreach)) and hasattr(torch, "_foreach_mul_"):
             for bucket in _bucket_by_tensor(items, tensor_index=0):
@@ -627,7 +659,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
 
     def _step_fallback_bucket_foreach(
         self,
-        bucket: list[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]],
+        bucket: list[tuple[Tensor, Tensor, Tensor, Tensor, Tensor, int]],
         group: dict[str, Any],
         lr: float,
         ckp1: float,
@@ -641,17 +673,17 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         zs = [x[2] for x in bucket]
         exp_avg_sqs = [x[3] for x in bucket]
         anchors = [x[4] for x in bucket]
+        steps = [x[5] for x in bucket]
         beta2 = float(group.get("beta2", 0.999))
         eps = float(group.get("eps", 1e-10))
         wd = float(group.get("weight_decay", 0.0))
-        bias_correction2 = 1.0 - beta2**t
 
         # Invert Y -> X using the beta1 that produced the current param value.
         _foreach_lerp_(params, zs, 1.0 - 1.0 / beta1_prev, True)
         self._apply_soda_anchor_bucket(zs, anchors, soda_lambda)
         torch._foreach_mul_(exp_avg_sqs, beta2)
         torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
-        denoms = torch._foreach_div(exp_avg_sqs, bias_correction2)
+        denoms = [exp_avg_sq / max(1.0 - beta2**step, eps) for exp_avg_sq, step in zip(exp_avg_sqs, steps, strict=True)]
         torch._foreach_sqrt_(denoms)
         torch._foreach_add_(denoms, eps)
         updates = torch._foreach_div(grads, denoms)
@@ -663,7 +695,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
 
     def _step_fallback_one(
         self,
-        item: tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
+        item: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, int],
         group: dict[str, Any],
         lr: float,
         ckp1: float,
@@ -672,7 +704,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         t: int,
         soda_lambda: float,
     ) -> None:
-        p, grad, z, exp_avg_sq, anchor = item
+        p, grad, z, exp_avg_sq, anchor, step = item
         beta2 = float(group.get("beta2", 0.999))
         eps = float(group.get("eps", 1e-10))
         wd = float(group.get("weight_decay", 0.0))
@@ -680,7 +712,7 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         p.lerp_(z.to(dtype=p.dtype), 1.0 - 1.0 / beta1_prev)
         self._apply_soda_anchor_one(z, anchor, soda_lambda)
         exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-        update = grad.div(exp_avg_sq.div(1.0 - beta2**t).sqrt_().add_(eps))
+        update = grad.div(exp_avg_sq.div(max(1.0 - beta2**step, eps)).sqrt_().add_(eps))
         if wd and soda_lambda <= 0.0:
             update = update.add(z, alpha=wd)
         z.add_(update, alpha=-lr)
@@ -693,25 +725,27 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         for p in group["params"]:
             if p.grad is None:
                 continue
-            if p.grad.ndim < 2:
-                raise ValueError("use_muon=True parameters must have ndim >= 2")
+            if p.grad.is_sparse:
+                raise RuntimeError("EquiMuseNorMuon does not support sparse gradients")
+            if not _has_matrix_shape(p.grad):
+                raise ValueError("use_muon=True parameters must have at least two non-singleton dimensions")
             state = self.state[p]
             z = self._get_z(p)
             anchor = self._get_soda_anchor(p, z)
-            if "momentum_buffer" not in state:
-                state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32, memory_format=torch.preserve_format)
+            momentum_buffer = state.get("momentum_buffer")
+            if isinstance(momentum_buffer, Tensor) and momentum_buffer.shape == p.shape:
+                if momentum_buffer.device != p.device or momentum_buffer.dtype != torch.float32:
+                    momentum_buffer = state["momentum_buffer"] = momentum_buffer.to(device=p.device, dtype=torch.float32)
+            else:
+                momentum_buffer = state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32, memory_format=torch.preserve_format)
             # Invert Y -> X using the beta1 that produced the current param value.
             p.lerp_(z.to(dtype=p.dtype), 1.0 - 1.0 / beta1_prev)
             grad32 = p.grad.detach().to(torch.float32)
-            state["momentum_buffer"].lerp_(grad32, 1.0 - momentum_beta)
-            update = grad32.lerp(state["momentum_buffer"], momentum_beta)
+            momentum_buffer.lerp_(grad32, 1.0 - momentum_beta)
+            update = grad32.lerp(momentum_buffer, momentum_beta)
             raw_grad = grad32
-            if update.ndim > 2:
-                matrix = update.reshape(update.shape[0], -1)
-                raw_matrix = raw_grad.reshape(raw_grad.shape[0], -1)
-            else:
-                matrix = update.reshape(update.shape[-2], update.shape[-1])
-                raw_matrix = raw_grad.reshape(raw_grad.shape[-2], raw_grad.shape[-1])
+            matrix = _matrix_view(update)
+            raw_matrix = _matrix_view(raw_grad)
             items.append(
                 {
                     "param": p,
@@ -741,9 +775,12 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
     @staticmethod
     def _get_diag_state(state: dict[str, Any], key: str, size: int, device: torch.device) -> Tensor:
         value = state.get(key)
-        if value is None or value.shape != (size,) or value.device != device:
-            value = torch.zeros(size, device=device, dtype=torch.float32)
-            state[key] = value
+        if isinstance(value, Tensor) and value.shape == (size,):
+            if value.device != device or value.dtype != torch.float32:
+                value = state[key] = value.to(device=device, dtype=torch.float32)
+            return value
+        value = torch.zeros(size, device=device, dtype=torch.float32)
+        state[key] = value
         return value
 
     @torch.no_grad()
@@ -818,9 +855,12 @@ class EquiMuseNorMuon(torch.optim.Optimizer):
         shape = (rows, 1) if effective == "row" else (1, cols)
         key = f"normuon_{effective}_second_moment"
         value = state.get(key)
-        if value is None or tuple(value.shape) != shape or value.device != device:
-            value = torch.zeros(shape, device=device, dtype=torch.float32)
-            state[key] = value
+        if isinstance(value, Tensor) and tuple(value.shape) == shape:
+            if value.device != device or value.dtype != torch.float32:
+                value = state[key] = value.to(device=device, dtype=torch.float32)
+            return value
+        value = torch.zeros(shape, device=device, dtype=torch.float32)
+        state[key] = value
         return value
 
     def _normuon_matrix(self, item: dict[str, Any], update: Tensor, group: dict[str, Any]) -> Tensor:
@@ -905,21 +945,31 @@ def build_equimuse_normuon_param_groups(
     fallback_names: list[str] = []
     muon: list[torch.nn.Parameter] = []
     muon_names: list[str] = []
-    seen: set[int] = set()
+    unique: dict[int, tuple[torch.nn.Parameter, list[str]]] = {}
     for name, param in named_params:
-        if not param.requires_grad or id(param) in seen:
+        if not param.requires_grad:
             continue
-        seen.add(id(param))
-        lower = name.lower().removeprefix("module.")
-        is_embedding = any(token in lower for token in ("embed", "embedding", "wte", "wpe", "token_emb", "tok_embeddings"))
-        is_lm_head = "lm_head" in lower or "unembed" in lower or lower.endswith("head.weight")
-        is_scalar_or_bias = param.ndim < 2 or lower.endswith("bias")
+        key = id(param)
+        if key not in unique:
+            unique[key] = (param, [name])
+        else:
+            unique[key][1].append(name)
+    for param, names in unique.values():
+        lowers = [name.lower().removeprefix("module.") for name in names]
+        is_embedding = any(
+            token in lower
+            for lower in lowers
+            for token in ("embed", "embedding", "wte", "wpe", "token_emb", "tok_embeddings")
+        )
+        is_lm_head = any("lm_head" in lower or "unembed" in lower or lower.endswith("head.weight") for lower in lowers)
+        is_scalar_or_bias = not _has_matrix_shape(param) or any(lower.endswith("bias") for lower in lowers)
+        display_name = "|".join(names)
         if is_embedding or is_lm_head or is_scalar_or_bias:
             fallback.append(param)
-            fallback_names.append(name)
+            fallback_names.append(display_name)
         else:
             muon.append(param)
-            muon_names.append(name)
+            muon_names.append(display_name)
 
     groups: list[dict[str, Any]] = []
     if fallback:

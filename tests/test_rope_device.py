@@ -38,3 +38,28 @@ def test_vision_rope_rejects_non_square_patch_count():
         assert "square patch grid" in str(exc)
     else:
         raise AssertionError("expected non-square patch count to fail clearly")
+
+
+def test_vision_rope_accepts_tensor_custom_freqs():
+    rope = _load_rope()
+    module = rope.VisionRotaryEmbedding(dim=4, pt_seq_len=2, custom_freqs=torch.ones(2))
+    x = torch.randn(4, 4, 8)
+
+    out = module(x)
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+
+
+def test_vision_rope_preserves_input_dtype_for_half_precision():
+    rope = _load_rope()
+    module = rope.VisionRotaryEmbedding(dim=4, pt_seq_len=2)
+
+    for dtype in (torch.float16, torch.bfloat16):
+        x = torch.randn(4, 4, 8).to(dtype)
+
+        out = module(x)
+
+        assert out.dtype == dtype
+        assert out.shape == x.shape
+        assert torch.isfinite(out).all()

@@ -1,0 +1,48 @@
+id: fig_appendix_c_kappa_all_models
+paper: "Fig 6"
+desc: "kappa x c response across 3 models (PACE c-sweep at kappa in {0.2,0.5,0.7})"
+dataset: smoltalk
+
+# Rows = models, columns = EMA Power kappa in {0.2, 0.5, 0.7}. Each panel sweeps
+# the PACE pullback strength c over the log grid, with the matched EMA baseline
+# (c=0) at the same kappa and the AdamW baseline as the leftmost reference, all
+# at the model's headline learning rate (SmolLM2-1.7B 1e-3, Qwen3-1.7B 5e-4,
+# Gemma3-1B 1e-3). c grid: [1e-4, 5e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1].
+# Per model: AdamW(1) + EMA(3 kappas) + PACE(8 c x 3 kappas) = 28 runs; 84 total.
+sweeps:
+  # ---- SmolLM2-1.7B (headline lr 1e-3) ----
+  - model: smollm2_1.7b
+    base: {method: AdamW, schedule: const, seed: 42, optimizer: {name: adamw, lr: 0.001, lambda_pullback: 0.0}}
+    grid: {}
+  - model: smollm2_1.7b
+    base: {method: EMA, schedule: const, seed: 42, optimizer: {name: ema, lr: 0.001, lambda_pullback: 0.0}}
+    grid: {optimizer.ema_kappa: [0.2, 0.5, 0.7]}
+  - model: smollm2_1.7b
+    base: {method: PACE, schedule: const, seed: 42, optimizer: {name: pace, lr: 0.001}}
+    grid:
+      optimizer.ema_kappa: [0.2, 0.5, 0.7]
+      optimizer.lambda_pullback: [0.0001, 0.0005, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3]
+  # ---- Qwen3-1.7B (headline lr 5e-4) ----
+  - model: qwen3_1.7b
+    base: {method: AdamW, schedule: const, seed: 42, optimizer: {name: adamw, lr: 0.0005, lambda_pullback: 0.0}}
+    grid: {}
+  - model: qwen3_1.7b
+    base: {method: EMA, schedule: const, seed: 42, optimizer: {name: ema, lr: 0.0005, lambda_pullback: 0.0}}
+    grid: {optimizer.ema_kappa: [0.2, 0.5, 0.7]}
+  - model: qwen3_1.7b
+    base: {method: PACE, schedule: const, seed: 42, optimizer: {name: pace, lr: 0.0005}}
+    grid:
+      optimizer.ema_kappa: [0.2, 0.5, 0.7]
+      optimizer.lambda_pullback: [0.0001, 0.0005, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3]
+  # ---- Gemma3-1B (headline lr 1e-3) ----
+  - model: gemma3_1b
+    base: {method: AdamW, schedule: const, seed: 42, optimizer: {name: adamw, lr: 0.001, lambda_pullback: 0.0}}
+    grid: {}
+  - model: gemma3_1b
+    base: {method: EMA, schedule: const, seed: 42, optimizer: {name: ema, lr: 0.001, lambda_pullback: 0.0}}
+    grid: {optimizer.ema_kappa: [0.2, 0.5, 0.7]}
+  - model: gemma3_1b
+    base: {method: PACE, schedule: const, seed: 42, optimizer: {name: pace, lr: 0.001}}
+    grid:
+      optimizer.ema_kappa: [0.2, 0.5, 0.7]
+      optimizer.lambda_pullback: [0.0001, 0.0005, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3]

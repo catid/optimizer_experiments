@@ -3,6 +3,7 @@ import sys
 from io import BytesIO
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -46,6 +47,20 @@ class WideMatrixNet(nn.Module):
         return self.classifier_head(F.gelu(self.wide(x)))
 
 
+def test_sparse_gradients_fail_with_clear_error() -> None:
+    embedding = nn.Embedding(16, 8, sparse=True)
+    opt = SodaPmuonEqNorMuon(
+        [{"params": [embedding.weight], "use_matrix_update": False}],
+        warmup_steps=1,
+    )
+
+    loss = embedding(torch.tensor([1, 2, 3])).sum()
+    loss.backward()
+
+    with pytest.raises(RuntimeError, match="does not support sparse gradients"):
+        opt.step()
+
+
 def test_param_group_builder_keeps_head_and_norm_in_fallback() -> None:
     model = TinyClassifier()
     groups = build_soda_pmuoneq_normuon_param_groups(model.named_parameters())
@@ -77,6 +92,38 @@ def test_param_group_builder_does_not_overmatch_head_substrings() -> None:
     assert "blocks.0.layernorm.weight" in fallback_names
 
 
+def test_param_group_builder_deduplicates_tied_parameter_aliases() -> None:
+    tied = nn.Parameter(torch.zeros(8, 8))
+    groups = build_soda_pmuoneq_normuon_param_groups(
+        [
+            ("token_embed.weight", tied),
+            ("lm_head.weight", tied),
+        ]
+    )
+
+    assert len(groups) == 1
+    assert groups[0]["use_matrix_update"] is False
+    assert groups[0]["params"] == [tied]
+    assert groups[0]["param_names"] == ["token_embed.weight|lm_head.weight"]
+
+
+def test_constructor_deduplicates_shared_params_in_raw_inputs() -> None:
+    for params in (
+        lambda p: [p, p],
+        lambda p: [{"params": [p, p], "use_matrix_update": False}],
+        lambda p: [{"params": p, "use_matrix_update": False}],
+    ):
+        param = nn.Parameter(torch.ones(1))
+        opt = SodaPmuonEqNorMuon(params(param), warmup_steps=1)
+
+        assert sum(candidate is param for group in opt.param_groups for candidate in group["params"]) == 1
+
+        param.grad = torch.ones_like(param)
+        opt.step()
+
+        assert opt.last_stats["fallback_count"] == 1.0
+
+
 def test_optimizer_step_is_finite_and_creates_matrix_state() -> None:
     torch.manual_seed(0)
     model = TinyClassifier()
@@ -103,6 +150,30 @@ def test_optimizer_step_is_finite_and_creates_matrix_state() -> None:
     assert "normuon_second_momentum" in state
     assert opt.last_stats["matrix_count"] >= 1
     assert opt.last_stats["fallback_count"] >= 1
+
+
+def test_leading_singleton_param_uses_effective_matrix_shape() -> None:
+    torch.manual_seed(101)
+    param = nn.Parameter(torch.randn(1, 6, 8))
+    groups = build_soda_pmuoneq_normuon_param_groups([("blocks.0.rel.weight", param)])
+    opt = SodaPmuonEqNorMuon(groups, warmup_steps=1, ns_compute_dtype=torch.float32)
+
+    param.grad = torch.randn_like(param)
+    opt.step()
+
+    state = opt.state[param]
+    assert state["pmuoneq_row_ema"].shape == (6,)
+    assert state["pmuoneq_col_ema"].shape == (8,)
+    assert opt.last_stats["matrix_count"] == 1.0
+
+
+def test_effective_vector_shape_routes_to_fallback() -> None:
+    param = nn.Parameter(torch.randn(1, 1, 8))
+    groups = build_soda_pmuoneq_normuon_param_groups([("blocks.0.scale.weight", param)])
+
+    assert len(groups) == 1
+    assert groups[0]["use_matrix_update"] is False
+    assert groups[0]["params"] == [param]
 
 
 def test_normuon_aspect_and_orientation_ablation_controls() -> None:

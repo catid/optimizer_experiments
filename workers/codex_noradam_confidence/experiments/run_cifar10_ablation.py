@@ -1497,10 +1497,30 @@ class EMANesterovOptimizer:
         self.step_index += 1
         return loss
 
+    def _flat_params(self) -> list[torch.Tensor]:
+        return [p for group in self.param_groups for p in group["params"]]
+
+    @staticmethod
+    def _clone_state_value(value: Any) -> Any:
+        if torch.is_tensor(value):
+            return value.detach().clone()
+        if isinstance(value, dict):
+            return {key: EMANesterovOptimizer._clone_state_value(val) for key, val in value.items()}
+        if isinstance(value, list):
+            return [EMANesterovOptimizer._clone_state_value(val) for val in value]
+        if isinstance(value, tuple):
+            return tuple(EMANesterovOptimizer._clone_state_value(val) for val in value)
+        return value
+
     def state_dict(self) -> dict[str, Any]:
+        param_to_index = {p: index for index, p in enumerate(self._flat_params())}
         return {
             "base_optimizer": self.base_optimizer.state_dict(),
-            "state": self.state,
+            "state": {
+                param_to_index[p]: self._clone_state_value(state)
+                for p, state in self.state.items()
+                if p in param_to_index
+            },
             "step_index": self.step_index,
             "total_steps": self.total_steps,
             "beta": self.beta,
@@ -1511,7 +1531,18 @@ class EMANesterovOptimizer:
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.base_optimizer.load_state_dict(state_dict["base_optimizer"])
-        self.state = state_dict.get("state", {})
+        self.param_groups = self.base_optimizer.param_groups
+        flat_params = self._flat_params()
+        packed_state = state_dict.get("state", {})
+        if packed_state and not all(isinstance(index, (int, str)) for index in packed_state):
+            packed_items = enumerate(packed_state.values())
+        else:
+            packed_items = packed_state.items()
+        self.state = {}
+        for index, state in packed_items:
+            int_index = int(index)
+            if int_index < len(flat_params):
+                self.state[flat_params[int_index]] = self._clone_state_value(state)
         self.step_index = int(state_dict.get("step_index", 0))
 
     def train(self) -> None:
@@ -2107,14 +2138,15 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> None:
     data_path = args.data_path.resolve()
     ensure_cifar10_downloaded(data_path)
     pending = list(trials)
-    running: list[tuple[subprocess.Popen, str]] = []
-    next_gpu = 0
+    running: list[tuple[subprocess.Popen, str, int]] = []
+    available_gpus = list(range(gpu_count))
     while pending or running:
-        while pending and len(running) < gpu_count:
+        while pending and available_gpus:
             cfg = pending.pop(0)
             if args.skip_completed and (output_dir / cfg.name / "summary.json").exists():
                 print(f"[skip] completed trial={cfg.name}", flush=True)
                 continue
+            gpu = available_gpus.pop(0)
             trial_json = output_dir / f"{cfg.name}.trial.json"
             trial_json.write_text(json.dumps(asdict(cfg), indent=2) + "\n")
             cmd = [
@@ -2147,21 +2179,22 @@ def launch_trials(args: argparse.Namespace, trials: list[TrialConfig]) -> None:
             if not args.sync_step_timing:
                 cmd.append("--no-sync-step-timing")
             env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(next_gpu)
-            print(f"[launch] gpu={next_gpu} trial={cfg.name}", flush=True)
-            running.append((subprocess.Popen(cmd, env=env, cwd=ROOT), cfg.name))
-            next_gpu = (next_gpu + 1) % gpu_count
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+            print(f"[launch] gpu={gpu} trial={cfg.name}", flush=True)
+            running.append((subprocess.Popen(cmd, env=env, cwd=ROOT), cfg.name, gpu))
         time.sleep(2.0)
-        still_running: list[tuple[subprocess.Popen, str]] = []
-        for proc, name in running:
+        still_running: list[tuple[subprocess.Popen, str, int]] = []
+        for proc, name, gpu in running:
             rc = proc.poll()
             if rc is None:
-                still_running.append((proc, name))
+                still_running.append((proc, name, gpu))
             elif rc != 0:
                 raise RuntimeError(f"trial {name} failed with exit code {rc}")
             else:
+                available_gpus.append(gpu)
                 print(f"[done] {name}", flush=True)
         running = still_running
+        available_gpus = sorted(available_gpus)
 
 
 def collect_epoch_rows(output_dir: Path) -> list[dict[str, str]]:
@@ -2211,6 +2244,14 @@ def add_speed_fields_from_metrics(summary_path: Path, row: dict) -> dict:
     return row
 
 
+def finite_float(value: Any, default: float) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
 def summarize(output_dir: Path, make_plots: bool) -> None:
     summaries = []
     for path in sorted(output_dir.glob("*/summary.json")):
@@ -2222,10 +2263,23 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(summaries)
-    best = max(summaries, key=lambda row: (float(row["best_val_acc"]), -float(row["best_val_loss"])))
+    finite_summaries = [
+        row
+        for row in summaries
+        if math.isfinite(finite_float(row.get("best_val_acc"), -math.inf))
+        and math.isfinite(finite_float(row.get("best_val_loss"), math.inf))
+    ]
+    selectable_summaries = finite_summaries or summaries
+    best = max(
+        selectable_summaries,
+        key=lambda row: (
+            finite_float(row.get("best_val_acc"), -math.inf),
+            -finite_float(row.get("best_val_loss"), math.inf),
+        ),
+    )
     (output_dir / "best_run.json").write_text(json.dumps(best, indent=2) + "\n")
     by_family_candidates: dict[str, dict[str, dict[str, Any]]] = {}
-    for row in summaries:
+    for row in selectable_summaries:
         cfg = TrialConfig(
             name=row["trial"],
             optimizer=row["optimizer"],
@@ -2287,8 +2341,8 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
         best_score: tuple[float, float, int] | None = None
         for candidate in candidates.values():
             rows = candidate["rows"]
-            acc_values = [float(row["best_val_acc"]) for row in rows]
-            loss_values = [float(row["best_val_loss"]) for row in rows]
+            acc_values = [finite_float(row["best_val_acc"], -math.inf) for row in rows]
+            loss_values = [finite_float(row["best_val_loss"], math.inf) for row in rows]
             mean_acc = sum(acc_values) / len(acc_values)
             mean_loss = sum(loss_values) / len(loss_values)
             score = (mean_acc, -mean_loss, len(rows))
@@ -2299,8 +2353,8 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
             continue
         rows = best_candidate["rows"]
         cfg = best_candidate["cfg"]
-        acc_values = [float(row["best_val_acc"]) for row in rows]
-        loss_values = [float(row["best_val_loss"]) for row in rows]
+        acc_values = [finite_float(row["best_val_acc"], -math.inf) for row in rows]
+        loss_values = [finite_float(row["best_val_loss"], math.inf) for row in rows]
         mean_acc = sum(acc_values) / len(acc_values)
         mean_loss = sum(loss_values) / len(loss_values)
         acc_std = math.sqrt(sum((value - mean_acc) ** 2 for value in acc_values) / len(acc_values))
@@ -2412,14 +2466,22 @@ def summarize(output_dir: Path, make_plots: bool) -> None:
                 ("avg_step_ms", "step_time_ms_bar.png", "Average training step time (ms)", False),
                 ("overall_examples_per_sec", "examples_per_sec_bar.png", "Overall training examples/s", True),
             ]:
-                available = [row for row in summaries if row.get(metric) not in (None, "")]
+                available = [
+                    row
+                    for row in summaries
+                    if math.isfinite(finite_float(row.get(metric), math.nan))
+                ]
                 if not available:
                     continue
-                available = sorted(available, key=lambda row: float(row[metric]), reverse=reverse)
+                available = sorted(
+                    available,
+                    key=lambda row: finite_float(row.get(metric), -math.inf if reverse else math.inf),
+                    reverse=reverse,
+                )
                 height = max(4.0, 0.32 * len(available))
                 plt.figure(figsize=(11, height))
                 labels = [display_label(str(row["trial"])) for row in available]
-                vals = [float(row[metric]) for row in available]
+                vals = [finite_float(row.get(metric), math.nan) for row in available]
                 bars = plt.barh(labels, vals)
                 plt.gca().invert_yaxis()
                 plt.xlabel(title)

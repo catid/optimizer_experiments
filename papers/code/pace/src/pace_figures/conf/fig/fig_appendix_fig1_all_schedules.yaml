@@ -1,0 +1,38 @@
+id: fig_appendix_fig1_all_schedules
+paper: "Fig 16"
+desc: "3 models x 3 schedules: AdamW/EMA per schedule vs PACE constant-LR"
+dataset: smoltalk
+
+# Rows = models, columns = schedule (const | cos | wsd). Each panel shows the
+# AdamW and EMA baselines at that column's schedule, plus the PACE constant-LR
+# run (trained once, repeated as the reference in every column). Per model the
+# headline learning rate is fixed (SmolLM2-1.7B 1e-3, Qwen3-1.7B 5e-4,
+# Gemma3-1B 1e-3); the best config is picked at each (method, schedule) cell.
+# Distinct runs: 3 models x (AdamW x3 sched + EMA x3 sched + PACE const) = 21.
+
+# AdamW + EMA baselines across the three schedules (one grid per model).
+sweeps:
+  - model: smollm2_1.7b
+    base: {method: AdamW, seed: 42, optimizer: {name: adamw, lr: 0.001, lambda_pullback: 0.0}}
+    grid: {schedule: [const, cos, wsd]}
+  - model: smollm2_1.7b
+    base: {method: EMA, seed: 42, optimizer: {name: ema, lr: 0.001, lambda_pullback: 0.0, ema_kappa: 0.5}}
+    grid: {schedule: [const, cos, wsd]}
+  - model: qwen3_1.7b
+    base: {method: AdamW, seed: 42, optimizer: {name: adamw, lr: 0.0005, lambda_pullback: 0.0}}
+    grid: {schedule: [const, cos, wsd]}
+  - model: qwen3_1.7b
+    base: {method: EMA, seed: 42, optimizer: {name: ema, lr: 0.0005, lambda_pullback: 0.0, ema_kappa: 0.5}}
+    grid: {schedule: [const, cos, wsd]}
+  - model: gemma3_1b
+    base: {method: AdamW, seed: 42, optimizer: {name: adamw, lr: 0.001, lambda_pullback: 0.0}}
+    grid: {schedule: [const, cos, wsd]}
+  - model: gemma3_1b
+    base: {method: EMA, seed: 42, optimizer: {name: ema, lr: 0.001, lambda_pullback: 0.0, ema_kappa: 0.5}}
+    grid: {schedule: [const, cos, wsd]}
+
+# PACE constant-LR reference (one run per model, headline config from Fig 1).
+curves:
+  - {model: smollm2_1.7b, method: PACE, schedule: const, seed: 42, optimizer: {name: pace, lr: 0.001,  lambda_pullback: 0.15, ema_kappa: 0.2}}
+  - {model: qwen3_1.7b,   method: PACE, schedule: const, seed: 42, optimizer: {name: pace, lr: 0.0005, lambda_pullback: 0.25, ema_kappa: 0.5}}
+  - {model: gemma3_1b,    method: PACE, schedule: const, seed: 42, optimizer: {name: pace, lr: 0.001,  lambda_pullback: 0.15, ema_kappa: 0.5}}

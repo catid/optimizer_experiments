@@ -1,0 +1,58 @@
+# Single source of truth mapping each `pace-figure fig=<id>` to its paper figure
+# and inputs. Used by `pace-figure fig=list`, the README, and the tests.
+fig1:
+  paper: "Fig 1"
+  desc: "Best-per-method validation loss (finetuning)"
+  models: [SmolLM2-1.7B, Qwen3-1.7B, Gemma3-1B]
+fig_clip_frac_body:
+  paper: "Fig 2"
+  desc: "Clip-fraction of the pullback gain over training"
+  models: [SmolLM2-1.7B]
+fig3_135m_grid:
+  paper: "Fig 3"
+  desc: "Update-frequency x pullback-strength grid"
+  models: [SmolLM2-135M]
+fig_appendix_c_kappa_all_models:
+  paper: "Fig 6"
+  desc: "kappa x c response across 3 models"
+  models: [SmolLM2-1.7B, Qwen3-1.7B, Gemma3-1B]
+fig_appendix_train_curves:
+  paper: "Fig 7"
+  desc: "Training-loss comparison (PACE / AdamW / EMA)"
+  models: [SmolLM2-135M, Qwen3-1.7B]
+fig_appendix_135m_full_grid:
+  paper: "Fig 8"
+  desc: "Full (c, kappa, uf) grid"
+  models: [SmolLM2-135M]
+fig_appendix_tulu_qwen:
+  paper: "Fig 10"
+  desc: "Qwen3-1.7B on Tulu-3"
+  models: [Qwen3-1.7B]
+fig_appendix_full_train_curves:
+  paper: "Fig 11"
+  desc: "Fig 1 curves with last-25% zoom"
+  models: [SmolLM2-1.7B, Qwen3-1.7B, Gemma3-1B]
+fig_appendix_clip_frac:
+  paper: "Fig 12"
+  desc: "Coordinate-saturation fraction over eta, kappa, c"
+  models: [SmolLM2-1.7B]
+fig_appendix_clip_frac_vs_c:
+  paper: "Fig 13"
+  desc: "End-of-training saturation vs c"
+  models: [SmolLM2-1.7B]
+fig_appendix_wsd_val_curves:
+  paper: "Fig 14"
+  desc: "PACE vs baselines under decay schedules"
+  models: [SmolLM2-135M]
+fig_appendix_wsd_finetune:
+  paper: "Fig 15"
+  desc: "Best val per method across learning rates"
+  models: [SmolLM2-135M]
+fig_appendix_fig1_all_schedules:
+  paper: "Fig 16"
+  desc: "3 models x 3 schedules"
+  models: [SmolLM2-1.7B, Qwen3-1.7B, Gemma3-1B]
+fig_appendix_multiseed_robust:
+  paper: "Fig 17"
+  desc: "Seed robustness (seeds 42/1337/2024)"
+  models: [SmolLM2-1.7B, Qwen3-1.7B, Gemma3-1B]
