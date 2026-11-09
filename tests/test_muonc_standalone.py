@@ -91,33 +91,40 @@ def test_gs_projection_can_be_disabled_and_per_parameter_skipped() -> None:
 
 
 @pytest.mark.parametrize("corrected", [True, False])
-def test_decay_schedule(corrected: bool) -> None:
-    base_lr, lr, weight_decay = 1e-2, 2.5e-3, 0.5
+def test_decay_schedule_uses_each_groups_own_peak_lr(corrected: bool) -> None:
+    # Different peak LRs and different schedule fractions per group, so a
+    # fallback group that borrowed the matrix group's base_lr would be caught.
+    peaks = {True: 1e-2, False: 4e-3}
+    fractions = {True: 0.25, False: 0.5}
+    weight_decay = 0.5
 
     def run(decay: float) -> torch.nn.Module:
         model = _model()
         optimizer = _plain(
             MuonC,
             model,
-            lr=base_lr,
+            lr=peaks[True],
+            fallback_lr=peaks[False],
             matrix_weight_decay=decay,
             fallback_weight_decay=decay,
             corrected_decay=corrected,
         )
         for group in optimizer.param_groups:
-            assert group["base_lr"] == base_lr
-            group["lr"] = lr
+            is_matrix = bool(group["use_matrix_update"])
+            assert group["base_lr"] == peaks[is_matrix]
+            group["lr"] = peaks[is_matrix] * fractions[is_matrix]
         _backward(model)
         optimizer.step()
         return model
 
     init, no_decay, decayed = _model(), run(0.0), run(weight_decay)
-    factor = 1.0 - weight_decay * (lr * lr / base_lr if corrected else lr)
     for name, w0 in init.named_parameters():
+        is_matrix = name.endswith("weight")
+        lr, base_lr = peaks[is_matrix] * fractions[is_matrix], peaks[is_matrix]
+        factor = 1.0 - weight_decay * (lr * lr / base_lr if corrected else lr)
         step = dict(no_decay.named_parameters())[name] - w0
-        expected = factor * w0 + step
         torch.testing.assert_close(
-            dict(decayed.named_parameters())[name], expected, rtol=1e-5, atol=1e-7
+            dict(decayed.named_parameters())[name], factor * w0 + step, rtol=1e-5, atol=1e-7
         )
 
 
@@ -164,12 +171,40 @@ def test_bf16_parameters_keep_fp32_masters() -> None:
     assert not torch.equal(master, start)
 
 
-def test_fp32_parameters_do_not_allocate_masters() -> None:
-    model = _model()
+def test_fp32_master_accumulates_updates_too_small_for_bf16() -> None:
+    """A constant sub-ulp update moves a BF16 weight only when a master integrates it."""
+
+    def run(cls) -> tuple[torch.Tensor, int]:
+        weight = torch.nn.Parameter(torch.ones(4, 4, dtype=torch.bfloat16))
+        optimizer = _plain(cls, [weight], lr=2e-4)
+        gradient = torch.eye(4, dtype=torch.bfloat16)
+        first_change = -1
+        for step in range(1, 81):
+            weight.grad = gradient.clone()
+            optimizer.step()
+            if first_change < 0 and not torch.equal(weight.detach(), torch.ones_like(weight)):
+                first_change = step
+        return weight.detach().float(), first_change
+
+    # The BF16 spacing just below 1.0 is 2**-8 = 0.0039; each step moves the
+    # diagonal by lr * 0.2 * sqrt(4) = 8e-5, far below half of that.
+    control, control_change = run(AnchorMuon)
+    assert control_change == -1  # every in-place BF16 update rounds straight back
+    assert torch.equal(control, torch.ones(4, 4))
+    mastered, master_change = run(MuonC)
+    assert master_change > 5  # nothing visible until enough sub-ulp steps accumulate
+    assert float(mastered.diagonal().max()) < 1.0
+    assert torch.equal(mastered - torch.diag(mastered.diagonal()), torch.ones(4, 4) - torch.eye(4))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_full_precision_parameters_do_not_allocate_masters(dtype: torch.dtype) -> None:
+    model = _model(dtype)
     optimizer = MuonC(model, lr=1e-3)
     _backward(model)
     optimizer.step()
     assert all("master_param" not in optimizer.state[p] for p in model.parameters())
+    assert all(p.dtype == dtype for p in model.parameters())
 
 
 def test_state_dict_round_trip_preserves_fp32_state_and_trajectory() -> None:
@@ -227,6 +262,61 @@ def test_gs_stats_report_the_removed_radial_component() -> None:
 
     quiet = _plain(MuonC, _model(), lr=1e-2)
     assert "gs_radial_cosine_mean" not in quiet.last_stats
+
+
+@pytest.mark.parametrize("strength", [0.25, 0.5])
+def test_partial_projection_removes_that_fraction_of_the_radial_step(strength: float) -> None:
+    reference, model = _model(), _model()
+    _backward(reference)
+    _backward(model)
+    before = [w.detach().clone() for w in (model[0].weight, model[2].weight)]
+    _plain(MuonC, reference, lr=1e-2, gs_projection=False).step()
+    _plain(MuonC, model, lr=1e-2, gs_projection=strength).step()
+    for w0, w_ref, w in zip(before, (reference[0].weight, reference[2].weight), (model[0].weight, model[2].weight)):
+        radial_ref = float(((w_ref.detach() - w0) * w0).sum())
+        radial = float(((w.detach() - w0) * w0).sum())
+        assert radial == pytest.approx((1.0 - strength) * radial_ref, rel=1e-4, abs=1e-7)
+
+
+def test_projection_strength_one_is_the_boolean_projection() -> None:
+    a, b = _model(), _model()
+    _backward(a)
+    _backward(b)
+    MuonC(a, lr=1e-2, gs_projection=True).step()
+    MuonC(b, lr=1e-2, gs_projection=1.0).step()
+    for pa, pb in zip(a.parameters(), b.parameters()):
+        assert torch.equal(pa, pb)
+    with pytest.raises(ValueError, match="gs_projection"):
+        MuonC(_model(), gs_projection=1.5)
+
+
+def test_equilibrium_rms_is_the_fixed_point_of_the_projected_norm() -> None:
+    """Random tangent steps of known size + corrected decay settle at the predicted RMS."""
+
+    lr, wd = 0.05, 0.5
+    rms = MuonC.equilibrium_rms(lr, wd)
+    assert MuonC.weight_decay_for_rms(lr, rms) == pytest.approx(wd)
+    assert MuonC.equilibrium_rms(1.2e-3, 0.05) == pytest.approx(0.0219, abs=1e-4)
+    torch.manual_seed(0)
+    weight = torch.nn.Parameter(0.5 * torch.randn(24, 16))  # starts well above the fixed point
+    optimizer = _plain(MuonC, [weight], lr=lr, matrix_weight_decay=wd)
+    generator = torch.Generator().manual_seed(1)
+    realised: list[float] = []
+    for step in range(600):
+        current = lr * (1.0 if step < 300 else 0.5)  # halving the LR must not move the fixed point
+        for group in optimizer.param_groups:
+            group["lr"] = current
+        weight.grad = torch.randn(24, 16, generator=generator)
+        before = weight.detach().clone()
+        optimizer.step()
+        applied = (before * (1.0 - wd * current**2 / lr) - weight.detach()) / current
+        realised.append(float(applied.square().mean().sqrt()))
+        if step in (299, 599):
+            # The orthogonalization is approximate, so use the realised update RMS.
+            update_rms = sum(realised[-100:]) / 100
+            assert 0.10 < update_rms < 0.21  # ideal is 0.2; small random matrices orthogonalize less tightly
+            measured = float(weight.detach().square().mean().sqrt())
+            assert measured == pytest.approx(MuonC.equilibrium_rms(lr, wd, update_rms=update_rms), rel=0.03)
 
 
 def test_invalid_gs_eps_is_rejected() -> None:

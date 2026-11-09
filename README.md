@@ -329,6 +329,124 @@ First grid for a new problem:
 schedulers can mutate `optimizer.param_groups` as usual. Matrix-like tensors
 use Muon; scalar/vector tensors use an AdamW-style fallback.
 
+### GPT-2 Tokenized MuonC x MuonGS Study
+
+The H-Net trainer's `MuonC` optimizer is now a standalone root file,
+[`muonc.py`](muonc.py). It puts two things on top of the AnchorMuon direction:
+the MuonGS tangent projection, which removes the part of each update that is
+parallel to the weight, and corrected decoupled decay,
+`1 - wd * lr^2 / lr_max`. Neither paper tests the other's idea, so I ran a
+study of how the two should be combined on the same GPT-2-tokenized 50M proxy.
+Paper notes are in `papers/md/2610.37647v1_muongs.md` and
+`papers/md/2506.02285v2_corrected_weight_decay.md`. The full write-up, with the
+mechanics, every ablation and the limits, is
+[`workers/claude_muonc_gs/README.md`](workers/claude_muonc_gs/README.md).
+
+Protocol: the model, data, batch and evaluation of the 8K tables above, on
+eight B300 GPUs. All variants share one plain-Muon direction and the runner's
+parameter routing, so only the norm control differs. Two regimes were run: the
+standard one above (8M-token cache, about four passes, WSD) and a single-pass
+one (512M-token cache, 100-step warmup, cosine to 10%). Grids were selected on
+seed 123 and the numbers below are means over fresh seeds 124-126.
+
+| Configuration | Standard protocol, 8K | Single-pass, 8K | Single-pass, 32K |
+|---|---:|---:|---:|
+| Unprojected Muon, standard decay, tuned | 4.7682 +/- 0.0054 | 4.3392 +/- 0.0014 | 3.9323 |
+| Unprojected Muon, corrected decay, tuned | 4.7704 (1 seed) | 4.3315 +/- 0.0030 | 3.9255 |
+| Unprojected Muon, no decay | 4.9572 (1 seed) | 4.3665 +/- 0.0013 | 3.9304 |
+| Half projection, no decay | not run | 4.3419 +/- 0.0034 | 3.9134 |
+| Half projection, corrected decay | not run | 4.3412 +/- 0.0034 | 3.9270 |
+| Full projection (MuonGS), default init | 4.7667 +/- 0.0075 | 4.3894 +/- 0.0036 | 3.9423 |
+| Full projection, fixed norm (MuonH-style) | 4.7678 +/- 0.0091 | 4.3984 +/- 0.0037 | not run |
+| Full projection + corrected decay (`MuonC` defaults) | 4.7703 +/- 0.0043 (wd 0.0125) | 4.4119 +/- 0.0026 (wd 0.05) | 3.9984 (wd 0.05) |
+| Full projection at 2x init scale, no decay | 4.7737 (1 seed) | 4.3502 +/- 0.0037 | 3.9214 (2 seeds) |
+| Full projection at 2x init scale, corrected decay wd 0.0125 | not run | 4.3488 +/- 0.0029 | 3.9228 |
+| Muon at the settings of the tables above (wd 0.05, lr 1.8e-3) | 4.8875 +/- 0.0104 | not run | not run |
+
+Each cell is that configuration at its best learning rate and weight decay.
+The 8K columns are fresh-seed means +/- one standard deviation; the 32K column
+is one seed unless marked, with about 0.005 of seed noise.
+
+Takeaways:
+
+- On the standard protocol everything well tuned ties at about 4.77, and the
+  Muon baseline used in the tables above was under-regularised. With
+  `wd=0.4, lr=1e-3` plain Muon reaches 4.7682, against 4.88-4.89 at `wd=0.05`.
+  That is below every entry in the PACE table. Norm control is the lever: at
+  `wd=0.05` the weight norms grow 5.6x.
+- In the single-pass regime at 8K steps the full projection costs 0.05-0.08.
+  It pins every matrix at its initial scale and removes the learning-rate
+  anneal that norm growth provides. Starting at 2x scale closes most of the
+  gap, and half-strength projection (`gs_projection=0.5`) closes all of it.
+- If you project, use corrected decay. With the projection the weight norm
+  follows `|W|^2 <- f^2 |W|^2 + lr^2 |N|^2` exactly, so the decay no longer
+  regularises: it sets the scale each matrix settles at,
+  `RMS = 0.2 * sqrt(lr / (2 * wd))`. Only the corrected form keeps that scale
+  fixed while the LR decays.
+- Do not project the embedding/output matrix. Doing so is what made the H-Net
+  stack 0.22 worse with `MuonC` than without it on this proxy (4.7419 against
+  4.5200); with that matrix exempt it is 4.52 again.
+- At 32K steps the ordering changes. Half projection without decay (3.913)
+  and the full projection at 2x scale (3.921) are level with or slightly
+  ahead of unprojected Muon (3.926-3.932). The gaps are one to three seed
+  standard deviations, and the decay-based unprojected runs were still
+  improving at the lowest LR tried.
+- The LR schedule is a larger effect than any of this. For one projected
+  optimizer, cosine, terminal-decay-only and constant LR give 4.39, 4.55 and
+  5.06. A free-norm "accumulator" (projection, no decay, constant LR) and the
+  equivalent inverse-sqrt schedule are insensitive to the LR, as predicted,
+  but end at 5.2-5.8.
+
+Result bundle:
+`workers/claude_muonc_gs/results/muonc_gs_fineweb_gpt2_20261109/`
+(`summary.md` has every table).
+
+![Single-pass LR sweep with and without the projection](workers/claude_muonc_gs/results/muonc_gs_fineweb_gpt2_20261109/plots/fig_lr_sweep_sp.png)
+
+![Weight norms with and without the projection](workers/claude_muonc_gs/results/muonc_gs_fineweb_gpt2_20261109/plots/fig_norms.png)
+
+![What the projection removes](workers/claude_muonc_gs/results/muonc_gs_fineweb_gpt2_20261109/plots/fig_effective_step.png)
+
+#### Using MuonC In New Experiments
+
+Start from the standalone optimizer in [`muonc.py`](muonc.py):
+
+```python
+from muonc import MuonC
+
+lr = 1e-3
+optimizer = MuonC(
+    model,
+    lr=lr,
+    fallback_lr=lr,
+    gs_projection=0.5,           # True = MuonGS, False = no projection
+    corrected_decay=True,        # False = standard 1 - lr * wd
+    matrix_weight_decay=0.2,
+    use_soda=False, use_pmuoneq=False, use_normuon=False,   # plain Muon direction
+)
+
+for group in optimizer.param_groups:     # schedules stay in the trainer
+    group["lr"] = group["base_lr"] * schedule(step)   # never change base_lr
+```
+
+`base_lr` is the peak rate that corrected decay divides by, so a schedule must
+only write `lr`. The constructor defaults are AnchorMuon's CIFAR defaults; the
+H-Net trainer's exact call is in the module docstring. Tag a parameter with
+`_no_gs = True` to keep it out of the projection and `_no_weight_decay = True`
+to keep it out of the decay. `track_gs_stats=True` reports the radial cosine
+the projection removes.
+
+First grid for a new problem:
+
+| Knob | Suggested values |
+|---|---|
+| `gs_projection` | `0.5` first; `True` when data is limited or the scale is known; `False` as the control |
+| `lr` | the tuned Muon LR at `0.5`; with the full projection try 1.5-3x lower |
+| `matrix_weight_decay` | with the full projection, `MuonC.weight_decay_for_rms(lr, rms)` for the weight RMS you want, and `0`; otherwise the tuned Muon value and 2x it |
+| `corrected_decay` | `True` |
+| initial scale | with the full projection, start the weights near the scale you want to keep |
+| schedule | re-tune it; the projection removes the anneal that norm growth gave you |
+
 ## FineWeb-Edu 50M LLM AnchorMuon HPO
 
 After the fixed WikiText-selected AnchorMuon setting lost to plain Muon on the
@@ -784,6 +902,8 @@ workload is noisy or unstable.
 - Gram Newton-Schulz / polar update: [Dao-AILab gram-newton-schulz reference implementation](https://github.com/Dao-AILab/gram-newton-schulz/blob/main/gram_newton_schulz/gram_newton_schulz.py). AnchorMuon uses this family for matrix orthogonalization.
 - NorMuon / HTMuon lineage: [HTMuon: Improving Muon via Heavy-Tailed Spectral Correction](https://arxiv.org/abs/2603.10067) and the [HTMuon reference code](https://github.com/TDCSZ327/HTmuon). AnchorMuon uses the post-Gram row-normalization idea, not the full HTMuon optimizer.
 - PMuon lineage: the [PMuon track-3 implementation notes](https://github.com/zzp1012/modded-nanogpt/tree/pmuon-track3-3225/records/track_3_optimization/results/20260507_pmuon) motivated the pre-polar preconditioning idea. AnchorMuon implements only a cheap row-only PMuonEq approximation, not dense two-sided PMuon.
+- MuonGS tangent projection: [MuonGS: Pretraining LLMs with Relaxed Weight-Norm Control](https://arxiv.org/abs/2610.37647). `muonc.py` applies its Frobenius projection after the direction has been shaped.
+- Corrected weight decay: [Why Gradients Rapidly Increase Near the End of Training](https://arxiv.org/abs/2506.02285) by Defazio. `muonc.py` uses its `lr^2 / lr_max` decay schedule on matrix and fallback tensors.
 - PACE pullback: [PACE: Per-coordinate Averaged Controlled EMA](https://arxiv.org/abs/2606.25086). The standalone PACE+Muon implementation is in `pace_muon.py`; the benchmark runner keeps a local copy for result reproduction.
 - WSD schedule context: [Understanding Warmup-Stable-Decay Learning Rates](https://arxiv.org/abs/2410.05192). WSD is implemented in the training harness, not in `optimizer.py`.
 - AdamATan2 fallback context: [Scaling Exponents Across Parameterizations and Optimizers](https://arxiv.org/abs/2407.05872) by Everett et al. introduces the Adam-atan2 code change in Appendix C.5, replacing Adam's unbounded `m / sqrt(v)` update with `atan2(m, sqrt(v))` to reduce epsilon sensitivity. AnchorMuon uses this as the default only after matrix-direction construction and only on fallback tensors.

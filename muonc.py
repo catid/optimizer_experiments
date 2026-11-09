@@ -2,16 +2,21 @@
 
 This file is intentionally self-contained so it can be copied or imported into
 another training job.  It is the optimizer used by the canonical ~600M
-byte-level H-Net trainer, ported verbatim apart from removing unrelated
-ablation optimizers:
+byte-level H-Net trainer (hnet commit 308978a), ported with no behavioural
+change in its default configuration:
 
     optimizer = MuonC(model, lr=1.2e-3, fallback_lr=6e-4,
                       matrix_weight_decay=0.05, fallback_weight_decay=0.05,
-                      row_gamma=0.45, soda_lambda_scale=0.003)
+                      momentum=0.95, row_gamma=0.45, pmuoneq_beta=0.90,
+                      normuon_beta2=0.93, soda_lambda_scale=0.003,
+                      fallback_mode="atan2", ns_compute_dtype=torch.bfloat16)
 
-Those are the H-Net trainer's values.  The bare constructor defaults are
-inherited from AnchorMuon and were tuned on a CIFAR ViT (``lr=8e-3``, SODA
-scale 1.0, no weight decay); do not use them unchanged for language models.
+That is the H-Net trainer's call.  The trainer also tags biases and
+normalization parameters with ``_no_weight_decay`` and its zero-initialised
+residual projections with ``_no_gs``.  ``ns_compute_dtype`` defaults to FP16 on
+CUDA; the trainer chooses BF16.  The bare constructor defaults are inherited
+from AnchorMuon and were tuned on a CIFAR ViT (``lr=8e-3``, SODA scale 1.0, no
+weight decay); do not use them unchanged for language models.
 
 ``MuonC`` is the root ``optimizer.py`` AnchorMuon direction (SODA + row-only
 PMuonEq + Gram Newton-Schulz + NorMuon, AdamATan2 fallback) with three changes:
@@ -27,6 +32,7 @@ PMuonEq + Gram Newton-Schulz + NorMuon, AdamATan2 fallback) with three changes:
    reintroduce a radial component.  To first order the update no longer
    changes ``||W||_F``; norm control is left to SODA and the decay term.
    Tag a parameter with ``param._no_gs = True`` to skip the projection.
+   ``gs_projection`` takes ``True``/``False`` or a strength in ``[0, 1]``.
 
 2. Corrected decoupled weight decay (arXiv:2506.02285).  With scheduled rate
    ``lr_t`` and the group's unscheduled peak rate ``base_lr``:
@@ -59,6 +65,22 @@ Full matrix step for weight ``W_t`` with gradient ``G_t``:
        W_t <- (1 - soda_t) W_t + soda_t W_0     # soda_t = min(1, scale/(t+1)^power)
        W_{t+1} = (1 - wd * lr_t^2 / base_lr) W_t - lr_t N'_t
 
+What the two switches do together (measured on this repository's LM proxy; see
+``workers/claude_muonc_gs/README.md``):
+
+* With the full projection the norm of a matrix no longer depends on the loss.
+  It follows ``|W|^2 <- f^2 |W|^2 + lr^2 |N'|^2`` exactly, so the decay does
+  not regularise: it sets the scale every projected matrix settles at,
+  ``RMS = 0.2 * sqrt(lr_max / (2 * weight_decay))`` (``MuonC.equilibrium_rms``),
+  over about ``1 / (2 * weight_decay * lr_max)`` steps.  Only corrected decay
+  keeps that scale fixed while the learning rate decays, which is why the two
+  belong together.
+* The projection also removes the learning-rate anneal that norm growth gives
+  unprojected Muon, so the learning rate and schedule need re-tuning.
+* A matrix whose scale does functional work should not be projected.  Tag the
+  output/embedding matrix with ``_no_gs``, or use a partial projection
+  (``gs_projection=0.5``), which keeps half of the loss-driven norm change.
+
 Differences from root ``optimizer.py`` beyond the three items above (these
 come from the H-Net production trainer and also apply to the ``AnchorMuon``
 base class defined in *this* file, which is therefore not interchangeable
@@ -67,10 +89,13 @@ with the root ``optimizer.AnchorMuon``):
 * Tensors with more than two non-singleton dimensions are treated as banks of
   independent ``[rows, cols]`` matrices over the leading dimensions (stacked
   expert weights) rather than flattened to ``[dim0, rest]``.
-* When names are available (``MuonC(model)`` / ``named_parameters()``),
+* When the optimizer is built from a module or from ``named_parameters()``,
   parameters whose name contains ``lm_head``, ``output_head``, ``conv1d`` or
   ``depthwise`` (and >=3-D ``conv`` kernels) are routed to the AdamATan2
-  fallback even if matrix-shaped.
+  fallback even if matrix-shaped.  A tied weight is seen only under the first
+  name PyTorch reports for it.  Explicit param-group dicts are routed by their
+  ``use_matrix_update`` flag, or by shape alone when the flag is absent; their
+  ``param_names`` are used for reporting only.
 * GramNS uses the direct Gram polynomial recurrence with ``bmm`` for both
   square and rectangular matrices; the restarted inverse-estimate recurrence
   diverged for rectangular BF16/FP16 matrices on the production hardware.
@@ -78,6 +103,24 @@ with the root ``optimizer.AnchorMuon``):
   ``use_soda`` / ``use_pmuoneq`` / ``use_normuon`` switches allow matched
   plain-Muon controls.  ``param._no_soda = True`` exempts a tensor from SODA.
 * Fallback tensors are updated with batched ``torch._foreach_*`` kernels.
+
+One deliberate deviation from the H-Net source: FP64 parameters are updated in
+place.  The source gives every non-FP32 parameter an FP32 master, which would
+lower the precision of an FP64 tensor.
+
+Related algorithms as configurations of this class.  All of them use this
+file's ``0.2 * sqrt(max(rows, cols))`` update scale, not the
+``sqrt(max(1, rows / cols))`` scale of the MuonGS paper, so learning rates do
+not transfer from the paper:
+
+    plain = dict(use_soda=False, use_pmuoneq=False, use_normuon=False)
+    MuonGS (paper)   MuonC(model, **plain, matrix_weight_decay=0.0)
+    corrected only   MuonC(model, **plain, gs_projection=False,
+                           matrix_weight_decay=wd)
+    MuonW            MuonC(model, **plain, gs_projection=False,
+                           corrected_decay=False, matrix_weight_decay=wd)
+
+The paper also keeps embeddings and the output head on AdamW.
 
 Muon-C (arXiv:2609.09676) is a different, convolution-specific Fourier-domain
 optimizer and is not what this file implements.  ``MuonGS`` is exported as an
@@ -326,8 +369,10 @@ class AnchorMuon(torch.optim.Optimizer):
     Passing a ``torch.nn.Module``, ``model.parameters()``, or
     ``model.named_parameters()`` lets the optimizer route tensors by effective
     shape: matrix-like tensors use PMuonEq/GramNS/NorMuon, while scalar/vector
-    tensors use the fallback path. Parameter names are accepted only for
-    reporting in ``group_summary()``.
+    tensors use the fallback path. With a module or ``named_parameters()``
+    the names also apply the semantic exclusions of ``build_param_groups``
+    (output heads and convolution kernels go to the fallback); in explicit
+    param-group dicts ``param_names`` are only reported by ``group_summary()``.
 
     Call ``optimizer.group_summary()`` before long runs to audit this routing.
 
@@ -674,7 +719,12 @@ class AnchorMuon(torch.optim.Optimizer):
                         continue
                     target_dtype = value.dtype
                     if value.is_floating_point() and (
-                        key in fp32_keys or (key == "soda_z0" and self.use_fp32_masters)
+                        key in fp32_keys
+                        or (
+                            key == "soda_z0"
+                            and self.use_fp32_masters
+                            and parameter.dtype != torch.float64
+                        )
                     ):
                         target_dtype = torch.float32
                     destination[key] = value.detach().to(
@@ -723,9 +773,11 @@ class AnchorMuon(torch.optim.Optimizer):
         MuonC uses a persistent FP32 copy for BF16 parameters so corrected
         decay and small optimizer updates survive parameter quantization.
         AnchorMuon leaves this as the live parameter for control parity.
+        FP32 and FP64 parameters are already at least that precise and are
+        updated in place.
         """
 
-        if not self.use_fp32_masters or p.dtype == torch.float32:
+        if not self.use_fp32_masters or p.dtype in (torch.float32, torch.float64):
             return p
         state = self.state[p]
         master = state.get("master_param")
@@ -1259,29 +1311,44 @@ class MuonC(AnchorMuon):
     masters stay enabled in every configuration so the comparison is not
     confounded by BF16 parameter quantization.
 
+    ``gs_projection`` also accepts a strength in ``[0, 1]``: the fraction of
+    the radial component that is removed.  ``True`` / ``1.0`` is MuonGS and
+    ``False`` / ``0.0`` disables the projection.  An intermediate value keeps
+    part of the loss-driven change of each matrix's norm; with the full
+    projection the norm is set by the schedule and the decay alone (see
+    :meth:`equilibrium_rms`), never by the loss.
+
     ``track_gs_stats=True`` records per-step radial diagnostics in
     ``last_stats`` (``gs_radial_cosine_mean``, ``gs_radial_cosine_abs_max``,
-    ``gs_tangent_norm_ratio_mean``).  This forces a host synchronization each
-    step, so leave it off for throughput runs and CUDA graph capture.
+    ``gs_tangent_norm_ratio_mean``).  They describe the direction *before*
+    projection for every matrix tensor that stepped, including ``_no_gs``
+    tensors and runs with ``gs_projection=False``: the tangent ratio is what
+    the projection keeps or would keep, not necessarily what was applied.
+    Tracking forces a host synchronization each step, so leave it off for
+    throughput runs and CUDA graph capture.
     """
 
     def __init__(
         self,
         *args: Any,
         gs_eps: float = 1e-12,
-        gs_projection: bool = True,
+        gs_projection: bool | float = True,
         corrected_decay: bool = True,
         track_gs_stats: bool = False,
         **kwargs: Any,
     ) -> None:
         if gs_eps <= 0.0:
             raise ValueError("gs_eps must be positive")
+        gs_strength = float(gs_projection)
+        if not 0.0 <= gs_strength <= 1.0:
+            raise ValueError("gs_projection must be a bool or a strength in [0, 1]")
         super().__init__(*args, **kwargs)
         # Corrected Muon decay and small SODA/AdamATan2 updates must be
         # accumulated in FP32 before the BF16 model copy is refreshed.
         self.use_fp32_masters = True
         self.gs_eps = float(gs_eps)
-        self.gs_projection = bool(gs_projection)
+        self.gs_strength = gs_strength
+        self.gs_projection = gs_strength > 0.0
         self.corrected_decay = bool(corrected_decay)
         self.track_gs_stats = bool(track_gs_stats)
         self._gs_stat_buffer: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -1318,11 +1385,18 @@ class MuonC(AnchorMuon):
             self._gs_stat_buffer.append((cosine.flatten(), ratio.flatten()))
         if not self.gs_projection:
             return updates
-        skip = torch.tensor(
-            [bool(getattr(parameter, "_no_gs", False)) for parameter, _a, _s, _g in entries],
-            device=weights.device,
-            dtype=torch.bool,
-        ).view(-1, *([1] * (weights.ndim - 1)))
+        if self.gs_strength != 1.0:
+            # Partial projection: remove only a fraction of the radial component.
+            projected = directions - (self.gs_strength * radial) * weights
+        exempt = [bool(getattr(parameter, "_no_gs", False)) for parameter, _a, _s, _g in entries]
+        if not any(exempt):
+            # Common case: nothing in this bucket is exempt, so the select below
+            # would return ``projected`` unchanged.  Skipping it saves one pass
+            # over the bucket and a host-to-device mask per step.
+            return projected.to(dtype=updates.dtype)
+        skip = torch.tensor(exempt, device=weights.device, dtype=torch.bool).view(
+            -1, *([1] * (weights.ndim - 1))
+        )
         return torch.where(skip, directions, projected).to(dtype=updates.dtype)
 
     @torch.no_grad()
@@ -1351,6 +1425,33 @@ class MuonC(AnchorMuon):
             return 1.0
         return 1.0 - weight_decay * (lr * lr / base_lr)
 
+    @staticmethod
+    def equilibrium_rms(lr: float, weight_decay: float, *, update_rms: float = 0.2) -> float:
+        """RMS weight entry at which a fully projected matrix settles under corrected decay.
+
+        With the projection the norm obeys ``|W|^2 <- f^2 |W|^2 + lr^2 |N'|^2``
+        exactly, whatever the loss does.  The direction has RMS entry
+        ``update_rms`` (0.2 for this file's ``0.2 * sqrt(max(rows, cols))``
+        scale; about 0.18-0.2 in practice because the orthogonalization is
+        approximate), so with ``f = 1 - weight_decay * lr_t^2 / lr`` the fixed
+        point is ``update_rms * sqrt(lr / (2 * weight_decay))`` at every point
+        of the schedule.  ``lr`` is the peak (``base_lr``) rate.  The norm
+        relaxes towards it over about ``1 / (2 * weight_decay * lr)`` steps at
+        peak rate, so short runs stay near their initial scale instead.
+        """
+
+        if lr <= 0.0 or weight_decay <= 0.0 or update_rms <= 0.0:
+            raise ValueError("lr, weight_decay and update_rms must be positive")
+        return update_rms * math.sqrt(lr / (2.0 * weight_decay))
+
+    @staticmethod
+    def weight_decay_for_rms(lr: float, rms: float, *, update_rms: float = 0.2) -> float:
+        """Inverse of :meth:`equilibrium_rms`: the decay that holds RMS ``rms`` at peak rate ``lr``."""
+
+        if lr <= 0.0 or rms <= 0.0 or update_rms <= 0.0:
+            raise ValueError("lr, rms and update_rms must be positive")
+        return lr * update_rms**2 / (2.0 * rms**2)
+
     def _matrix_decay_factor(self, group: dict[str, Any], lr: float) -> float:
         if not self.corrected_decay:
             return super()._matrix_decay_factor(group, lr)
@@ -1370,7 +1471,7 @@ class MuonC(AnchorMuon):
 
 # H-Net exposes this hybrid under both names, so ``MuonGS`` is kept as an alias
 # for drop-in compatibility.  Note that the *paper's* MuonGS is the projection
-# alone with no matrix weight decay; see the module docstring for that recipe.
+# alone with no matrix weight decay; the module docstring gives that recipe.
 MuonGS = MuonC
 
 
