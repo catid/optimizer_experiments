@@ -1,0 +1,130 @@
+\begin{thebibliography}{}
+
+\bibitem[Ba et~al., 2016]{ba2016layer}
+Ba, J.~L., Kiros, J.~R., and Hinton, G.~E. (2016).
+\newblock Layer normalization.
+\newblock {\em arXiv preprint arXiv:1607.06450}.
+
+\bibitem[Bernstein et~al., 2020]{bernstein2020distance}
+Bernstein, J., Vahdat, A., Yue, Y., and Liu, M.-Y. (2020).
+\newblock On the distance between two neural networks and the stability of
+  learning.
+\newblock {\em Advances in Neural Information Processing Systems},
+  33:21370--21381.
+
+\bibitem[Bernstein et~al., 2018]{bernstein2018signsgd}
+Bernstein, J., Wang, Y.-X., Azizzadenesheli, K., and Anandkumar, A. (2018).
+\newblock signsgd: Compressed optimisation for non-convex problems.
+\newblock In {\em International Conference on Machine Learning}, pages
+  560--569. PMLR.
+
+\bibitem[D'Angelo et~al., 2024]{dangelo2024needweightdecaymodern}
+D'Angelo, F., Andriushchenko, M., Varre, A., and Flammarion, N. (2024).
+\newblock Why do we need weight decay in modern deep learning?
+
+\bibitem[Defazio and Bottou, 2022]{defazioscaling2022}
+Defazio, A. and Bottou, L. (2022).
+\newblock A scaling calculus for the design and initialization of relu
+  networks.
+\newblock {\em Neural Comput. Appl.}, 34(17):14807–14821.
+
+\bibitem[Defazio et~al., 2023]{defazio2023when}
+Defazio, A., Cutkosky, A., Mehta, H., and Mishchenko, K. (2023).
+\newblock When, why and how much? adaptive learning rate scheduling by
+  refinement.
+
+\bibitem[Defazio and Gower, 2021]{defazio2021factorial}
+Defazio, A. and Gower, R.~M. (2021).
+\newblock The power of factorial powers: New parameter settings for
+  (stochastic) optimization.
+\newblock In Balasubramanian, V.~N. and Tsang, I., editors, {\em Proceedings of
+  The 13th Asian Conference on Machine Learning}, volume 157 of {\em
+  Proceedings of Machine Learning Research}, pages 49--64. PMLR.
+
+\bibitem[Defazio and Mishchenko, 2023]{defazio2023dadapt}
+Defazio, A. and Mishchenko, K. (2023).
+\newblock Learning-rate-free learning by {D}-adaptation.
+\newblock {\em The 40th International Conference on Machine Learning (ICML
+  2023)}.
+
+\bibitem[Duchi et~al., 2011]{adagrad}
+Duchi, J., Hazan, E., and Singer, Y. (2011).
+\newblock Adaptive subgradient methods for online learning and stochastic
+  optimization.
+\newblock {\em Journal of Machine Learning Research}, 12(61).
+
+\bibitem[He et~al., 2016]{he2016deep}
+He, K., Zhang, X., Ren, S., and Sun, J. (2016).
+\newblock Deep residual learning for image recognition.
+\newblock In {\em Proceedings of the IEEE conference on computer vision and
+  pattern recognition}.
+
+\bibitem[Ioffe and Szegedy, 2015]{ioffe2015batch}
+Ioffe, S. and Szegedy, C. (2015).
+\newblock Batch normalization: Accelerating deep network training by reducing
+  internal covariate shift.
+\newblock In {\em International conference on machine learning}, pages
+  448--456. pmlr.
+
+\bibitem[Kosson et~al., 2024]{kosson2024rotationalequilibriumweightdecay}
+Kosson, A., Messmer, B., and Jaggi, M. (2024).
+\newblock Rotational equilibrium: How weight decay balances learning across
+  neural networks.
+
+\bibitem[Loshchilov and Hutter, 2019]{loshchilov2018decoupled}
+Loshchilov, I. and Hutter, F. (2019).
+\newblock Decoupled weight decay regularization.
+\newblock In {\em International Conference on Learning Representations}.
+
+\bibitem[Orabona, 2019]{orabona2019modern}
+Orabona, F. (2019).
+\newblock A modern introduction to online learning.
+\newblock {\em arXiv preprint arXiv:1912.13213}.
+
+\bibitem[Penedo et~al., 2024]{penedo2024finewebdatasetsdecantingweb}
+Penedo, G., Kydlíček, H., allal, L.~B., Lozhkov, A., Mitchell, M., Raffel,
+  C., Werra, L.~V., and Wolf, T. (2024).
+\newblock The fineweb datasets: Decanting the web for the finest text data at
+  scale.
+
+\bibitem[Russakovsky et~al., 2015]{ILSVRC15}
+Russakovsky, O., Deng, J., Su, H., Krause, J., Satheesh, S., Ma, S., Huang, Z.,
+  Karpathy, A., Khosla, A., Bernstein, M., Berg, A.~C., and Fei-Fei, L. (2015).
+\newblock {ImageNet Large Scale Visual Recognition Challenge}.
+\newblock {\em International Journal of Computer Vision (IJCV)}, 115(3).
+
+\bibitem[Schaipp, 2023]{schaipp2023decaynomore}
+Schaipp, F. (2023).
+\newblock Decay no more.
+\newblock In {\em ICLR Blogposts 2023}.
+\newblock https://iclr-blogposts.github.io/2023/blog/2023/adamw/.
+
+\bibitem[Van~Laarhoven, 2017]{van2017l2}
+Van~Laarhoven, T. (2017).
+\newblock L2 regularization versus batch and weight normalization.
+\newblock {\em arXiv preprint arXiv:1706.05350}.
+
+\bibitem[Xie and Li, 2024]{xie2024implicit}
+Xie, S. and Li, Z. (2024).
+\newblock Implicit bias of adamw: $\ell_\infty$ norm constrained optimization.
+\newblock {\em arXiv preprint arXiv:2404.04454}.
+
+\bibitem[Xie et~al., 2023]{xie2023on}
+Xie, Z., zhiqiang xu, Zhang, J., Sato, I., and Sugiyama, M. (2023).
+\newblock On the overlooked pitfalls of weight decay and how to mitigate them:
+  A gradient-norm perspective.
+\newblock In {\em Thirty-seventh Conference on Neural Information Processing
+  Systems}.
+
+\bibitem[Zhang et~al., 2019]{zhang2018three}
+Zhang, G., Wang, C., Xu, B., and Grosse, R. (2019).
+\newblock Three mechanisms of weight decay regularization.
+\newblock In {\em International Conference on Learning Representations}.
+
+\bibitem[Zhuang et~al., 2022]{zhuang2022understanding}
+Zhuang, Z., Liu, M., Cutkosky, A., and Orabona, F. (2022).
+\newblock Understanding adamw through proximal methods and scale-freeness.
+\newblock {\em Transactions on Machine Learning Research}.
+\newblock Expert Certification.
+
+\end{thebibliography}
